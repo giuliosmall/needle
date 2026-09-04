@@ -1,0 +1,7 @@
+/target
+/data/
+!/data/.gitkeep
+/tools/minio
+/tools/mc
+*.log
+.DS_Store
