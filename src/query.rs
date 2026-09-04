@@ -15,7 +15,10 @@ use crate::prepared::{self, FrameLoc};
 use crate::s3::{S3ChunkReader, S3Client, S3RangeReader};
 use crate::storage::{HttpRange, LocalFile, RangeReader};
 use anyhow::{Context, Result};
-use arrow::array::{Array, Int64Array, StringArray, TimestampMillisecondArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
@@ -26,6 +29,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Columns ranged-read when `QueryOptions::columns` is None.
@@ -78,6 +82,8 @@ pub struct QueryTimings {
 pub struct QueryResult {
     pub key: String,
     pub rows: Vec<ListenRow>,
+    /// Decoded projection as Arrow. Always present (0 rows when covering_only / no hits).
+    pub batch: RecordBatch,
     pub timings: QueryTimings,
     pub covering_hits: Vec<String>,
     pub page_descriptions: Vec<String>,
@@ -87,6 +93,18 @@ pub struct QueryResult {
     pub limit: Option<usize>,
     /// Entries dropped by covering/time predicates before IO.
     pub skipped_by_predicate: usize,
+}
+
+impl QueryResult {
+    /// Decoded projection as Arrow. Empty batch (0 rows) when covering_only or no hits.
+    pub fn record_batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
+    /// One JSON object per row from the batch (not ListenRow-only).
+    pub fn json_rows(&self) -> Vec<serde_json::Value> {
+        batch_to_json_rows(&self.batch)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +193,7 @@ impl RapQuerier {
             return Ok(QueryResult {
                 key: key.to_string(),
                 rows: Vec::new(),
+                batch: empty_record_batch(),
                 timings: QueryTimings {
                     index_lookup,
                     metadata_resolve: Duration::ZERO,
@@ -288,11 +307,17 @@ impl RapQuerier {
         // Decode.
         let t_dec = Instant::now();
         let s3_dec = self.s3_or_env();
-        let decoded: Result<Vec<Vec<ListenRow>>> = units
+        let decoded: Result<Vec<UnitDecode>> = units
             .par_iter()
             .map(|u| decode_unit(u, key, &s3_dec))
             .collect();
-        let mut rows: Vec<ListenRow> = decoded?.into_iter().flatten().collect();
+        let decoded = decoded?;
+        let mut rows: Vec<ListenRow> = Vec::new();
+        let mut parquet_batches: Vec<RecordBatch> = Vec::new();
+        for part in decoded {
+            rows.extend(part.rows);
+            parquet_batches.extend(part.parquet_batches);
+        }
         rows.sort_by(|a, b| {
             a.timestamp_ms
                 .cmp(&b.timestamp_ms)
@@ -307,11 +332,21 @@ impl RapQuerier {
                 rows.truncate(lim);
             }
         }
+        let batch = if parquet_batches.is_empty() {
+            if rows.is_empty() {
+                empty_record_batch()
+            } else {
+                listen_rows_to_batch(&rows)
+            }
+        } else {
+            assemble_parquet_batch(&parquet_batches, key, opts)
+        };
         let decode_extract = t_dec.elapsed();
 
         Ok(QueryResult {
             key: key.to_string(),
             rows,
+            batch,
             timings: QueryTimings {
                 index_lookup,
                 metadata_resolve,
@@ -386,6 +421,12 @@ struct WorkUnit {
     entry: RapIndexEntry,
     path: PathBuf,
     io_cols: Option<Vec<String>>,
+}
+
+struct UnitDecode {
+    rows: Vec<ListenRow>,
+    /// Projected parquet batches (row-selected). Empty for prepared / blob expansion.
+    parquet_batches: Vec<RecordBatch>,
 }
 
 fn columns_eq(a: &str, b: &str) -> bool {
@@ -690,7 +731,7 @@ fn resolve_prepared(parquet_path: &Path, prepared_rel: &str) -> PathBuf {
     p
 }
 
-fn decode_unit(u: &WorkUnit, key: &str, s3: &S3Client) -> Result<Vec<ListenRow>> {
+fn decode_unit(u: &WorkUnit, key: &str, s3: &S3Client) -> Result<UnitDecode> {
     // Prepared ZSTD / interleaved path.
     if u.entry.frame_locs.is_some() || u.entry.contiguous.is_some() {
         return decode_prepared(u, key);
@@ -706,7 +747,7 @@ fn decode_unit(u: &WorkUnit, key: &str, s3: &S3Client) -> Result<Vec<ListenRow>>
     )
 }
 
-fn decode_prepared(u: &WorkUnit, key: &str) -> Result<Vec<ListenRow>> {
+fn decode_prepared(u: &WorkUnit, key: &str) -> Result<UnitDecode> {
     let prep_path = u
         .entry
         .prepared_file
@@ -757,7 +798,10 @@ fn decode_prepared(u: &WorkUnit, key: &str) -> Result<Vec<ListenRow>> {
             row_number: u.entry.row_numbers.get(i).copied().unwrap_or(i as u64),
         });
     }
-    Ok(out)
+    Ok(UnitDecode {
+        rows: out,
+        parquet_batches: Vec::new(),
+    })
 }
 
 fn decode_rows_for_key(
@@ -767,7 +811,7 @@ fn decode_rows_for_key(
     _file_ord: u32,
     s3: &S3Client,
     io_cols: Option<&[String]>,
-) -> Result<Vec<ListenRow>> {
+) -> Result<UnitDecode> {
     let uri = path.to_string_lossy();
     let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new()
         .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
@@ -794,7 +838,7 @@ fn decode_rows_for_key_local(
     file: File,
     options: parquet::arrow::arrow_reader::ArrowReaderOptions,
     proj: Option<&[String]>,
-) -> Result<Vec<ListenRow>> {
+) -> Result<UnitDecode> {
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?;
     finish_decode_rows(builder, path, key, row_numbers, proj)
 }
@@ -820,19 +864,21 @@ fn finish_decode_rows<T: parquet::file::reader::ChunkReader + 'static>(
     key: &str,
     row_numbers: &[u64],
     proj: Option<&[String]>,
-) -> Result<Vec<ListenRow>> {
+) -> Result<UnitDecode> {
     let selection =
         row_numbers_to_selection(row_numbers, builder.metadata().file_metadata().num_rows() as u64)?;
     let builder = apply_projection(builder, proj);
     let reader = builder.with_row_selection(selection).build()?;
 
     let mut out = Vec::new();
+    let mut parquet_batches = Vec::new();
     let mut sorted_rows = row_numbers.to_vec();
     sorted_rows.sort_unstable();
     let mut cursor = 0usize;
 
     for batch in reader {
         let batch = batch?;
+        let is_blob = is_blob_schema(&batch);
         let extracted = extract_listens(&batch, path, key)?;
         for row in extracted {
             if row.user_id == key {
@@ -844,8 +890,16 @@ fn finish_decode_rows<T: parquet::file::reader::ChunkReader + 'static>(
                 out.push(row);
             }
         }
+        // Blob / payload expansion: ListenRows are the source of truth; batch is
+        // rebuilt from those rows after sort/time/limit.
+        if !is_blob {
+            parquet_batches.push(batch);
+        }
     }
-    Ok(out)
+    Ok(UnitDecode {
+        rows: out,
+        parquet_batches,
+    })
 }
 
 fn row_numbers_to_selection(rows: &[u64], total_rows: u64) -> Result<RowSelection> {
@@ -1011,6 +1065,407 @@ fn extract_listens(batch: &RecordBatch, path: &PathBuf, fallback_user: &str) -> 
         });
     }
     Ok(out)
+}
+
+fn is_blob_schema(batch: &RecordBatch) -> bool {
+    batch.column_by_name("payload").is_some() && batch.column_by_name("track_uri").is_none()
+}
+
+fn empty_record_batch() -> RecordBatch {
+    RecordBatch::new_empty(Arc::new(Schema::empty()))
+}
+
+fn listen_row_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("timestamp_ms", DataType::Int64, false),
+        Field::new("track_uri", DataType::Utf8, false),
+        Field::new("duration_ms", DataType::Int64, false),
+    ]))
+}
+
+fn listen_rows_to_batch(rows: &[ListenRow]) -> RecordBatch {
+    let schema = listen_row_schema();
+    let user_id: ArrayRef = Arc::new(StringArray::from_iter_values(
+        rows.iter().map(|r| r.user_id.as_str()),
+    ));
+    let timestamp_ms: ArrayRef = Arc::new(Int64Array::from(
+        rows.iter().map(|r| r.timestamp_ms).collect::<Vec<_>>(),
+    ));
+    let track_uri: ArrayRef = Arc::new(StringArray::from_iter_values(
+        rows.iter().map(|r| r.track_uri.as_str()),
+    ));
+    let duration_ms: ArrayRef = Arc::new(Int64Array::from(
+        rows.iter().map(|r| r.duration_ms).collect::<Vec<_>>(),
+    ));
+    RecordBatch::try_new(
+        schema,
+        vec![user_id, timestamp_ms, track_uri, duration_ms],
+    )
+    .unwrap_or_else(|_| empty_record_batch())
+}
+
+fn assemble_parquet_batch(batches: &[RecordBatch], key: &str, opts: &QueryOptions) -> RecordBatch {
+    let schema = batches[0].schema();
+    let mut batch = match arrow::compute::concat_batches(&schema, batches) {
+        Ok(b) => b,
+        Err(_) => batches[0].clone(),
+    };
+    batch = filter_batch_by_key(&batch, key);
+    batch = filter_batch_by_time(&batch, opts);
+    if let Some(lim) = opts.limit {
+        if batch.num_rows() > lim {
+            batch = batch.slice(0, lim);
+        }
+    }
+    batch
+}
+
+fn is_stringy(dt: &DataType) -> bool {
+    match dt {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => true,
+        DataType::Dictionary(_, value) => is_stringy(value.as_ref()),
+        _ => false,
+    }
+}
+
+fn key_column_index(batch: &RecordBatch) -> Option<usize> {
+    if let Some((i, _)) = batch.schema().column_with_name("user_id") {
+        return Some(i);
+    }
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| is_stringy(f.data_type()))
+}
+
+fn string_value_at(col: &dyn Array, i: usize) -> Option<String> {
+    use arrow::array::{DictionaryArray, LargeStringArray, StringViewArray};
+    use arrow::datatypes::{
+        ArrowNativeType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
+        UInt64Type, UInt8Type,
+    };
+    if col.is_null(i) {
+        return None;
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return Some(a.value(i).to_string());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(a.value(i).to_string());
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringViewArray>() {
+        return Some(a.value(i).to_string());
+    }
+    macro_rules! dict {
+        ($t:ty) => {
+            if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<$t>>() {
+                let idx = d.keys().value(i).to_usize()?;
+                return string_value_at(d.values().as_ref(), idx);
+            }
+        };
+    }
+    dict!(Int8Type);
+    dict!(Int16Type);
+    dict!(Int32Type);
+    dict!(Int64Type);
+    dict!(UInt8Type);
+    dict!(UInt16Type);
+    dict!(UInt32Type);
+    dict!(UInt64Type);
+    arrow::util::display::array_value_to_string(col, i).ok()
+}
+
+fn filter_batch_by_key(batch: &RecordBatch, key: &str) -> RecordBatch {
+    if batch.num_rows() == 0 {
+        return batch.clone();
+    }
+    let Some(idx) = key_column_index(batch) else {
+        return batch.clone();
+    };
+    let col = batch.column(idx);
+    let mask: Vec<bool> = (0..batch.num_rows())
+        .map(|i| string_value_at(col.as_ref(), i).map(|s| s == key).unwrap_or(false))
+        .collect();
+    let pred = BooleanArray::from(mask);
+    arrow::compute::filter_record_batch(batch, &pred).unwrap_or_else(|_| batch.clone())
+}
+
+fn timestamp_col(batch: &RecordBatch) -> Option<&dyn Array> {
+    batch
+        .column_by_name("timestamp")
+        .or_else(|| batch.column_by_name("timestamp_ms"))
+        .map(|c| c.as_ref())
+}
+
+fn ts_ms_at(col: &dyn Array, i: usize) -> Option<i64> {
+    use arrow::array::{
+        TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
+    };
+    use arrow::datatypes::TimeUnit;
+    if col.is_null(i) {
+        return Some(0);
+    }
+    match col.data_type() {
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| a.value(i)),
+        DataType::UInt64 => col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|a| a.value(i) as i64),
+        DataType::Timestamp(unit, _) => {
+            let raw = if let Some(a) = col.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                Some(a.value(i))
+            } else if let Some(a) = col.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                Some(a.value(i))
+            } else if let Some(a) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                Some(a.value(i))
+            } else if let Some(a) = col.as_any().downcast_ref::<TimestampSecondArray>() {
+                Some(a.value(i))
+            } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                Some(a.value(i))
+            } else {
+                None
+            }?;
+            Some(match unit {
+                TimeUnit::Second => raw.saturating_mul(1_000),
+                TimeUnit::Millisecond => raw,
+                TimeUnit::Microsecond => raw / 1_000,
+                TimeUnit::Nanosecond => raw / 1_000_000,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn filter_batch_by_time(batch: &RecordBatch, opts: &QueryOptions) -> RecordBatch {
+    if batch.num_rows() == 0 || (opts.since_ms.is_none() && opts.until_ms.is_none()) {
+        return batch.clone();
+    }
+    let Some(col) = timestamp_col(batch) else {
+        return batch.clone();
+    };
+    let mask: Vec<bool> = (0..batch.num_rows())
+        .map(|i| {
+            let Some(ts) = ts_ms_at(col, i) else {
+                return true;
+            };
+            if let Some(since) = opts.since_ms {
+                if ts < since {
+                    return false;
+                }
+            }
+            if let Some(until) = opts.until_ms {
+                if ts > until {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    let pred = BooleanArray::from(mask);
+    arrow::compute::filter_record_batch(batch, &pred).unwrap_or_else(|_| batch.clone())
+}
+
+/// Convert each batch row to a JSON object. Unknown / nested types become
+/// structured JSON when possible, otherwise `null` (never panics).
+pub fn batch_to_json_rows(batch: &RecordBatch) -> Vec<serde_json::Value> {
+    let n = batch.num_rows();
+    let names: Vec<String> = batch
+        .schema_ref()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut map = serde_json::Map::new();
+        for (j, name) in names.iter().enumerate() {
+            map.insert(name.clone(), array_value_to_json(batch.column(j).as_ref(), i));
+        }
+        out.push(serde_json::Value::Object(map));
+    }
+    out
+}
+
+fn array_value_to_json(col: &dyn Array, i: usize) -> serde_json::Value {
+    use arrow::array::{
+        BinaryArray, BooleanArray as ArrowBooleanArray, DictionaryArray, FixedSizeBinaryArray,
+        Float32Array, Float64Array, Int32Array, LargeBinaryArray, LargeListArray, LargeStringArray,
+        ListArray, StringViewArray, StructArray, TimestampMicrosecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::{
+        ArrowNativeType, Int16Type, Int32Type, Int64Type, Int8Type, TimeUnit, UInt16Type,
+        UInt32Type, UInt64Type, UInt8Type,
+    };
+    if col.is_null(i) {
+        return serde_json::Value::Null;
+    }
+    match col.data_type() {
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| serde_json::Value::String(a.value(i).to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::LargeUtf8 => col
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .map(|a| serde_json::Value::String(a.value(i).to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Utf8View => col
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .map(|a| serde_json::Value::String(a.value(i).to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| serde_json::json!(a.value(i)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Int32 => col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .map(|a| serde_json::json!(a.value(i)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt64 => col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .map(|a| serde_json::json!(a.value(i)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::UInt32 => col
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .map(|a| serde_json::json!(a.value(i)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Float64 => col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .and_then(|a| serde_json::Number::from_f64(a.value(i)))
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Float32 => col
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .and_then(|a| serde_json::Number::from_f64(a.value(i) as f64))
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Boolean => col
+            .as_any()
+            .downcast_ref::<ArrowBooleanArray>()
+            .map(|a| serde_json::Value::Bool(a.value(i)))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Timestamp(unit, _) => {
+            let raw = if let Some(a) = col.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                Some(a.value(i))
+            } else if let Some(a) = col.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                Some(a.value(i))
+            } else if let Some(a) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
+                Some(a.value(i))
+            } else if let Some(a) = col.as_any().downcast_ref::<TimestampSecondArray>() {
+                Some(a.value(i))
+            } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+                Some(a.value(i))
+            } else {
+                None
+            };
+            match raw {
+                Some(v) => {
+                    let ms = match unit {
+                        TimeUnit::Second => v.saturating_mul(1_000),
+                        TimeUnit::Millisecond => v,
+                        TimeUnit::Microsecond => v / 1_000,
+                        TimeUnit::Nanosecond => v / 1_000_000,
+                    };
+                    serde_json::json!(ms)
+                }
+                None => serde_json::Value::Null,
+            }
+        }
+        DataType::Binary => col
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .map(|a| serde_json::Value::String(hex::encode(a.value(i))))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::LargeBinary => col
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .map(|a| serde_json::Value::String(hex::encode(a.value(i))))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::FixedSizeBinary(_) => col
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .map(|a| serde_json::Value::String(hex::encode(a.value(i))))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::List(_) => col
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .map(|a| list_values_to_json(a.value(i).as_ref()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::LargeList(_) => col
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .map(|a| list_values_to_json(a.value(i).as_ref()))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Struct(_) => col
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .map(|st| struct_row_to_json(st, i))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Dictionary(_, _) => {
+            macro_rules! dict {
+                ($t:ty) => {
+                    if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<$t>>() {
+                        let Some(idx) = d.keys().value(i).to_usize() else {
+                            return serde_json::Value::Null;
+                        };
+                        return array_value_to_json(d.values().as_ref(), idx);
+                    }
+                };
+            }
+            dict!(Int8Type);
+            dict!(Int16Type);
+            dict!(Int32Type);
+            dict!(Int64Type);
+            dict!(UInt8Type);
+            dict!(UInt16Type);
+            dict!(UInt32Type);
+            dict!(UInt64Type);
+            serde_json::Value::Null
+        }
+        _ => {
+            if let Ok(s) = arrow::util::display::array_value_to_string(col, i) {
+                serde_json::Value::String(s)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+    }
+}
+
+fn list_values_to_json(inner: &dyn Array) -> serde_json::Value {
+    let mut arr = Vec::with_capacity(inner.len());
+    for j in 0..inner.len() {
+        arr.push(array_value_to_json(inner, j));
+    }
+    serde_json::Value::Array(arr)
+}
+
+fn struct_row_to_json(st: &arrow::array::StructArray, i: usize) -> serde_json::Value {
+    if st.is_null(i) {
+        return serde_json::Value::Null;
+    }
+    let mut map = serde_json::Map::new();
+    for (j, field) in st.fields().iter().enumerate() {
+        map.insert(
+            field.name().clone(),
+            array_value_to_json(st.column(j).as_ref(), i),
+        );
+    }
+    serde_json::Value::Object(map)
 }
 
 /// Naive full scan of all Parquet files - baseline for `needle bench`.
@@ -1347,5 +1802,42 @@ mod tests {
             expl.estimated_bytes > 0 || !expl.page_descriptions.is_empty(),
             "explain should estimate bytes or describe pages"
         );
+    }
+
+    #[test]
+    fn json_rows_contains_listen_fields() {
+        let (_tmp, querier, _) = setup(WriteMode::Sorted, false);
+        let res = querier.query("user_0000").unwrap();
+        let json = res.json_rows();
+        assert!(!json.is_empty(), "expected json rows for user_0000");
+        let row = &json[0];
+        assert!(
+            row.get("track_uri").is_some() || row.get("timestamp").is_some(),
+            "expected track_uri or timestamp in json row: {row}"
+        );
+    }
+
+    #[test]
+    fn record_batch_row_count_matches_rows() {
+        let (_tmp, querier, _) = setup(WriteMode::Sorted, false);
+        let res = querier.query("user_0000").unwrap();
+        assert_eq!(res.record_batch().num_rows(), res.rows.len());
+        assert!(!res.rows.is_empty());
+    }
+
+    #[test]
+    fn covering_only_empty_batch() {
+        let (_tmp, querier, _) = setup(WriteMode::Sorted, true);
+        let res = querier
+            .query_with(
+                "user_0005",
+                &QueryOptions {
+                    covering_only: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(res.record_batch().num_rows(), 0);
+        assert!(res.rows.is_empty());
     }
 }
