@@ -2,6 +2,8 @@
 
 **Point queries on your data lake - without copying it into a KV store.**
 
+Why *Needle*? A data lake is a haystack, one key is a needle, and the usual plan is to hire a combine harvester. Scan engines find the needle by eating the haystack (then billing you for the straw). We keep a map to the needle so you can just pick it up.
+
 Needle is an external **key → file + page** index over ordinary Parquet. Look up a key, issue a handful of precise object-storage Range GETs, decode only those pages. Same files BigQuery / Spark / DuckDB already scan; no second copy of the data.
 
 Inspired by Spotify’s [Random Access Parquet (RAP)](https://engineering.atspotify.com/2026/7/indexing-the-data-lake-for-online-point-queries) write-up. This repo is a faithful Rust recreation + local MinIO lake stress harness.
