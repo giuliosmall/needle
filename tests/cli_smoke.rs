@@ -14,7 +14,9 @@ fn cli_help_lists_commands() {
         .stdout(predicate::str::contains("generate"))
         .stdout(predicate::str::contains("index"))
         .stdout(predicate::str::contains("query"))
-        .stdout(predicate::str::contains("demo"));
+        .stdout(predicate::str::contains("demo"))
+        .stdout(predicate::str::contains("explain"))
+        .stdout(predicate::str::contains("stats"));
 }
 
 #[test]

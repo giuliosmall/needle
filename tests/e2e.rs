@@ -349,3 +349,125 @@ fn e2e_stress_larger_dataset() {
         assert_eq!(rap.rows.len(), 40);
     }
 }
+
+#[test]
+fn e2e_covering_only_no_rows() {
+    let (_t, q, _) = generate_index_query(WriteMode::Sorted);
+    let key = "user_0012";
+    let res = q
+        .query_with(
+            key,
+            &QueryOptions {
+                covering_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        res.rows.is_empty(),
+        "covering_only should skip row payloads, got {}",
+        res.rows.len()
+    );
+    assert!(
+        !res.covering_hits.is_empty(),
+        "covering_only should still return covering hits"
+    );
+    // Covering timestamp bounds are optional fields on the index entry.
+    for e in q.index.lookup(key) {
+        if let Some(c) = &e.covering {
+            if let (Some(min_ts), Some(max_ts)) = (c.min_ts, c.max_ts) {
+                assert!(min_ts <= max_ts);
+            }
+        }
+    }
+}
+
+#[test]
+fn e2e_time_window() {
+    let (_t, q, _) = generate_index_query(WriteMode::Sorted);
+    let key = "user_0010";
+    let full = q.query(key).unwrap();
+    assert!(
+        full.rows.len() >= 3,
+        "need enough timestamps to window, got {}",
+        full.rows.len()
+    );
+    let mut ts: Vec<i64> = full.rows.iter().map(|r| r.timestamp_ms).collect();
+    ts.sort();
+    // Inclusive-looking bounds that still drop the extremes for this key.
+    let since_ms = Some(ts[1]);
+    let until_ms = Some(ts[ts.len() - 2]);
+    let windowed = q
+        .query_with(
+            key,
+            &QueryOptions {
+                since_ms,
+                until_ms,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        !windowed.rows.is_empty(),
+        "window should include some rows (since={since_ms:?} until={until_ms:?})"
+    );
+    assert!(
+        windowed.rows.len() < full.rows.len(),
+        "window should exclude some rows: windowed={} full={}",
+        windowed.rows.len(),
+        full.rows.len()
+    );
+    for r in &windowed.rows {
+        assert!(r.timestamp_ms >= ts[1], "row ts {} < since", r.timestamp_ms);
+        assert!(
+            r.timestamp_ms <= ts[ts.len() - 2],
+            "row ts {} > until",
+            r.timestamp_ms
+        );
+    }
+    assert!(
+        windowed.skipped_by_predicate > 0,
+        "time window should record skipped_by_predicate, got {}",
+        windowed.skipped_by_predicate
+    );
+}
+
+#[test]
+fn e2e_explain_lists_files() {
+    let (_t, q, _) = generate_index_query(WriteMode::Sorted);
+    let explain = q
+        .explain("user_0012", &QueryOptions::default())
+        .unwrap();
+    assert!(
+        !explain.files.is_empty(),
+        "explain() should list files, got {:?}",
+        explain.files
+    );
+    assert!(
+        explain.estimated_range_gets > 0 || !explain.page_descriptions.is_empty(),
+        "explain() should estimate range gets or list page descriptions"
+    );
+}
+
+#[test]
+fn e2e_secondary_key_column_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("parquet");
+    let idx = tmp.path().join("rap-index");
+    let paths = write_sample_dataset(&opts(&data, WriteMode::Sorted)).unwrap();
+    let (naive, _) = naive_scan(&paths, "user_0000").unwrap();
+    assert!(!naive.is_empty(), "expected sample rows for user_0000");
+    let track = naive[0].track_uri.clone();
+
+    IndexBuilder::new(&idx, 8)
+        .with_key_columns(vec!["track_uri".into()])
+        .build_fragment(&paths, "frag-track", Some("track_uri key"))
+        .unwrap();
+    let index = load_index(&idx).unwrap();
+    let key = rap::index::encode_key(&[track.as_str()]);
+    let entries = index.lookup(&key);
+    assert!(
+        !entries.is_empty(),
+        "expected index entries for track key {key} (track_uri={track})"
+    );
+}
