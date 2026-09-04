@@ -1717,14 +1717,13 @@ fn build_query_options(
 }
 
 fn print_sql_result(result: &needle::sql::SqlResult, out: OutputFormat) -> Result<()> {
+    let rows = needle::sql::batch_to_json(&result.batch)?;
     match out {
         OutputFormat::Json => {
-            let rows = needle::sql::batch_to_json(&result.batch);
             println!("{}", serde_json::to_string(&rows)?);
         }
         OutputFormat::Table => {
-            // JSON lines (Arrow pretty-print is not enabled in this crate's arrow features).
-            for row in needle::sql::batch_to_json(&result.batch) {
+            for row in rows {
                 println!("{row}");
             }
         }

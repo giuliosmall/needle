@@ -70,7 +70,11 @@ fn lookup_hits(index: &Path, key: &str, query: &QueryOptions) -> Result<RecordBa
     let idx = load_index_for_keys(index, &[key.to_string()])?;
     let querier = RapQuerier::new(idx);
     let res = querier.query_with(key, query)?;
-    listen_rows_to_batch(&res.rows)
+    if res.batch.num_rows() > 0 {
+        Ok(res.batch)
+    } else {
+        listen_rows_to_batch(&res.rows)
+    }
 }
 
 /// Convenience wrapper: RAP lookup for `key`, then SQL against `hits`.
