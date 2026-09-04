@@ -116,6 +116,34 @@ needle stats --index data/rap-index
 only the index buckets for that key. `needle query --help` / `needle index --help` list
 the filter and column flags.
 
+### HTTP daemon
+
+Serve point queries over HTTP (optional `--lazy-buckets`):
+
+```bash
+needled --index data/rap-index --bind 127.0.0.1:7780
+# or
+needle daemon --index data/rap-index
+```
+
+`GET http://127.0.0.1:7780/v1/query?key=user_0042`
+
+### Iceberg
+
+Index an Apache Iceberg table into Needle fragments:
+
+```bash
+needle iceberg-index --table /path/to/iceberg/table --index data/rap-index --key-column user_id --covering
+```
+
+### SQL
+
+Run SQL over the hits for a single key (`hits` table):
+
+```bash
+needle sql --index data/rap-index --key user_0042 --sql "SELECT track_uri, count(*) AS n FROM hits GROUP BY track_uri ORDER BY n DESC"
+```
+
 ### MinIO lake (optional stress)
 
 Needle can speak S3 Range GET against a **local** MinIO (no cloud account):

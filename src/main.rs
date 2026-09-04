@@ -3,20 +3,26 @@
 //! Commands map to the article workflow:
 //!   needle generate  - write prepared Parquet / sidecars
 //!   needle index     - build external append-only index (+ optional secondary)
+//!   needle iceberg-index - index an Apache Iceberg table into Needle fragments
 //!   needle query     - point lookup via index + ranged reads (+ filters / JSON)
+//!   needle sql       - SQL over the rows for one key (`hits` table)
 //!   needle explain   - plan a lookup (files, pages, estimated Range GETs)
 //!   needle stats     - fragment / manifest summary without loading buckets
 //!   needle bench     - compare naive scan vs RAP
 //!   needle serve     - tiny HTTP Range server for object-store demo
+//!   needle daemon    - HTTP query daemon (`GET /v1/query?key=…`)
 //!   needle demo / demo-full - end-to-end demos
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate};
 use clap::{Parser, Subcommand, ValueEnum};
+use needle::iceberg::{self, IcebergIndexOpts};
 use needle::index::{IndexBuilder, load_index, load_index_for_keys};
 use needle::query::{QueryOptions, RapQuerier, collect_demo_ranges, naive_scan};
 use needle::secondary::{self, refs_to_primary_entries};
 use needle::lake::{self, LakeGenerateOpts};
+use needle::server::{self, DaemonOptions};
+use needle::sql::SqlOptions;
 use needle::storage::{RangeHttpServer, prove_http_matches_local};
 use needle::parquet_lowlevel;
 use needle::writer::{WriteMode, WriterOptions, write_sample_dataset};
@@ -27,7 +33,7 @@ use std::time::Instant;
 #[derive(Parser, Debug)]
 #[command(
     name = "needle",
-    about = "Needle - point queries on a Parquet data lake (Random Access Parquet)",
+    about = "Needle - point queries on a Parquet data lake (Random Access Parquet). Commands include query, daemon, sql, and iceberg-index.",
     version
 )]
 struct Cli {
@@ -88,6 +94,27 @@ enum Cmd {
         #[arg(long, value_name = "NAME")]
         value_column: Vec<String>,
     },
+    /// Index an Apache Iceberg table into Needle / RAP fragments.
+    #[command(name = "iceberg-index")]
+    IcebergIndex {
+        /// Path to the Iceberg table root (or table metadata).
+        #[arg(long)]
+        table: PathBuf,
+        #[arg(long, default_value = "data/rap-index")]
+        index: PathBuf,
+        /// Key column to index (repeatable). Default: user_id.
+        #[arg(long, value_name = "NAME")]
+        key_column: Vec<String>,
+        /// Value column to store alongside the key (repeatable).
+        #[arg(long, value_name = "NAME")]
+        value_column: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        covering: bool,
+        #[arg(long, default_value_t = 16)]
+        buckets: u32,
+        #[arg(long, default_value = "iceberg")]
+        fragment_prefix: String,
+    },
     /// Point-query a key through the Needle / RAP index (filters, JSON, secondary range).
     ///
     /// Compound keys: join parts with `||` (encoded as U+001F), or pass an already-encoded
@@ -140,6 +167,35 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
         /// Shorthand for `--format json` (stdout is a single JSON object).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Run SQL over the rows for one key (table name `hits`).
+    Sql {
+        #[arg(long, default_value = "data/rap-index")]
+        index: PathBuf,
+        /// Lookup key whose hits form the `hits` table.
+        #[arg(long)]
+        key: String,
+        /// SQL statement (e.g. `SELECT track_uri, count(*) FROM hits GROUP BY 1`).
+        #[arg(long)]
+        sql: String,
+        /// Project these columns when loading hits (comma-separated or repeat the flag).
+        #[arg(long, value_name = "NAME")]
+        columns: Vec<String>,
+        /// Inclusive start time (RFC3339, YYYY-MM-DD as UTC midnight, or integer ms).
+        #[arg(long, value_name = "TIME")]
+        since: Option<String>,
+        /// Inclusive end time (RFC3339, YYYY-MM-DD as UTC end of day 23:59:59.999, or integer ms).
+        #[arg(long, value_name = "TIME")]
+        until: Option<String>,
+        /// Max rows to load into `hits` before running SQL (index pagination).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output format (`table` = JSON lines; `json` = `batch_to_json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+        /// Shorthand for `--format json`.
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -200,6 +256,16 @@ enum Cmd {
         /// Hold the server this many seconds (0 = until Ctrl-C / process end via demo).
         #[arg(long, default_value_t = 30)]
         seconds: u64,
+    },
+    /// HTTP query daemon (`GET /v1/query?key=…`).
+    Daemon {
+        #[arg(long, default_value = "data/rap-index")]
+        index: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:7780")]
+        bind: String,
+        /// Load index buckets on demand instead of at startup.
+        #[arg(long, default_value_t = false)]
+        lazy_buckets: bool,
     },
     /// End-to-end demo: generate → index → query → bench.
     Demo {
@@ -485,6 +551,38 @@ fn main() -> Result<()> {
                 loaded.files.len()
             );
         }
+        Cmd::IcebergIndex {
+            table,
+            index,
+            key_column,
+            value_column,
+            covering,
+            buckets,
+            fragment_prefix,
+        } => {
+            let key_columns = if key_column.is_empty() {
+                vec!["user_id".to_string()]
+            } else {
+                key_column
+            };
+            let report = iceberg::index_iceberg_table(&IcebergIndexOpts {
+                table,
+                index,
+                key_columns,
+                value_columns: value_column,
+                covering,
+                buckets,
+                fragment_prefix,
+            })?;
+            println!(
+                "snapshot_id={} fragment_id={} files_indexed={} skipped={} table_location={}",
+                report.snapshot_id,
+                report.fragment_id,
+                report.files_indexed,
+                report.skipped,
+                report.table_location
+            );
+        }
         Cmd::Query {
             key,
             index,
@@ -523,6 +621,36 @@ fn main() -> Result<()> {
                 min_listens,
                 out,
             )?;
+        }
+        Cmd::Sql {
+            index,
+            key,
+            sql: sql_text,
+            columns,
+            since,
+            until,
+            limit,
+            format,
+            json,
+        } => {
+            let out = resolve_format(format, json);
+            let qopts = build_query_options(
+                0,
+                limit,
+                None,
+                &columns,
+                since.as_deref(),
+                until.as_deref(),
+                false,
+                None,
+            )?;
+            let result = needle::sql::run_sql(&SqlOptions {
+                index,
+                key: Some(encode_cli_key(&key)),
+                sql: sql_text,
+                query: qopts,
+            })?;
+            print_sql_result(&result, out)?;
         }
         Cmd::Explain {
             key,
@@ -617,6 +745,17 @@ fn main() -> Result<()> {
             std::thread::sleep(std::time::Duration::from_secs(seconds));
             println!("Stopping server.");
             server.stop();
+        }
+        Cmd::Daemon {
+            index,
+            bind,
+            lazy_buckets,
+        } => {
+            server::serve_forever(DaemonOptions {
+                index,
+                bind,
+                lazy_buckets,
+            })?;
         }
         Cmd::Demo {
             root,
@@ -1577,25 +1716,29 @@ fn build_query_options(
     })
 }
 
+fn print_sql_result(result: &needle::sql::SqlResult, out: OutputFormat) -> Result<()> {
+    match out {
+        OutputFormat::Json => {
+            let rows = needle::sql::batch_to_json(&result.batch);
+            println!("{}", serde_json::to_string(&rows)?);
+        }
+        OutputFormat::Table => {
+            // JSON lines (Arrow pretty-print is not enabled in this crate's arrow features).
+            for row in needle::sql::batch_to_json(&result.batch) {
+                println!("{row}");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn query_result_json(
     result: &needle::query::QueryResult,
     index_load: std::time::Duration,
 ) -> serde_json::Value {
     let t = &result.timings;
-    let rows: Vec<serde_json::Value> = result
-        .rows
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "user_id": r.user_id,
-                "timestamp_ms": r.timestamp_ms,
-                "track_uri": r.track_uri,
-                "duration_ms": r.duration_ms,
-                "source_file": r.source_file,
-                "row_number": r.row_number,
-            })
-        })
-        .collect();
+    // Prefer QueryResult::json_rows() over hardcoding ListenRow fields (sibling API).
+    let rows = result.json_rows();
     serde_json::json!({
         "key": result.key,
         "rows": rows,

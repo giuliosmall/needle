@@ -10,6 +10,17 @@ fn needle() -> Command {
 }
 
 #[test]
+fn cli_help_lists_daemon_sql_iceberg_index() {
+    needle()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("daemon"))
+        .stdout(predicate::str::contains("sql"))
+        .stdout(predicate::str::contains("iceberg-index"));
+}
+
+#[test]
 fn cli_demo_tiny_dataset_exit_zero_and_markers() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
