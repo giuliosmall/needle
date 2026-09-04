@@ -11,6 +11,7 @@ pub mod parquet_lowlevel;
 pub mod prepared;
 pub mod query;
 pub mod server;
+pub mod sql;
 pub mod secondary;
 pub mod s3;
 pub mod storage;

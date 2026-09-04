@@ -22,6 +22,8 @@ bincode = "1.3"
 clap = { version = "4", features = ["derive", "env"] }
 parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd"] }
 rayon = "1.10"
+datafusion = "55"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
