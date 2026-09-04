@@ -1,6 +1,6 @@
 //! Minimal path-style S3 client for local MinIO (no cloud / no gcloud).
 //!
-//! Raw TCP + AWS SigV4 — same rustc-1.85 constraint as `HttpRange` (no reqwest).
+//! Raw TCP + AWS SigV4 - same rustc-1.85 constraint as `HttpRange` (no reqwest).
 //! Supports Range GET, full GET, PUT, HEAD, ListObjectsV2.
 //! Anonymous GET works when the bucket allows download (our lake setup).
 
@@ -677,7 +677,7 @@ impl crate::storage::RangeReader for S3RangeReader {
 /// Parquet `ChunkReader` over MinIO Range GETs (fat-file RAP decode).
 ///
 /// Footer parse uses `get_read` near EOF (a few bytes). With OffsetIndex +
-/// `RowSelection`, page bodies come through `get_bytes` of individual pages —
+/// `RowSelection`, page bodies come through `get_bytes` of individual pages -
 /// never a whole-object GET.
 pub struct S3ChunkReader {
     client: S3Client,

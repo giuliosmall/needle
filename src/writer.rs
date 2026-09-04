@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum WriteMode {
-    /// Flat rows, unsorted (baseline — keys scattered across pages).
+    /// Flat rows, unsorted (baseline - keys scattered across pages).
     Unsorted,
     /// Flat rows sorted by user_id (article: concentrating key data).
     Sorted,
@@ -242,7 +242,7 @@ fn writer_props(opts: &WriterOptions) -> WriterProperties {
 
 /// One-page-per-key: one RecordBatch (and effectively one page / RG) per key.
 /// Uses tiny page limits + one batch per key so OffsetIndex yields one page
-/// location per key per column — stored into the RAP index at build time.
+/// location per key per column - stored into the RAP index at build time.
 fn one_page_props(rows_in_key: usize, write_page_index: bool) -> WriterProperties {
     let n = rows_in_key.max(1);
     WriterProperties::builder()
@@ -279,7 +279,7 @@ fn write_one_page_per_key(path: &Path, listens: &[Listen], opts: &WriterOptions)
     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
     // Open writer with a permissive max RG; we recreate props per key via
     // flush by writing one key then relying on max_row_group_row_count.
-    // arrow-rs applies properties at writer construction — so we use the
+    // arrow-rs applies properties at writer construction - so we use the
     // max key size as the page/RG limit and feed exactly one key per write,
     // calling `flush` between keys when available.
     let max_key = listens

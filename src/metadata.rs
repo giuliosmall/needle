@@ -22,7 +22,7 @@ pub struct ColumnPageIndex {
     pub pages: Vec<PageLocation>,
 }
 
-/// Cached metadata for one Parquet file — enough to map rows → byte ranges
+/// Cached metadata for one Parquet file - enough to map rows → byte ranges
 /// without re-reading the footer.
 #[derive(Debug, Clone)]
 pub struct CachedFileMeta {

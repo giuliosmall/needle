@@ -151,7 +151,7 @@ fn lake_object_key(prefix: &str, date: &str, hash_bucket: usize, part: usize) ->
 pub fn ensure_minio(bucket: &str) -> Result<S3Client> {
     let client = S3Client::from_env();
     // Cheap health check: list a prefix that should be empty (do NOT list the
-    // whole lake — that is 100k–1M keys and dominated startup).
+    // whole lake - that is 100k–1M keys and dominated startup).
     match client.list_objects(bucket, ".rap-healthcheck") {
         Ok(_) => Ok(client),
         Err(_) => {
@@ -198,7 +198,7 @@ pub fn minio_up() -> Result<()> {
     let minio = PathBuf::from(TOOLS_MINIO);
     if !minio.exists() {
         bail!(
-            "MinIO binary not found at {} — download linux-amd64 minio + mc into tools/",
+            "MinIO binary not found at {} - download linux-amd64 minio + mc into tools/",
             minio.display()
         );
     }
@@ -227,7 +227,7 @@ pub fn minio_up() -> Result<()> {
         }
     }
     if !TcpOk::check("127.0.0.1:9000") {
-        bail!("MinIO failed to start — see {}", log.display());
+        bail!("MinIO failed to start - see {}", log.display());
     }
     let client = ensure_minio(DEFAULT_BUCKET)?;
     println!("MinIO started at http://127.0.0.1:9000 (console :9001)");
@@ -346,7 +346,7 @@ pub fn lake_generate(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
                 Ok(buf.len())
             })?;
             // Fast path: index from in-memory listens; contiguous span = whole object
-            // (tiny files — one ranged read). Skips footer parse at generate-time.
+            // (tiny files - one ranged read). Skips footer parse at generate-time.
             // File ordinal = generation index (deterministic; no global dict lock).
             let t_idx = Instant::now();
             let entries = index_entries_fast(&listens, nbytes as u64, i as u32)?;
@@ -750,7 +750,7 @@ pub fn lake_index_from_bucket(
     })?;
 
     let mut files = file_dict.into_inner().unwrap();
-    // Preserve order from parallel is nondeterministic — re-sort by URI and rewrite ordinals?
+    // Preserve order from parallel is nondeterministic - re-sort by URI and rewrite ordinals?
     // For correctness of entries.file we must keep dict order as assigned. OK.
     let _ = &mut files;
 
@@ -1778,7 +1778,7 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
     let acc = StressAcc::new(n + warmup_n);
     let wall0 = Instant::now();
 
-    // Warm-up (sequential, first warmup_n keys) — still via waves for memory.
+    // Warm-up (sequential, first warmup_n keys) - still via waves for memory.
     if warmup_n > 0 {
         eprintln!("  warmup {warmup_n} queries…");
         let warm_keys: Vec<String> = keys[..warmup_n].to_vec();
@@ -1819,7 +1819,7 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
         let idx = load_index_entries_for_keys(&root, Arc::clone(&files), &fragments, &wave_keys)?;
         let querier = RapQuerier::new(idx).with_s3(client.clone());
         // Run with verify based on original positions: pass keys and check inside using enumerate offset.
-        // Simpler: run_query_batch with query_offset=0 and verify_every on local i — approximate.
+        // Simpler: run_query_batch with query_offset=0 and verify_every on local i - approximate.
         // Better: verify using original index.
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(opts.concurrency.max(1))
@@ -2058,7 +2058,7 @@ pub fn lake_e2e_fat_small(index_dir: &Path) -> Result<()> {
     }
     let min_sz = man.file_sizes.iter().copied().min().unwrap_or(0);
     if min_sz < 500_000 {
-        bail!("fat e2e: file too small ({min_sz} bytes) — need multi-MB-ish for the proof");
+        bail!("fat e2e: file too small ({min_sz} bytes) - need multi-MB-ish for the proof");
     }
     let key = man.sample_keys.first().cloned().unwrap_or_else(|| "user_0".into());
     let report = lake_query(index_dir, &key, 32)?;
@@ -2193,7 +2193,7 @@ pub fn lake_demo_fat(files: usize, rows_per_file: usize, index_dir: &Path) -> Re
             r.naive_full_get_ms
         );
         if r.bytes_ratio >= 0.01 {
-            println!("  (ratio not yet < 1% — still ≪ full object if ratio < 5%)");
+            println!("  (ratio not yet < 1% - still ≪ full object if ratio < 5%)");
         }
     }
     println!("\n=== fat lake bench ===");

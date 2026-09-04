@@ -3,13 +3,13 @@
 //! "RAP supports this by building multiple access structures over the same index
 //! entries, one per dimension. Hash tables give O(1) exact lookups; sorted indexes
 //! enable range queries. Adding or removing a secondary index is a serving-layer
-//! decision — no pipeline changes, no data rewriting."
+//! decision - no pipeline changes, no data rewriting."
 //!
 //! Layout:
 //!   fragments/<id>/secondary/<dim>/
 //!     manifest.json
-//!     hash/buckets/bucket_NNN.bin|.jsonl   — O(1) exact
-//!     sorted/entries.bin|.jsonl            — range scans (keys sorted)
+//!     hash/buckets/bucket_NNN.bin|.jsonl   - O(1) exact
+//!     sorted/entries.bin|.jsonl            - range scans (keys sorted)
 
 use crate::index::{key_bucket, RapIndexEntry};
 use anyhow::{Context, Result, bail};
@@ -96,7 +96,7 @@ pub fn secondary_index_root(
 }
 
 /// Build a secondary index over `dimension` by scanning the same Parquet files
-/// already registered in the primary fragment — **no Parquet rewrite**.
+/// already registered in the primary fragment - **no Parquet rewrite**.
 pub fn build_secondary(
     index_root: &Path,
     fragment_id: &str,
@@ -257,7 +257,7 @@ fn scan_dimension(
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
 
-    // sec_key → (primary_key → rows) — for track_uri, primary is user_id.
+    // sec_key → (primary_key → rows) - for track_uri, primary is user_id.
     let mut map: HashMap<String, HashMap<String, Vec<u64>>> = HashMap::new();
     let mut row_base = 0u64;
 

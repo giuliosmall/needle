@@ -1,4 +1,4 @@
-# NOTES — Article details & implementation fidelity
+# NOTES - Article details & implementation fidelity
 
 Source article:
 https://engineering.atspotify.com/2026/7/indexing-the-data-lake-for-online-point-queries
@@ -9,7 +9,7 @@ https://engineering.atspotify.com/2026/7/indexing-the-data-lake-for-online-point
 - Exabytes in the GCS data lake vs petabytes in Bigtable for online use-cases.
 - Interactive / AI-agent point queries need per-key lookup + pagination at low latency.
 - Distributed SQL (Trino, BigQuery) adds seconds of scheduling/planning even for one row.
-- Object storage itself is fast (GCS 30–100ms; Rapid / S3 Express single-digit ms) —
+- Object storage itself is fast (GCS 30–100ms; Rapid / S3 Express single-digit ms) -
   the bottleneck is the **dependent read chain** inside Parquet discovery.
 
 ## How engines find a needle today (article)
@@ -19,7 +19,7 @@ https://engineering.atspotify.com/2026/7/indexing-the-data-lake-for-online-point
 3. Still must, per remaining file: fetch footer → parse row groups → scan key column →
    use column/page indexes → fetch value pages. Multiple round-trips per file/column.
 
-## RAP approach (article) — what we recreated
+## RAP approach (article) - what we recreated
 
 > "Instead of scanning, RAP looks up. An external index maps each key directly to each
 > file and row number… resolve the row number to page locations using cached file
@@ -80,7 +80,7 @@ key cardinality, large `data_page_size_limit` so the key stays in **one** page p
 column. Index builder copies OffsetIndex locations into `page_locs` on each entry.
 Query prefers those locs and skips footer page-index resolution.
 
-Valid standard Parquet — analytics readers unchanged.
+Valid standard Parquet - analytics readers unchanged.
 
 ## ZSTD frame resets / alignment / interleaving (inside Parquet)
 
@@ -120,7 +120,7 @@ fragments/<id>/secondary/<dim>/
 ## HTTP Range
 
 `storage::RangeReader` trait with `LocalFile` and `HttpRange` (raw TCP `Range:`).
-`rap serve --root data/parquet` — tiny_http with 206 + Content-Range.
+`rap serve --root data/parquet` - tiny_http with 206 + Content-Range.
 `rap query … --http http://127.0.0.1:PORT` issues ranged reads over HTTP and can
 prove bytes match local (`prove_http_matches_local`).
 
@@ -129,7 +129,7 @@ prove bytes match local (`prove_http_matches_local`).
 - Index loaded fully into memory (production would memory-map / cache hot buckets)
 - Interleaving stays spec-valid by duplicating sibling columns in official
   chunks; RAP's one-read span is the skippable-bridged bundle in the host page
-- No Bloom / partition pruning layer (out of scope — RAP replaces within-file scan)
+- No Bloom / partition pruning layer (out of scope - RAP replaces within-file scan)
 - Cogrouped nested decode expands lists; page-range demo focuses on flat / blob / prepared
 
 ## Demo expectations
@@ -160,7 +160,7 @@ One-page-per-key overrides these with per-key limits + `flush()` at key boundari
 
 `src/lake.rs` `lake-generate` used to call arrow-rs `ArrowWriter` once per tiny
 object. At ~4 rows that is dominated by writer setup (schema, properties, page
-index machinery) — measured ~100 obj/s vs ~700/s for a bare MinIO PUT.
+index machinery) - measured ~100 obj/s vs ~700/s for a bare MinIO PUT.
 
 Fast path (`src/parquet_lowlevel/tiny.rs`):
 

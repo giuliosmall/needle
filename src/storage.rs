@@ -1,9 +1,9 @@
-//! Ranged byte access — local filesystem and HTTP Range (article: object-store reads).
+//! Ranged byte access - local filesystem and HTTP Range (article: object-store reads).
 //!
 //! Production RAP issues `Range:` requests against GCS / S3 Express. Here we provide
 //! a common trait plus:
-//! - `LocalFile` — `seek` + `read` (existing path)
-//! - `HttpRange` — `reqwest` blocking client with `Range: bytes=start-end`
+//! - `LocalFile` - `seek` + `read` (existing path)
+//! - `HttpRange` - `reqwest` blocking client with `Range: bytes=start-end`
 //! - a tiny `tiny_http` server that serves Parquet/prepared files for demos
 
 use anyhow::{Context, Result, bail};

@@ -32,7 +32,7 @@ fn row_sig(rows: &[rap::query::ListenRow]) -> Vec<(i64, String, i64)> {
 }
 
 fn edge_keys(num_users: usize) -> [&'static str; 3] {
-    // first / mid / last — fixed for num_users=24
+    // first / mid / last - fixed for num_users=24
     let _ = num_users;
     ["user_0000", "user_0012", "user_0023"]
 }

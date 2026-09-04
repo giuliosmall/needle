@@ -6,16 +6,16 @@
 //!
 //! ## Layouts
 //!
-//! **A. ZSTD frame resets (`zstd-frames`)** — one data page per column (single row
+//! **A. ZSTD frame resets (`zstd-frames`)** - one data page per column (single row
 //! group). Compressed page payload is `[zstd_frame(key0)][zstd_frame(key1)]…`.
 //! Standard ZSTD decompress of the whole page concatenates frames → full PLAIN
 //! column. RAP ranged-reads individual frames via `frame_locs`.
 //!
-//! **B. Storage alignment (`aligned`)** — same, but ZSTD *skippable* frames pad so
+//! **B. Storage alignment (`aligned`)** - same, but ZSTD *skippable* frames pad so
 //! the next key's frame starts on a 4KB boundary. Skippable frames are ignored by
 //! a conventional page decompress.
 //!
-//! **C. Interleaving (`interleaved`)** — Parquet requires each column chunk to be a
+//! **C. Interleaving (`interleaved`)** - Parquet requires each column chunk to be a
 //! contiguous region, so we still write official `track_uri` / `duration_ms` chunks
 //! (duplicate PLAIN/ZSTD) for analytics readers. Article intent lives **inside**
 //! the `timestamp` page:

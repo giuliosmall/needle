@@ -1,12 +1,12 @@
 //! CLI for Random Access Parquet (RAP) demo.
 //!
 //! Commands map to the article workflow:
-//!   rap generate  — write prepared Parquet / sidecars
-//!   rap index     — build external append-only index (+ optional secondary)
-//!   rap query     — point lookup via index + ranged reads (+ pagination)
-//!   rap bench     — compare naive scan vs RAP
-//!   rap serve     — tiny HTTP Range server for object-store demo
-//!   rap demo / demo-full — end-to-end demos
+//!   rap generate  - write prepared Parquet / sidecars
+//!   rap index     - build external append-only index (+ optional secondary)
+//!   rap query     - point lookup via index + ranged reads (+ pagination)
+//!   rap bench     - compare naive scan vs RAP
+//!   rap serve     - tiny HTTP Range server for object-store demo
+//!   rap demo / demo-full - end-to-end demos
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
-#[command(name = "rap", about = "Random Access Parquet — Spotify-style point queries over the data lake", version)]
+#[command(name = "rap", about = "Random Access Parquet - Spotify-style point queries over the data lake", version)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -416,11 +416,11 @@ fn main() -> Result<()> {
                     }
                     println!("  HTTP Range proof (base={base}):");
                     for (path, rs) in by_file {
-                        // Server roots at data dir — ensure path is under it.
+                        // Server roots at data dir - ensure path is under it.
                         let _ = data;
                         match prove_http_matches_local(&path, &base, &rs) {
                             Ok(pr) => println!(
-                                "    OK {} — {} ranges, {} bytes match ({})",
+                                "    OK {} - {} ranges, {} bytes match ({})",
                                 path.file_name().unwrap_or_default().to_string_lossy(),
                                 pr.ranges,
                                 pr.bytes_compared,
@@ -747,7 +747,7 @@ fn run_secondary_query(
         let end = format!("{key}\u{ffff}");
         let range_refs = sec.lookup_range(key, &end);
         println!(
-            "  (exact miss — range [{key} .. ] → {} refs)",
+            "  (exact miss - range [{key} .. ] → {} refs)",
             range_refs.len()
         );
         for r in range_refs.iter().skip(offset).take(limit) {
@@ -965,7 +965,7 @@ fn run_demo_full(
             for p in &paths {
                 let proof = parquet_lowlevel::verify_parquet_file(p)?;
                 let n = parquet_lowlevel::try_arrow_read(p)?;
-                println!("  custom writer {} — {proof}; arrow rows={n}", p.file_name().unwrap().to_string_lossy());
+                println!("  custom writer {} - {proof}; arrow rows={n}", p.file_name().unwrap().to_string_lossy());
                 // Must not require sidecar data files.
                 for ext in ["rapz", "rapi"] {
                     let side = p.with_extension(ext);
@@ -1047,7 +1047,7 @@ fn run_demo_full(
     for (path, rs) in &by_file {
         match prove_http_matches_local(path, &base, rs) {
             Ok(pr) => println!(
-                "  PROVED {} — {} ranges / {} bytes identical over HTTP Range",
+                "  PROVED {} - {} ranges / {} bytes identical over HTTP Range",
                 path.file_name().unwrap_or_default().to_string_lossy(),
                 pr.ranges,
                 pr.bytes_compared

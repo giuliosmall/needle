@@ -71,7 +71,7 @@ pub struct QueryOptions {
     pub offset: usize,
     /// Max values to return (None = all after offset).
     pub limit: Option<usize>,
-    /// Optional HTTP base URL — when set, demo ranged reads go through HttpRange.
+    /// Optional HTTP base URL - when set, demo ranged reads go through HttpRange.
     pub http_base: Option<String>,
 }
 
@@ -699,7 +699,7 @@ fn extract_listens(batch: &RecordBatch, path: &PathBuf) -> Result<Vec<ListenRow>
     Ok(out)
 }
 
-/// Naive full scan of all Parquet files — baseline for `rap bench`.
+/// Naive full scan of all Parquet files - baseline for `rap bench`.
 pub fn naive_scan(files: &[PathBuf], key: &str) -> Result<(Vec<ListenRow>, Duration)> {
     let t0 = Instant::now();
     let mut rows = Vec::new();
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(page.offset, 2);
         assert_eq!(page.limit, Some(3));
         assert_eq!(page.total_value_count, 8);
-        // Pagination slices index row_numbers; decode then sorts by timestamp —
+        // Pagination slices index row_numbers; decode then sorts by timestamp -
         // so compare membership against the full result, not a positional slice.
         let full_sig = row_sig(&full.rows);
         for r in &page.rows {

@@ -1,6 +1,6 @@
 # Needle
 
-**Point queries on your data lake — without copying it into a KV store.**
+**Point queries on your data lake - without copying it into a KV store.**
 
 Needle is an external **key → file + page** index over ordinary Parquet. Look up a key, issue a handful of precise object-storage Range GETs, decode only those pages. Same files BigQuery / Spark / DuckDB already scan; no second copy of the data.
 
@@ -11,13 +11,13 @@ cargo build --release
 ./target/release/rap demo --key user_0042
 ```
 
-(CLI binary is still named `rap` — Needle is the project name.)
+(CLI binary is still named `rap` - Needle is the project name.)
 
 ---
 
 ## Why it exists
 
-Online services and agents need **per-key** reads (one user, one entity) at interactive latency. Lakes are cheap and huge; distributed SQL is built for scans. The expensive part is rarely the disk — it’s the **dependent discovery chain** inside each Parquet file:
+Online services and agents need **per-key** reads (one user, one entity) at interactive latency. Lakes are cheap and huge; distributed SQL is built for scans. The expensive part is rarely the disk - it’s the **dependent discovery chain** inside each Parquet file:
 
 ```mermaid
 flowchart LR
@@ -52,8 +52,8 @@ A multimap (hash-bucketed, append-only fragments):
 | `key` | Lookup key (e.g. `user_id`) |
 | `file` | Dictionary-encoded ordinal → Parquet path / `s3://…` URI |
 | `row_numbers` | Rows for that key in the file |
-| `value_count` | Optional — pagination without reading data |
-| `page_locs` / `frame_locs` | Optional — byte ranges stored in the index |
+| `value_count` | Optional - pagination without reading data |
+| `page_locs` / `frame_locs` | Optional - byte ranges stored in the index |
 | `covering` | Optional hoisted aggregates (counts, sums) |
 
 ```mermaid
@@ -137,8 +137,8 @@ sequenceDiagram
 
 **Two stress axes this repo exercises:**
 
-1. **Many files** — index picks 1 of N objects (N → 10⁵–10⁶).
-2. **Fat files** — Range GET pages so `bytes_ranged / file_size` ≪ 1%.
+1. **Many files** - index picks 1 of N objects (N → 10⁵–10⁶).
+2. **Fat files** - Range GET pages so `bytes_ranged / file_size` ≪ 1%.
 
 ---
 
@@ -174,4 +174,4 @@ Apache-2.0.
 
 ## References
 
-- Will Edwards, Spotify Engineering — [*Indexing the Data Lake for Online Point Queries*](https://engineering.atspotify.com/2026/7/indexing-the-data-lake-for-online-point-queries) (2026)
+- Will Edwards, Spotify Engineering - [*Indexing the Data Lake for Online Point Queries*](https://engineering.atspotify.com/2026/7/indexing-the-data-lake-for-online-point-queries) (2026)

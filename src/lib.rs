@@ -1,4 +1,4 @@
-//! Random Access Parquet (RAP) — faithful recreation of Spotify's approach:
+//! Random Access Parquet (RAP) - faithful recreation of Spotify's approach:
 //! external index maps keys → {file ordinal, row numbers} then precise ranged
 //! reads fetch only the pages needed.
 //!

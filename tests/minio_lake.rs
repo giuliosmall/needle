@@ -1,4 +1,4 @@
-//! Small MinIO lake E2E (local only — no cloud). Skips if tools/minio missing.
+//! Small MinIO lake E2E (local only - no cloud). Skips if tools/minio missing.
 //! Large scale: `rap lake-generate --files 1000000` (see README).
 
 use std::path::PathBuf;

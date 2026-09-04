@@ -2,7 +2,7 @@
 name = "rap"
 version = "0.1.0"
 edition = "2021"
-description = "Needle — external key→page index for point queries over lake Parquet (Spotify RAP-inspired)"
+description = "Needle - external key→page index for point queries over lake Parquet (Spotify RAP-inspired)"
 license = "Apache-2.0"
 
 [[bin]]
@@ -26,7 +26,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 rand = "0.8"
 
 # HTTP Range + local demo server (article: ranged reads over object storage)
-# Minimal HTTP client is implemented with std::net (no ureq/reqwest — rustc 1.85).
+# Minimal HTTP client is implemented with std::net (no ureq/reqwest - rustc 1.85).
 tiny_http = "0.12"
 zstd = "0.13"
 hmac = "0.12"

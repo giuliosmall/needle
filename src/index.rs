@@ -1,13 +1,13 @@
 //! External RAP index: multimap key → {file ordinal, row numbers, value_count, …}.
 //!
-//! Article: "The index is a multimap — a single key can have entries across many
+//! Article: "The index is a multimap - a single key can have entries across many
 //! files and partitions. … Large indexes distribute naturally by hash bucketing.
 //! The index grows by appending fragments, not modifying existing ones."
 //!
 //! Extended fields for write-time preparation:
-//! - `page_locs` — one-page-per-key locations stored in the entry (no footer needed)
-//! - `frame_locs` — ZSTD frame offset+size per column
-//! - `contiguous` — interleaved multi-column span for one ranged read
+//! - `page_locs` - one-page-per-key locations stored in the entry (no footer needed)
+//! - `frame_locs` - ZSTD frame offset+size per column
+//! - `contiguous` - interleaved multi-column span for one ranged read
 
 use crate::prepared::{self, ByteSpan, FrameLoc, PreparedManifest};
 use anyhow::{Context, Result, bail};
@@ -290,7 +290,7 @@ fn merge_prepared_into_buckets(
                         Some(k.frames.clone())
                     };
                     e.contiguous = k.contiguous.clone();
-                    // Frames live in the parquet file — no sidecar needed.
+                    // Frames live in the parquet file - no sidecar needed.
                     e.prepared_file = if in_parquet {
                         None
                     } else {
@@ -339,7 +339,7 @@ fn capture_page_locs(path: &Path, rows: &[u64]) -> Result<Vec<PageLoc>> {
     let pq = arrow_meta.metadata();
     let offset_indexes = pq
         .offset_index()
-        .context("no offset index — cannot capture page locs")?;
+        .context("no offset index - cannot capture page locs")?;
 
     // Build row_group starts.
     let mut starts = Vec::new();
@@ -709,7 +709,7 @@ fn scan_key_column(
             None
         };
 
-        // Cogrouped: nested LIST<STRUCT> of listens — hoist list length + duration sum.
+        // Cogrouped: nested LIST<STRUCT> of listens - hoist list length + duration sum.
         let listens_col: Option<&ListArray> = if covering {
             batch
                 .column_by_name("listens")
