@@ -9,6 +9,8 @@ Inspired by Spotify’s [Random Access Parquet (RAP)](https://engineering.atspot
 ```bash
 cargo build --release
 ./target/release/needle demo --key user_0042
+# optional: install onto PATH
+install -m 0755 target/release/needle target/release/needled ~/.local/bin/
 ```
 
 ---
@@ -75,8 +77,8 @@ flowchart TB
 
 1. Hash the key → load the one index bucket (lazy).
 2. Resolve rows → page byte ranges (OffsetIndex and/or index-stored `page_locs`).
-3. Issue **parallel** Range GETs (local file or S3/MinIO).
-4. Decode only those pages; return rows (optional offset/limit).
+3. Issue **parallel** Range GETs (local file, MinIO, or AWS S3).
+4. Decode only those pages; return rows (optional offset/limit) plus covering aggregates.
 
 ### Prep modes (still valid Parquet where possible)
 
@@ -111,15 +113,40 @@ needle explain user_0042
 needle query --dimension track_uri --range-start spotify:track:000 --range-end spotify:track:fff
 needle stats --index data/rap-index
 needle forget --index data/rap-index --key user_0000
-needle compact --index data/rap-index --fragment compact-001
+needle compact --index data/rap-index
 needle verify --index data/rap-index
 ```
 
-`forget` suppresses keys from Needle lookups (sticky across later index fragments). It does not rewrite Parquet. Stop or let `needled` reload after compact/forget (it watches `registry.json`).
+`--format json` (or `--json`) prints one JSON object to stdout. Point-query JSON
+includes `rows` (Arrow projection, not listen-schema-only) and `covering_values`:
 
-`--format json` (or `--json`) prints one JSON object to stdout. Point queries load
-only the index buckets for that key. `needle query --help` / `needle index --help` list
+```json
+{
+  "key": "user_0042",
+  "rows": [{"user_id": "user_0042", "track_uri": "spotify:track:…"}],
+  "covering": ["file=… listen_count=80 …"],
+  "covering_values": [
+    {"file": "…", "value_count": 80, "listen_count": 80, "total_duration_ms": 123, "min_ts": 1, "max_ts": 2}
+  ]
+}
+```
+
+`value_count` is the generic alias of `listen_count`. Point queries load only the
+index buckets for that key. `needle query --help` / `needle index --help` list
 the filter and column flags.
+
+### Compact, forget, verify
+
+The index is append-only fragments (`registry.json` + `fragments/`). These commands
+maintain it without rewriting lake Parquet:
+
+| Command | What it does |
+|---------|----------------|
+| `needle forget --key K` | Hide `K` from lookups. Sticky across later data fragments (`forgotten.jsonl`). Does **not** rewrite Parquet. |
+| `needle compact` | Rewrite to one fragment: last `(key, file)` wins, apply forget + Iceberg drops. Old fragment dirs are kept; `registry.json` points at the new id (`compact-<unix-ms>` unless `--fragment` is set). |
+| `needle verify` | Compare stored size / ETag (`file_idents`) to live local files or S3 HEAD. Missing or resized objects are `stale`. |
+
+`registry.json` is published with tmp+rename. `needled` reloads when that file’s mtime changes, so forget/compact show up without a restart.
 
 ### HTTP daemon
 
@@ -131,27 +158,64 @@ needled --index data/rap-index --bind 127.0.0.1:7780
 needle daemon --index data/rap-index
 ```
 
-`GET http://127.0.0.1:7780/v1/query?key=user_0042`
+| Method | Path | Notes |
+|--------|------|--------|
+| GET | `/health` | `{"ok": true}` |
+| GET | `/v1/query?key=user_0042` | Same JSON as `needle query --format json` (`rows`, `covering_values`). Optional: `offset`, `limit`, `columns`, `since_ms`, `until_ms`, `covering_only`, `min_listens`. |
+| GET | `/v1/explain?key=user_0042` | Plan: files, pages, estimated Range GETs. |
+| GET | `/v1/stats` | Fragment summary (no bucket load). |
+
+Env: `NEEDLE_INDEX`, `NEEDLE_BIND`.
 
 ### Iceberg
 
-Index an Apache Iceberg table into Needle fragments:
+Index an Apache Iceberg table (Hadoop metadata + Avro manifests) into Needle fragments.
+`--table` is a local directory or an `s3://` / `https://` table root.
 
 ```bash
 needle iceberg-index --table /path/to/iceberg/table --index data/rap-index --key-column user_id --covering
+needle iceberg-index --table s3://bucket/warehouse/db/tbl --index data/rap-index --key-column user_id
 ```
+
+Each run indexes the **current snapshot** incrementally: only newly added data files
+are scanned; files dropped by overwrite/expire are recorded on the fragment
+(`dropped_files`) and evicted on load/compact. Position/equality delete files
+(`content` 1/2) are skipped. Re-running the same snapshot is a no-op. A later
+snapshot that re-adds a previously expired file reindexes it.
 
 ### SQL
 
-Run SQL over the hits for a single key (`hits` table):
+Run SQL over the hits for a single key (`hits` is the decoded Arrow batch for that key):
 
 ```bash
 needle sql --index data/rap-index --key user_0042 --sql "SELECT track_uri, count(*) AS n FROM hits GROUP BY track_uri ORDER BY n DESC"
 ```
 
-### MinIO lake (optional stress)
+### Object store (MinIO and AWS)
 
-Needle can speak S3 Range GET against a **local** MinIO (no cloud account):
+Range GET, full GET, PUT, HEAD, ListObjectsV2. SigV4 over raw TCP; TLS via `native-tls`.
+
+| | MinIO (default) | AWS |
+|--|-----------------|-----|
+| Endpoint | `127.0.0.1:9000` | `s3.amazonaws.com` / `s3.<region>.amazonaws.com` |
+| Addressing | path-style `/{bucket}/{key}` | virtual-hosted `/{key}` on `{bucket}.{host}` |
+| TLS | off | on |
+| Anonymous GET | on (if the bucket allows it) | off (signed) |
+
+`NEEDLE_S3_*` wins over the older `RAP_S3_*` names:
+
+```bash
+export NEEDLE_S3_ENDPOINT=s3.us-east-1.amazonaws.com   # or https://…
+export NEEDLE_S3_REGION=us-east-1
+export NEEDLE_S3_ACCESS_KEY=…
+export NEEDLE_S3_SECRET_KEY=…
+# optional overrides:
+# NEEDLE_S3_TLS=1|0
+# NEEDLE_S3_PATH_STYLE=1|0
+# NEEDLE_S3_ANON_READ=1|0
+```
+
+Local MinIO stress (no cloud account):
 
 ```bash
 # downloads tools/minio + tools/mc on first run if missing
@@ -196,10 +260,14 @@ sequenceDiagram
 
 ```
 src/
-  main.rs              CLI
-  index.rs             External Needle / RAP index
+  main.rs              CLI (`needle`)
+  needled.rs           HTTP query daemon binary
+  index.rs             External Needle / RAP index (fragments, compact, forget, verify)
+  iceberg.rs           Incremental Iceberg snapshot → Needle fragments
+  query.rs             Point query + Arrow/JSON rows + covering
+  server.rs            needled JSON HTTP (`/v1/query`, reload on registry mtime)
+  sql.rs               DataFusion SQL over one-key `hits`
   metadata.rs          Footer + OffsetIndex → page ranges
-  query.rs             Point query + naive baseline
   writer.rs            Sample lake writers (sorted / cogrouped / …)
   storage.rs           RangeReader trait (local + HTTP)
   s3.rs                S3 SigV4 + Range GET (MinIO path-style HTTP, AWS TLS virtual-host)
@@ -214,7 +282,7 @@ NOTES.md               Article mapping & fidelity notes
 
 ## Status / honesty
 
-- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host), Iceberg incremental index, compact/forget/verify, `needled` + SQL over key hits, MinIO lake harness, broad unit/E2E suite.
+- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host, MinIO and AWS), Iceberg incremental index (add/drop live-set, remote metadata), compact/forget/verify + file identity, `needled` + SQL over key hits, MinIO lake harness, broad unit/E2E suite.
 - **Custom Parquet prep** (ZSTD multi-frame pages, skippable alignment, interleaving) uses a low-level writer so layouts live **inside** `.parquet` files readable by Arrow.
 - This is an R&D recreation, not Spotify’s production RAP.
 
