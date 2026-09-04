@@ -9,6 +9,10 @@ license = "Apache-2.0"
 name = "needle"
 path = "src/main.rs"
 
+[[bin]]
+name = "needled"
+path = "src/needled.rs"
+
 [dependencies]
 anyhow = "1"
 arrow = { version = "59", default-features = false }
