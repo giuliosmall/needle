@@ -1,16 +1,19 @@
-//! CLI for Random Access Parquet (RAP) demo.
+//! CLI for Needle / Random Access Parquet (RAP).
 //!
 //! Commands map to the article workflow:
 //!   rap generate  - write prepared Parquet / sidecars
 //!   rap index     - build external append-only index (+ optional secondary)
-//!   rap query     - point lookup via index + ranged reads (+ pagination)
+//!   rap query     - point lookup via index + ranged reads (+ filters / JSON)
+//!   rap explain   - plan a lookup (files, pages, estimated Range GETs)
+//!   rap stats     - fragment / manifest summary without loading buckets
 //!   rap bench     - compare naive scan vs RAP
 //!   rap serve     - tiny HTTP Range server for object-store demo
 //!   rap demo / demo-full - end-to-end demos
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use rap::index::{IndexBuilder, load_index};
+use chrono::{DateTime, NaiveDate};
+use clap::{Parser, Subcommand, ValueEnum};
+use rap::index::{IndexBuilder, load_index, load_index_for_keys};
 use rap::query::{QueryOptions, RapQuerier, collect_demo_ranges, naive_scan};
 use rap::secondary::{self, refs_to_primary_entries};
 use rap::lake::{self, LakeGenerateOpts};
@@ -18,14 +21,25 @@ use rap::storage::{RangeHttpServer, prove_http_matches_local};
 use rap::parquet_lowlevel;
 use rap::writer::{WriteMode, WriterOptions, write_sample_dataset};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
-#[command(name = "rap", about = "Random Access Parquet - Spotify-style point queries over the data lake", version)]
+#[command(
+    name = "rap",
+    about = "Needle - point queries on a Parquet data lake (Random Access Parquet)",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Table,
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -50,7 +64,7 @@ enum Cmd {
         #[arg(long, default_value_t = 42)]
         seed: u64,
     },
-    /// Build (append) an external RAP index fragment over Parquet files.
+    /// Build (append) an external Needle / RAP index fragment over Parquet files.
     Index {
         #[arg(long, default_value = "data/parquet")]
         data: PathBuf,
@@ -67,10 +81,22 @@ enum Cmd {
         secondary: Option<String>,
         #[arg(long)]
         file: Vec<PathBuf>,
+        /// Key column to index (repeatable). Default: user_id.
+        #[arg(long, value_name = "NAME")]
+        key_column: Vec<String>,
+        /// Value column to store alongside the key (repeatable). Empty = builder default.
+        #[arg(long, value_name = "NAME")]
+        value_column: Vec<String>,
     },
-    /// Point-query a key through the RAP index.
+    /// Point-query a key through the Needle / RAP index (filters, JSON, secondary range).
+    ///
+    /// Compound keys: join parts with `||` (encoded as U+001F), or pass an already-encoded
+    /// string. Secondary range queries use `--dimension` with `--range-start` / `--range-end`
+    /// and do not need a positional key.
     Query {
-        key: String,
+        /// Lookup key (optional when using `--dimension --range-start --range-end`).
+        #[arg(value_name = "KEY")]
+        key: Option<String>,
         #[arg(long, default_value = "data/rap-index")]
         index: PathBuf,
         #[arg(long, default_value_t = 10)]
@@ -83,12 +109,79 @@ enum Cmd {
         /// Query via secondary dimension (e.g. --dimension track_uri).
         #[arg(long)]
         dimension: Option<String>,
+        /// Inclusive secondary range start (requires `--dimension` and `--range-end`).
+        #[arg(long, value_name = "S")]
+        range_start: Option<String>,
+        /// Inclusive secondary range end (requires `--dimension` and `--range-start`).
+        #[arg(long, value_name = "E")]
+        range_end: Option<String>,
         /// Optional HTTP base URL for ranged reads (start with `rap serve`).
         #[arg(long)]
         http: Option<String>,
         /// Data dir for HTTP proof / secondary file resolution.
         #[arg(long, default_value = "data/parquet")]
         data: PathBuf,
+        /// Project these columns (comma-separated or repeat the flag).
+        #[arg(long, value_name = "NAME")]
+        columns: Vec<String>,
+        /// Inclusive start time (RFC3339, YYYY-MM-DD as UTC midnight, or integer ms).
+        #[arg(long, value_name = "TIME")]
+        since: Option<String>,
+        /// Inclusive end time (RFC3339, YYYY-MM-DD as UTC end of day 23:59:59.999, or integer ms).
+        #[arg(long, value_name = "TIME")]
+        until: Option<String>,
+        /// Skip page reads; return covering aggregates only.
+        #[arg(long, default_value_t = false)]
+        covering_only: bool,
+        /// Keep entries whose covering listen_count is at least N.
+        #[arg(long, value_name = "N")]
+        min_listens: Option<u64>,
+        /// Output format (`table` or `json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+        /// Shorthand for `--format json` (stdout is a single JSON object).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Explain a lookup: files, pages, and estimated Range GETs (no HTTP).
+    Explain {
+        /// Lookup key (compound: join parts with `||`).
+        #[arg(value_name = "KEY")]
+        key: String,
+        #[arg(long, default_value = "data/rap-index")]
+        index: PathBuf,
+        /// Project these columns (comma-separated or repeat the flag).
+        #[arg(long, value_name = "NAME")]
+        columns: Vec<String>,
+        /// Inclusive start time (RFC3339, YYYY-MM-DD as UTC midnight, or integer ms).
+        #[arg(long, value_name = "TIME")]
+        since: Option<String>,
+        /// Inclusive end time (RFC3339, YYYY-MM-DD as UTC end of day 23:59:59.999, or integer ms).
+        #[arg(long, value_name = "TIME")]
+        until: Option<String>,
+        /// Skip page reads; covering aggregates only.
+        #[arg(long, default_value_t = false)]
+        covering_only: bool,
+        /// Keep entries whose covering listen_count is at least N.
+        #[arg(long, value_name = "N")]
+        min_listens: Option<u64>,
+        /// Output format (`table` or `json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+        /// Shorthand for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Print index fragment stats (registry + manifests only; does not load buckets).
+    Stats {
+        #[arg(long, default_value = "data/rap-index")]
+        index: PathBuf,
+        /// Output format (`table` or `json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+        /// Shorthand for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Compare naive full scan vs RAP for a key.
     Bench {
@@ -339,6 +432,8 @@ fn main() -> Result<()> {
             covering,
             secondary,
             file,
+            key_column,
+            value_column,
         } => {
             let files = if file.is_empty() {
                 collect_parquet(&data)?
@@ -349,7 +444,16 @@ fn main() -> Result<()> {
                 bail!("no Parquet files found under {}", data.display());
             }
             std::fs::create_dir_all(&index)?;
-            let builder = IndexBuilder::new(&index, buckets).with_covering(covering);
+            let key_column = if key_column.is_empty() {
+                vec!["user_id".to_string()]
+            } else {
+                key_column
+            };
+            // provided by query/index slice
+            let builder = IndexBuilder::new(&index, buckets)
+                .with_covering(covering)
+                .with_key_columns(key_column.clone())
+                .with_value_columns(value_column);
             let t0 = Instant::now();
             let frag = builder.build_fragment(
                 &files,
@@ -357,12 +461,13 @@ fn main() -> Result<()> {
                 Some("RAP external index fragment"),
             )?;
             println!(
-                "Indexed {} file(s) → {} in {:?} (buckets={}, covering={})",
+                "Indexed {} file(s) → {} in {:?} (buckets={}, covering={}, key_columns={:?})",
                 files.len(),
                 frag.display(),
                 t0.elapsed(),
                 buckets,
-                covering
+                covering,
+                key_column
             );
             if let Some(dim) = secondary {
                 let t1 = Instant::now();
@@ -388,49 +493,73 @@ fn main() -> Result<()> {
             offset,
             verbose,
             dimension,
+            range_start,
+            range_end,
             http,
             data,
+            columns,
+            since,
+            until,
+            covering_only,
+            min_listens,
+            format,
+            json,
         } => {
-            if let Some(dim) = dimension {
-                run_secondary_query(&index, &dim, &key, offset, limit, verbose)?;
-            } else {
-                let t_load = Instant::now();
-                let idx = load_index(&index)?;
-                let load_ms = t_load.elapsed();
-                let querier = RapQuerier::new(idx);
-                let qopts = QueryOptions {
-                    offset,
-                    limit: Some(limit),
-                    http_base: http.clone(),
-                };
-                let result = querier.query_with(&key, &qopts)?;
-                print_query_result(&result, limit, verbose, load_ms);
-
-                if let Some(base) = http {
-                    // Prove HTTP Range bytes match local for this key's ranges.
-                    let ranges = collect_demo_ranges(&querier, &key)?;
-                    // Group by file for prove helper.
-                    let mut by_file: HashMap<PathBuf, Vec<std::ops::Range<u64>>> = HashMap::new();
-                    for (p, r) in ranges {
-                        by_file.entry(p).or_default().push(r);
-                    }
-                    println!("  HTTP Range proof (base={base}):");
-                    for (path, rs) in by_file {
-                        // Server roots at data dir - ensure path is under it.
-                        let _ = data;
-                        match prove_http_matches_local(&path, &base, &rs) {
-                            Ok(pr) => println!(
-                                "    OK {} - {} ranges, {} bytes match ({})",
-                                path.file_name().unwrap_or_default().to_string_lossy(),
-                                pr.ranges,
-                                pr.bytes_compared,
-                                pr.url
-                            ),
-                            Err(e) => println!("    FAIL {}: {e:#}", path.display()),
-                        }
-                    }
-                }
-            }
+            let out = resolve_format(format, json);
+            run_query_cmd(
+                key,
+                index,
+                limit,
+                offset,
+                verbose,
+                dimension,
+                range_start,
+                range_end,
+                http,
+                data,
+                columns,
+                since,
+                until,
+                covering_only,
+                min_listens,
+                out,
+            )?;
+        }
+        Cmd::Explain {
+            key,
+            index,
+            columns,
+            since,
+            until,
+            covering_only,
+            min_listens,
+            format,
+            json,
+        } => {
+            let out = resolve_format(format, json);
+            let key = encode_cli_key(&key);
+            let idx = load_index_for_keys(&index, &[key.to_string()])?;
+            let querier = RapQuerier::new(idx);
+            let qopts = build_query_options(
+                0,
+                None,
+                None,
+                &columns,
+                since.as_deref(),
+                until.as_deref(),
+                covering_only,
+                min_listens,
+            )?;
+            // provided by query/index slice
+            let expl = querier.explain(&key, &qopts)?;
+            print_explain(&expl, out)?;
+        }
+        Cmd::Stats {
+            index,
+            format,
+            json,
+        } => {
+            run_stats(&index, resolve_format(format, json))?;
         }
         Cmd::Bench {
             key,
@@ -725,17 +854,187 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_query_cmd(
+    key: Option<String>,
+    index: PathBuf,
+    limit: usize,
+    offset: usize,
+    verbose: bool,
+    dimension: Option<String>,
+    range_start: Option<String>,
+    range_end: Option<String>,
+    http: Option<String>,
+    data: PathBuf,
+    columns: Vec<String>,
+    since: Option<String>,
+    until: Option<String>,
+    covering_only: bool,
+    min_listens: Option<u64>,
+    out: OutputFormat,
+) -> Result<()> {
+    let key = key.filter(|s| !s.is_empty());
+    let range_query = range_start.is_some() || range_end.is_some();
+    if range_query {
+        if dimension.is_none() {
+            bail!("--range-start/--range-end require --dimension");
+        }
+        if range_start.is_none() || range_end.is_none() {
+            bail!("secondary range query requires both --range-start and --range-end");
+        }
+    }
+    if let Some(dim) = dimension {
+        if !range_query && key.is_none() {
+            bail!("query requires a KEY, or --dimension with --range-start and --range-end");
+        }
+        return run_secondary_query(
+            &index,
+            &dim,
+            key.as_deref(),
+            offset,
+            limit,
+            verbose,
+            range_start.as_deref(),
+            range_end.as_deref(),
+            out,
+        );
+    }
+    let Some(raw_key) = key else {
+        bail!("query requires a KEY, or --dimension with --range-start and --range-end");
+    };
+    let key = encode_cli_key(&raw_key);
+    let t_load = Instant::now();
+    let idx = load_index_for_keys(&index, &[key.to_string()])?;
+    let load_ms = t_load.elapsed();
+    let querier = RapQuerier::new(idx);
+    let qopts = build_query_options(
+        offset,
+        Some(limit),
+        http.clone(),
+        &columns,
+        since.as_deref(),
+        until.as_deref(),
+        covering_only,
+        min_listens,
+    )?;
+    let result = querier.query_with(&key, &qopts)?;
+    match out {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&query_result_json(&result, load_ms))?
+            );
+        }
+        OutputFormat::Table => {
+            print_query_result(&result, limit, verbose, load_ms);
+        }
+    }
+
+    if let Some(base) = http {
+        let ranges = collect_demo_ranges(&querier, &key)?;
+        let mut by_file: HashMap<PathBuf, Vec<std::ops::Range<u64>>> = HashMap::new();
+        for (p, r) in ranges {
+            by_file.entry(p).or_default().push(r);
+        }
+        let _ = data;
+        let emit = |line: String| {
+            if out == OutputFormat::Json {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        };
+        emit(format!("  HTTP Range proof (base={base}):"));
+        for (path, rs) in by_file {
+            match prove_http_matches_local(&path, &base, &rs) {
+                Ok(pr) => emit(format!(
+                    "    OK {} - {} ranges, {} bytes match ({})",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    pr.ranges,
+                    pr.bytes_compared,
+                    pr.url
+                )),
+                Err(e) => emit(format!("    FAIL {}: {e:#}", path.display())),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_secondary_query(
     index: &PathBuf,
     dim: &str,
-    key: &str,
+    key: Option<&str>,
     offset: usize,
     limit: usize,
     verbose: bool,
+    range_start: Option<&str>,
+    range_end: Option<&str>,
+    out: OutputFormat,
 ) -> Result<()> {
     let t0 = Instant::now();
     let sec = secondary::load_secondary_any(index, dim)?;
+    if let (Some(start), Some(end)) = (range_start, range_end) {
+        let refs = sec.lookup_range(start, end);
+        match out {
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "dimension": dim,
+                        "range_start": start,
+                        "range_end": end,
+                        "count": refs.len(),
+                        "refs": refs,
+                    }))?
+                );
+            }
+            OutputFormat::Table => {
+                println!(
+                    "Secondary range dim={dim} [{start} .. {end}] → {} ref(s) ({} keys in index) in {:?}",
+                    refs.len(),
+                    sec.num_keys(),
+                    t0.elapsed()
+                );
+                for r in refs.iter().skip(offset).take(limit) {
+                    println!(
+                        "    sec={} primary={} file={} rows={}",
+                        r.key,
+                        r.primary_key,
+                        r.file,
+                        r.row_numbers.len()
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let key = key.unwrap_or("");
     let refs = sec.lookup_exact(key);
+    if out == OutputFormat::Json {
+        let mut body = serde_json::json!({
+            "dimension": dim,
+            "key": key,
+            "count": refs.len(),
+            "refs": refs,
+        });
+        if refs.is_empty() {
+            let end = format!("{key}\u{ffff}");
+            let range_refs = sec.lookup_range(key, &end);
+            body["range_fallback"] = serde_json::json!({
+                "start": key,
+                "count": range_refs.len(),
+                "refs": range_refs,
+            });
+        } else {
+            let rows = decode_secondary_rows(&sec, refs, key, offset, limit)?;
+            body["rows"] = serde_json::Value::Array(
+                rows.into_iter().map(serde_json::Value::String).collect(),
+            );
+        }
+        println!("{}", serde_json::to_string(&body)?);
+        return Ok(());
+    }
     println!(
         "Secondary query dim={dim} key={key} → {} ref(s) ({} keys in index) in {:?}",
         refs.len(),
@@ -762,6 +1061,32 @@ fn run_secondary_query(
         return Ok(());
     }
 
+    let rows = decode_secondary_rows(&sec, refs, key, offset, limit)?;
+    println!("  decoded {} matching row(s) (showing up to {limit}):", rows.len());
+    for line in rows.iter().take(limit) {
+        println!("    {line}");
+    }
+    if verbose {
+        println!("  secondary refs:");
+        for r in refs.iter().take(8) {
+            println!(
+                "    primary={} file={} rows={:?}…",
+                r.primary_key,
+                r.file,
+                &r.row_numbers[..r.row_numbers.len().min(4)]
+            );
+        }
+    }
+    Ok(())
+}
+
+fn decode_secondary_rows(
+    sec: &secondary::SecondaryIndex,
+    refs: &[secondary::SecondaryRef],
+    key: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<String>> {
     // Decode via primary Parquet using row numbers from secondary.
     let _entries = refs_to_primary_entries(refs);
     let mut rows = Vec::new();
@@ -777,7 +1102,6 @@ fn run_secondary_query(
         let builder =
             parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
         let total = builder.metadata().file_metadata().num_rows() as u64;
-        // Build selection
         let mut sorted = r.row_numbers.clone();
         sorted.sort_unstable();
         let mut selectors = Vec::new();
@@ -800,7 +1124,6 @@ fn run_secondary_query(
         let reader = builder.with_row_selection(selection).build()?;
         for batch in reader {
             let batch = batch?;
-            // Flat extract track_uri rows.
             if let Some(tracks) = batch.column_by_name("track_uri") {
                 let tracks = tracks
                     .as_any()
@@ -831,22 +1154,7 @@ fn run_secondary_query(
             }
         }
     }
-    println!("  decoded {} matching row(s) (showing up to {limit}):", rows.len());
-    for line in rows.iter().take(limit) {
-        println!("    {line}");
-    }
-    if verbose {
-        println!("  secondary refs:");
-        for r in refs.iter().take(8) {
-            println!(
-                "    primary={} file={} rows={:?}…",
-                r.primary_key,
-                r.file,
-                &r.row_numbers[..r.row_numbers.len().min(4)]
-            );
-        }
-    }
-    Ok(())
+    Ok(rows)
 }
 
 fn run_demo(
@@ -995,6 +1303,7 @@ fn run_demo_full(
                 offset: 0,
                 limit: Some(5),
                 http_base: None,
+                ..Default::default()
             },
         )?;
         println!(
@@ -1020,6 +1329,7 @@ fn run_demo_full(
                 offset: 5,
                 limit: Some(5),
                 http_base: None,
+                ..Default::default()
             },
         )?;
         println!(
@@ -1062,6 +1372,7 @@ fn run_demo_full(
             offset: 0,
             limit: Some(3),
             http_base: Some(base.clone()),
+            ..Default::default()
         },
     )?;
     println!(
@@ -1131,6 +1442,10 @@ fn print_query_result(
     if t.used_prepared_layout {
         println!("  used prepared ZSTD/interleaved layout: yes");
     }
+    // provided by query/index slice
+    if result.skipped_by_predicate > 0 {
+        println!("  skipped_by_predicate: {}", result.skipped_by_predicate);
+    }
     if !result.covering_hits.is_empty() {
         println!("  covering index:");
         for c in &result.covering_hits {
@@ -1180,4 +1495,246 @@ fn avg_duration(v: &[std::time::Duration]) -> std::time::Duration {
     }
     let sum: std::time::Duration = v.iter().copied().sum();
     sum / (v.len() as u32)
+}
+
+fn resolve_format(format: OutputFormat, json: bool) -> OutputFormat {
+    if json {
+        OutputFormat::Json
+    } else {
+        format
+    }
+}
+
+/// Compound keys: `a||b` is encoded with U+001F via `encode_key`.
+fn encode_cli_key(raw: &str) -> String {
+    if raw.contains("||") {
+        let parts: Vec<String> = raw.split("||").map(str::to_string).collect();
+        rap::index::encode_key(&parts) // provided by query/index slice
+    } else {
+        raw.to_string()
+    }
+}
+
+fn parse_columns(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// RFC3339, `YYYY-MM-DD` (UTC), or integer milliseconds.
+fn parse_time_ms(s: &str, end_of_day: bool) -> Result<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("empty time; expected RFC3339, YYYY-MM-DD, or integer milliseconds");
+    }
+    if let Ok(ms) = s.parse::<i64>() {
+        return Ok(ms);
+    }
+    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let naive = if end_of_day {
+            d.and_hms_milli_opt(23, 59, 59, 999)
+        } else {
+            d.and_hms_milli_opt(0, 0, 0, 0)
+        }
+        .with_context(|| format!("invalid clock for date {s}"))?;
+        return Ok(naive.and_utc().timestamp_millis());
+    }
+    match DateTime::parse_from_rfc3339(s) {
+        Ok(dt) => Ok(dt.timestamp_millis()),
+        Err(e) => bail!(
+            "invalid time {s:?}: expected RFC3339, YYYY-MM-DD, or integer milliseconds ({e})"
+        ),
+    }
+}
+
+fn build_query_options(
+    offset: usize,
+    limit: Option<usize>,
+    http_base: Option<String>,
+    columns: &[String],
+    since: Option<&str>,
+    until: Option<&str>,
+    covering_only: bool,
+    min_listens: Option<u64>,
+) -> Result<QueryOptions> {
+    let cols = parse_columns(columns);
+    Ok(QueryOptions {
+        offset,
+        limit,
+        http_base,
+        // provided by query/index slice
+        columns: if cols.is_empty() { None } else { Some(cols) },
+        since_ms: match since {
+            Some(s) => Some(parse_time_ms(s, false)?),
+            None => None,
+        },
+        until_ms: match until {
+            Some(s) => Some(parse_time_ms(s, true)?),
+            None => None,
+        },
+        covering_only,
+        min_listen_count: min_listens,
+        ..Default::default()
+    })
+}
+
+fn query_result_json(
+    result: &rap::query::QueryResult,
+    index_load: std::time::Duration,
+) -> serde_json::Value {
+    let t = &result.timings;
+    let rows: Vec<serde_json::Value> = result
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "user_id": r.user_id,
+                "timestamp_ms": r.timestamp_ms,
+                "track_uri": r.track_uri,
+                "duration_ms": r.duration_ms,
+                "source_file": r.source_file,
+                "row_number": r.row_number,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "key": result.key,
+        "rows": rows,
+        "covering": result.covering_hits,
+        "timings": {
+            "index_load_ms": index_load.as_millis() as u64,
+            "index_lookup_ms": t.index_lookup.as_millis() as u64,
+            "metadata_resolve_ms": t.metadata_resolve.as_millis() as u64,
+            "ranged_read_ms": t.ranged_read_demo.as_millis() as u64,
+            "decode_extract_ms": t.decode_extract.as_millis() as u64,
+            "total_ms": t.total.as_millis() as u64,
+        },
+        "totals": {
+            "rows": result.rows.len(),
+            "value_count": result.total_value_count,
+            "bytes_ranged": t.bytes_ranged,
+            "pages_touched": t.pages_touched,
+            "files_touched": t.files_touched,
+            // provided by query/index slice
+            "skipped_by_predicate": result.skipped_by_predicate,
+            "offset": result.offset,
+            "limit": result.limit,
+        },
+    })
+}
+
+fn print_explain(expl: &rap::query::ExplainResult, out: OutputFormat) -> Result<()> {
+    match out {
+        OutputFormat::Json => {
+            let v = serde_json::json!({
+                "key": expl.key,
+                "bucket": expl.bucket,
+                "num_entries": expl.num_entries,
+                "num_entries_after_predicates": expl.num_entries_after_predicates,
+                "files": expl.files,
+                "covering": expl.covering,
+                "page_descriptions": expl.page_descriptions,
+                "estimated_bytes": expl.estimated_bytes,
+                "estimated_range_gets": expl.estimated_range_gets,
+                "covering_only": expl.covering_only,
+                "columns": expl.columns,
+                "since_ms": expl.since_ms,
+                "until_ms": expl.until_ms,
+                "skipped_by_predicate": expl.skipped_by_predicate,
+            });
+            println!("{}", serde_json::to_string(&v)?);
+        }
+        OutputFormat::Table => {
+            println!("explain key={} bucket={}", expl.key, expl.bucket);
+            println!(
+                "  entries={} after_predicates={} skipped={}",
+                expl.num_entries,
+                expl.num_entries_after_predicates,
+                expl.skipped_by_predicate
+            );
+            println!("  files: {:?}", expl.files);
+            println!("  covering: {:?}", expl.covering);
+            println!(
+                "  estimated: {} bytes / {} range GETs",
+                expl.estimated_bytes, expl.estimated_range_gets
+            );
+            println!("  pages:");
+            for p in &expl.page_descriptions {
+                println!("    {p}");
+            }
+            if expl.covering_only {
+                println!("  covering_only: true");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_stats(index: &Path, out: OutputFormat) -> Result<()> {
+    let registry_path = index.join("registry.json");
+    if !registry_path.exists() {
+        bail!("no RAP index at {} (missing registry.json)", index.display());
+    }
+    let registry: Vec<String> = serde_json::from_reader(std::fs::File::open(&registry_path)?)
+        .with_context(|| format!("read {}", registry_path.display()))?;
+
+    let mut fragments = Vec::new();
+    for frag_id in &registry {
+        let man_path = index
+            .join("fragments")
+            .join(frag_id)
+            .join("manifest.json");
+        let raw = std::fs::read_to_string(&man_path)
+            .with_context(|| format!("read {}", man_path.display()))?;
+        let mut man: serde_json::Value = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", man_path.display()))?;
+        if man.get("fragment_id").is_none() {
+            man["fragment_id"] = serde_json::Value::String(frag_id.clone());
+        }
+        fragments.push(man);
+    }
+
+    match out {
+        OutputFormat::Json => {
+            let v = serde_json::json!({
+                "index": index.display().to_string(),
+                "fragments": fragments,
+            });
+            println!("{}", serde_json::to_string(&v)?);
+        }
+        OutputFormat::Table => {
+            println!("index: {}", index.display());
+            println!("fragments: {}", fragments.len());
+            for man in &fragments {
+                let id = man
+                    .get("fragment_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let n_files = man
+                    .get("files")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                let buckets = man
+                    .get("num_buckets")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let created = man
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                print!("  {id}  files={n_files}  buckets={buckets}  created_at={created}");
+                if let Some(kc) = man.get("key_columns") {
+                    if !kc.is_null() {
+                        print!("  key_columns={kc}");
+                    }
+                }
+                println!();
+            }
+        }
+    }
+    Ok(())
 }
