@@ -4,6 +4,7 @@
 //!
 //! See: https://engineering.atspotify.com/2026/7/indexing-the-data-lake-for-online-point-queries
 
+pub mod iceberg;
 pub mod index;
 pub mod metadata;
 pub mod parquet_lowlevel;

@@ -74,6 +74,16 @@ pub struct IndexFragmentMeta {
     pub key_columns: Vec<String>,
     #[serde(default)]
     pub value_columns: Vec<String>,
+    /// Iceberg snapshot this fragment was built from, if any.
+    #[serde(default)]
+    pub iceberg_snapshot_id: Option<i64>,
+}
+
+fn parse_iceberg_snapshot_note(note: &str) -> Option<i64> {
+    note.trim()
+        .strip_prefix("iceberg-snapshot:")
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit() && c != '-').next())
+        .and_then(|id| id.parse().ok())
 }
 
 #[derive(Debug, Default, Clone)]
@@ -259,14 +269,17 @@ impl IndexBuilder {
             write_bincode(&bin_path, entries)?;
         }
 
+        let note_str = note.map(|s| s.to_string());
+        let iceberg_snapshot_id = note_str.as_deref().and_then(parse_iceberg_snapshot_note);
         let meta = IndexFragmentMeta {
             fragment_id: fragment_id.to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             files: file_dict,
             num_buckets: self.num_buckets,
-            note: note.map(|s| s.to_string()),
+            note: note_str,
             key_columns: self.key_columns.clone(),
             value_columns: self.value_columns.clone(),
+            iceberg_snapshot_id,
         };
         serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, &meta)?;
 
