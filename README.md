@@ -21,22 +21,22 @@ Online services and agents need **per-key** reads (one user, one entity) at inte
 
 ```mermaid
 flowchart LR
-  Q[Point query] --> L[List / prune files]
-  L --> F[Fetch footer]
-  F --> RG[Parse row groups]
-  RG --> K[Scan key column]
-  K --> P[Page index]
-  P --> V[Fetch value pages]
+  Q["Point query"] --> L["List / prune files"]
+  L --> F["Fetch footer"]
+  F --> RG["Parse row groups"]
+  RG --> K["Scan key column"]
+  K --> P["Page index"]
+  P --> V["Fetch value pages"]
 ```
 
 Each arrow is another round-trip. Needle collapses that to: **index lookup → ranged reads**.
 
 ```mermaid
 flowchart LR
-  Q[Point query] --> I[Needle index O(1)]
-  I --> M[Cached page locations]
-  M --> R[Parallel Range GETs]
-  R --> D[Decode matching rows]
+  Q["Point query"] --> I["Needle index O(1)"]
+  I --> M["Cached page locations"]
+  M --> R["Parallel Range GETs"]
+  R --> D["Decode matching rows"]
 ```
 
 ---
@@ -59,18 +59,18 @@ A multimap (hash-bucketed, append-only fragments):
 ```mermaid
 flowchart TB
   subgraph Lake["Object store / MinIO"]
-    P1[Parquet part-000.parquet]
-    P2[Parquet part-001.parquet]
-    Pn[…]
+    P1["Parquet part-000.parquet"]
+    P2["Parquet part-001.parquet"]
+    Pn["more parts"]
   end
-  subgraph Needle["Needle index"]
-    B0[bucket_000]
-    B1[bucket_001]
-    Bn[…]
+  subgraph NeedleIdx["Needle index"]
+    B0["bucket_000"]
+    B1["bucket_001"]
+    Bn["more buckets"]
   end
   user_42["key = user_42"] --> B1
-  B1 -->|"file=7, rows=3552..3583, page_locs"| P2
-  P2 -->|"Range GET ~2 KiB"| Out[Rows for user_42]
+  B1 -->|"file=7 rows page_locs"| P2
+  P2 -->|"Range GET about 2 KiB"| Out["Rows for user_42"]
 ```
 
 ### Reader path
@@ -122,17 +122,17 @@ sequenceDiagram
   participant Client
   participant Needle
   participant Index as Index buckets
-  participant Store as MinIO / S3 / FS
-  Client->>Needle: query(user_42)
-  Needle->>Index: lookup bucket(hash(key))
-  Index-->>Needle: file, rows, page_locs
+  participant Store as Object store
+  Client->>Needle: query user_42
+  Needle->>Index: lookup index bucket
+  Index-->>Needle: file rows page_locs
   par column pages
     Needle->>Store: Range GET page A
     Needle->>Store: Range GET page B
     Needle->>Store: Range GET page C
   end
-  Store-->>Needle: ~KiB payloads
-  Needle-->>Client: rows (+ covering aggregates)
+  Store-->>Needle: small page payloads
+  Needle-->>Client: rows and covering aggregates
 ```
 
 **Two stress axes this repo exercises:**
