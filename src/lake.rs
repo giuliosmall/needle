@@ -427,6 +427,7 @@ pub fn lake_generate(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
             "MinIO lake generate files={} days={} hash_buckets={}",
             opts.files, opts.days, opts.hash_buckets
         )),
+        ..Default::default()
     };
     let frag_dir = opts.index_dir.join("fragments").join(&opts.fragment_id);
     serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, &meta)?;
@@ -516,9 +517,12 @@ fn index_entries_fast(
         let c = covering.entry(l.user_id.clone()).or_insert(CoveringValues {
             listen_count: 0,
             total_duration_ms: 0,
+            ..Default::default()
         });
         c.listen_count += 1;
         c.total_duration_ms += l.duration_ms as u64;
+        c.min_ts = Some(c.min_ts.map_or(l.timestamp_ms, |m| m.min(l.timestamp_ms)));
+        c.max_ts = Some(c.max_ts.map_or(l.timestamp_ms, |m| m.max(l.timestamp_ms)));
     }
     let mut entries = Vec::new();
     for (key, rows) in key_rows {
@@ -585,9 +589,25 @@ fn index_entries_from_bytes(bytes: &[u8], file_ord: u32) -> Result<(Vec<RapIndex
             let c = covering.entry(k).or_insert(CoveringValues {
                 listen_count: 0,
                 total_duration_ms: 0,
+                ..Default::default()
             });
             c.listen_count += 1;
             c.total_duration_ms += durs.value(i) as u64;
+            if let Some(col) = batch.column_by_name("timestamp") {
+                let ts = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+                    .map(|a| a.value(i))
+                    .or_else(|| {
+                        col.as_any()
+                            .downcast_ref::<Int64Array>()
+                            .map(|a| a.value(i))
+                    });
+                if let Some(ts) = ts {
+                    c.min_ts = Some(c.min_ts.map_or(ts, |m| m.min(ts)));
+                    c.max_ts = Some(c.max_ts.map_or(ts, |m| m.max(ts)));
+                }
+            }
             global += 1;
         }
     }
@@ -778,6 +798,7 @@ pub fn lake_index_from_bucket(
         files,
         num_buckets,
         note: Some("lake-index from MinIO list+GET".into()),
+        ..Default::default()
     };
     serde_json::to_writer_pretty(
         File::create(index_dir.join("fragments").join(fragment_id).join("manifest.json"))?,
@@ -1081,6 +1102,7 @@ pub fn lake_generate_fat(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
             "MinIO FAT lake generate files={} rows_per_file={} page_rows={} prefix={} compact_rows={}",
             opts.files, n_rows, opts.page_rows, opts.prefix, scale || true
         )),
+        ..Default::default()
     };
     let frag_dir = opts.index_dir.join("fragments").join(&opts.fragment_id);
     let mf = File::create(frag_dir.join("manifest.json"))?;
@@ -1204,9 +1226,12 @@ fn index_entries_from_pages(
         let c = covering.entry(l.user_id.clone()).or_insert(CoveringValues {
             listen_count: 0,
             total_duration_ms: 0,
+            ..Default::default()
         });
         c.listen_count += 1;
         c.total_duration_ms += l.duration_ms as u64;
+        c.min_ts = Some(c.min_ts.map_or(l.timestamp_ms, |m| m.min(l.timestamp_ms)));
+        c.max_ts = Some(c.max_ts.map_or(l.timestamp_ms, |m| m.max(l.timestamp_ms)));
     }
     let mut entries = Vec::new();
     for (key, rows) in key_rows {

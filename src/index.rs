@@ -53,19 +53,27 @@ pub struct RapIndexEntry {
     pub aligned: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CoveringValues {
     pub listen_count: u64,
     pub total_duration_ms: u64,
+    #[serde(default)]
+    pub min_ts: Option<i64>,
+    #[serde(default)]
+    pub max_ts: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IndexFragmentMeta {
     pub fragment_id: String,
     pub created_at: String,
     pub files: Vec<String>,
     pub num_buckets: u32,
     pub note: Option<String>,
+    #[serde(default)]
+    pub key_columns: Vec<String>,
+    #[serde(default)]
+    pub value_columns: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -109,12 +117,36 @@ pub fn key_bucket(key: &str, num_buckets: u32) -> u32 {
     (n % num_buckets as u64) as u32
 }
 
+/// Unit separator between compound key parts.
+pub const KEY_SEP: char = '\u{1f}';
+
+pub fn encode_key(parts: &[&str]) -> String {
+    parts.join(&KEY_SEP.to_string())
+}
+
+fn default_key_columns() -> Vec<String> {
+    vec!["user_id".to_string()]
+}
+
+fn default_value_columns() -> Vec<String> {
+    vec![
+        "user_id".to_string(),
+        "timestamp".to_string(),
+        "track_uri".to_string(),
+        "duration_ms".to_string(),
+        "payload".to_string(),
+        "payload_bytes".to_string(),
+    ]
+}
+
 pub struct IndexBuilder {
     root: PathBuf,
     num_buckets: u32,
     covering: bool,
     /// Capture OffsetIndex page locs into entries (one-page-per-key).
     store_page_locs: bool,
+    key_columns: Vec<String>,
+    value_columns: Vec<String>,
 }
 
 impl IndexBuilder {
@@ -124,6 +156,8 @@ impl IndexBuilder {
             num_buckets: num_buckets.max(1),
             covering: false,
             store_page_locs: true,
+            key_columns: default_key_columns(),
+            value_columns: default_value_columns(),
         }
     }
 
@@ -134,6 +168,20 @@ impl IndexBuilder {
 
     pub fn with_store_page_locs(mut self, v: bool) -> Self {
         self.store_page_locs = v;
+        self
+    }
+
+    pub fn with_key_columns(mut self, cols: Vec<String>) -> Self {
+        if !cols.is_empty() {
+            self.key_columns = cols;
+        }
+        self
+    }
+
+    pub fn with_value_columns(mut self, cols: Vec<String>) -> Self {
+        if !cols.is_empty() {
+            self.value_columns = cols;
+        }
         self
     }
 
@@ -163,10 +211,10 @@ impl IndexBuilder {
             file_dict.push(stored.clone());
             path_to_ord.insert(path.clone(), ordinal as u32);
 
-            let key_rows = scan_key_column(path, self.covering)?;
+            let key_rows = scan_key_column(path, &self.key_columns, self.covering)?;
             for (key, rows, covering) in key_rows {
                 let page_locs = if self.store_page_locs {
-                    capture_page_locs(path, &rows).ok()
+                    capture_page_locs(path, &rows, &self.value_columns).ok()
                 } else {
                     None
                 };
@@ -217,6 +265,8 @@ impl IndexBuilder {
             files: file_dict,
             num_buckets: self.num_buckets,
             note: note.map(|s| s.to_string()),
+            key_columns: self.key_columns.clone(),
+            value_columns: self.value_columns.clone(),
         };
         serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, &meta)?;
 
@@ -328,7 +378,7 @@ fn merge_prepared_into_buckets(
 }
 
 /// Capture OffsetIndex page locations for the rows of one key (all value columns).
-fn capture_page_locs(path: &Path, rows: &[u64]) -> Result<Vec<PageLoc>> {
+fn capture_page_locs(path: &Path, rows: &[u64], value_columns: &[String]) -> Result<Vec<PageLoc>> {
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     use parquet::file::metadata::PageIndexPolicy;
     use std::collections::HashSet;
@@ -351,7 +401,7 @@ fn capture_page_locs(path: &Path, rows: &[u64]) -> Result<Vec<PageLoc>> {
 
     let mut locs = Vec::new();
     let mut seen = HashSet::new();
-    let cols_wanted = ["user_id", "timestamp", "track_uri", "duration_ms", "payload", "payload_bytes"];
+    let cols_wanted: HashSet<&str> = value_columns.iter().map(|s| s.as_str()).collect();
 
     for &grow in rows {
         let r = grow as i64;
@@ -369,7 +419,7 @@ fn capture_page_locs(path: &Path, rows: &[u64]) -> Result<Vec<PageLoc>> {
             let col_meta = rg_meta.column(col);
             let name = col_meta.column_path().string();
             let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
-            if !cols_wanted.iter().any(|c| *c == leaf) {
+            if !cols_wanted.contains(leaf.as_str()) && !cols_wanted.contains(name.as_str()) {
                 continue;
             }
             let oi = offset_indexes
@@ -509,7 +559,11 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
                 if (e.file as usize) < local_to_global.len() {
                     e.file = local_to_global[e.file as usize];
                 }
-                expand_compact_rows(e);
+                // IndexBuilder stores full row lists and records key_columns.
+                // Compact `[first]+value_count` encoding is lake-only (empty key_columns).
+                if meta.key_columns.is_empty() {
+                    expand_compact_rows(e);
+                }
                 entries_by_key
                     .entry(e.key.clone())
                     .or_default()
@@ -576,7 +630,9 @@ pub fn load_index_entries_for_keys(
                 if local < n_files {
                     e.file = (file_base + local) as u32;
                 }
-                expand_compact_rows(e);
+                if meta.key_columns.is_empty() {
+                    expand_compact_rows(e);
+                }
                 entries_by_key
                     .entry(e.key.clone())
                     .or_default()
@@ -628,14 +684,244 @@ fn read_jsonl(path: &Path) -> Result<Vec<RapIndexEntry>> {
     Ok(out)
 }
 
-/// Hoist listen_count + total_duration_ms from cogrouped `listens: LIST<STRUCT>`.
+fn fold_ts(min_ts: &mut Option<i64>, max_ts: &mut Option<i64>, ts: i64) {
+    *min_ts = Some(match *min_ts {
+        Some(m) => m.min(ts),
+        None => ts,
+    });
+    *max_ts = Some(match *max_ts {
+        Some(m) => m.max(ts),
+        None => ts,
+    });
+}
+
+fn format_timestamp_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| ms.to_string())
+}
+
+fn format_date32(days: i32) -> String {
+    chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+        .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(days as i64)))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| days.to_string())
+}
+
+fn timestamp_unit_to_ms(raw: i64, unit: arrow::datatypes::TimeUnit) -> i64 {
+    match unit {
+        arrow::datatypes::TimeUnit::Second => raw.saturating_mul(1_000),
+        arrow::datatypes::TimeUnit::Millisecond => raw,
+        arrow::datatypes::TimeUnit::Microsecond => raw / 1_000,
+        arrow::datatypes::TimeUnit::Nanosecond => raw / 1_000_000,
+    }
+}
+
+fn timestamp_raw_at(arr: &dyn arrow::array::Array, i: usize) -> Option<i64> {
+    use arrow::array::{
+        Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Some(a.value(i));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return Some(a.value(i));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return Some(a.value(i));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
+        return Some(a.value(i));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return Some(a.value(i));
+    }
+    None
+}
+
+fn timestamp_ms_at(col: &dyn arrow::array::Array, i: usize) -> Option<i64> {
+    use arrow::array::{Date32Array, DictionaryArray, Int64Array};
+    use arrow::datatypes::{
+        ArrowNativeType, DataType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
+        UInt32Type, UInt64Type, UInt8Type,
+    };
+    if col.is_null(i) {
+        return None;
+    }
+    match col.data_type() {
+        DataType::Timestamp(unit, _) => {
+            timestamp_raw_at(col, i).map(|raw| timestamp_unit_to_ms(raw, *unit))
+        }
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|a| a.value(i)),
+        DataType::Date32 => col.as_any().downcast_ref::<Date32Array>().map(|a| {
+            (a.value(i) as i64).saturating_mul(86_400_000)
+        }),
+        DataType::Dictionary(_, _) => {
+            macro_rules! dict {
+                ($t:ty) => {
+                    if let Some(d) = col.as_any().downcast_ref::<DictionaryArray<$t>>() {
+                        let idx = d.keys().value(i).to_usize()?;
+                        return timestamp_ms_at(d.values().as_ref(), idx);
+                    }
+                };
+            }
+            dict!(Int8Type);
+            dict!(Int16Type);
+            dict!(Int32Type);
+            dict!(Int64Type);
+            dict!(UInt8Type);
+            dict!(UInt16Type);
+            dict!(UInt32Type);
+            dict!(UInt64Type);
+            None
+        }
+        _ => None,
+    }
+}
+
+fn encode_array_value(arr: &dyn arrow::array::Array, i: usize) -> Result<String> {
+    use arrow::array::{
+        Date32Array, DictionaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
+        UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::{
+        ArrowNativeType, DataType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
+        UInt32Type, UInt64Type, UInt8Type,
+    };
+    if arr.is_null(i) {
+        return Ok(String::new());
+    }
+    match arr.data_type() {
+        DataType::Utf8 => Ok(arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("Utf8 array")?
+            .value(i)
+            .to_string()),
+        DataType::LargeUtf8 => Ok(arr
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .context("LargeUtf8 array")?
+            .value(i)
+            .to_string()),
+        DataType::Int64 => Ok(arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context("Int64 array")?
+            .value(i)
+            .to_string()),
+        DataType::Int32 => Ok(arr
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .context("Int32 array")?
+            .value(i)
+            .to_string()),
+        DataType::UInt64 => Ok(arr
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .context("UInt64 array")?
+            .value(i)
+            .to_string()),
+        DataType::UInt32 => Ok(arr
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .context("UInt32 array")?
+            .value(i)
+            .to_string()),
+        DataType::Date32 => {
+            let days = arr
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .context("Date32 array")?
+                .value(i);
+            Ok(format_date32(days))
+        }
+        DataType::Timestamp(unit, _) => {
+            let raw = timestamp_raw_at(arr, i)
+                .with_context(|| format!("timestamp array at row {i}"))?;
+            Ok(format_timestamp_ms(timestamp_unit_to_ms(raw, *unit)))
+        }
+        DataType::Dictionary(_, _) => {
+            macro_rules! dict {
+                ($t:ty) => {
+                    if let Some(d) = arr.as_any().downcast_ref::<DictionaryArray<$t>>() {
+                        let idx = d
+                            .keys()
+                            .value(i)
+                            .to_usize()
+                            .context("dictionary index")?;
+                        return encode_array_value(d.values().as_ref(), idx);
+                    }
+                };
+            }
+            dict!(Int8Type);
+            dict!(Int16Type);
+            dict!(Int32Type);
+            dict!(Int64Type);
+            dict!(UInt8Type);
+            dict!(UInt16Type);
+            dict!(UInt32Type);
+            dict!(UInt64Type);
+            bail!("unsupported dictionary key type for key encoding")
+        }
+        _ => {
+            // Utf8View and other displayable types.
+            if let Ok(s) = arrow::util::display::array_value_to_string(arr, i) {
+                return Ok(s);
+            }
+            bail!("unsupported key column type {}", arr.data_type())
+        }
+    }
+}
+
+fn encode_row_key(
+    batch: &arrow::record_batch::RecordBatch,
+    key_columns: &[String],
+    row: usize,
+) -> Result<Option<String>> {
+    let mut parts = Vec::with_capacity(key_columns.len());
+    for name in key_columns {
+        let col = batch
+            .column_by_name(name)
+            .with_context(|| format!("missing key column `{name}`"))?;
+        if col.is_null(row) {
+            return Ok(None);
+        }
+        parts.push(encode_array_value(col.as_ref(), row)?);
+    }
+    let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+    Ok(Some(encode_key(&refs)))
+}
+
+fn struct_timestamp_col(st: &arrow::array::StructArray) -> Option<&dyn arrow::array::Array> {
+    use arrow::datatypes::DataType;
+    if let Some(c) = st.column_by_name("timestamp") {
+        return Some(c.as_ref());
+    }
+    if let Some(c) = st.column_by_name("timestamp_ms") {
+        return Some(c.as_ref());
+    }
+    for i in 0..st.num_columns() {
+        let col = st.column(i);
+        if matches!(col.data_type(), DataType::Timestamp(_, _)) {
+            return Some(col.as_ref());
+        }
+    }
+    None
+}
+
+/// Hoist listen_count + total_duration_ms (+ time range) from cogrouped `listens: LIST<STRUCT>`.
 fn covering_from_nested_listens(
     listens: &arrow::array::ListArray,
     row: usize,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, Option<i64>, Option<i64>)> {
     use arrow::array::{Array, Int64Array, StructArray, UInt64Array};
     if listens.is_null(row) {
-        return Some((0, 0));
+        return Some((0, 0, None, None));
     }
     let arr = listens.value(row);
     let st = arr.as_any().downcast_ref::<StructArray>()?;
@@ -656,11 +942,30 @@ fn covering_from_nested_listens(
             }
         }
     }
-    Some((count, sum))
+    let mut min_ts = None;
+    let mut max_ts = None;
+    if let Some(ts_col) = struct_timestamp_col(st) {
+        for j in 0..st.len() {
+            if let Some(ts) = timestamp_ms_at(ts_col, j) {
+                fold_ts(&mut min_ts, &mut max_ts, ts);
+            }
+        }
+    }
+    Some((count, sum, min_ts, max_ts))
+}
+
+#[derive(Default)]
+struct KeyAgg {
+    rows: Vec<u64>,
+    listen_count: u64,
+    total_duration_ms: u64,
+    min_ts: Option<i64>,
+    max_ts: Option<i64>,
 }
 
 fn scan_key_column(
     path: &Path,
+    key_columns: &[String],
     covering: bool,
 ) -> Result<Vec<(String, Vec<u64>, Option<CoveringValues>)>> {
     use arrow::array::{Array, Int64Array, ListArray, StringArray, UInt64Array};
@@ -668,21 +973,21 @@ fn scan_key_column(
 
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema = builder.schema();
+    for col in key_columns {
+        schema
+            .index_of(col)
+            .ok()
+            .with_context(|| format!("missing key column `{col}`"))?;
+    }
     let reader = builder.build()?;
 
-    let mut map: HashMap<String, (Vec<u64>, u64, u64)> = HashMap::new();
+    let mut map: HashMap<String, KeyAgg> = HashMap::new();
     let mut row_base: u64 = 0;
 
     for batch in reader {
         let batch = batch?;
         let n = batch.num_rows();
-        let user_col = batch
-            .column_by_name("user_id")
-            .context("missing user_id column")?;
-        let users = user_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("user_id must be Utf8")?;
 
         let durations: Option<&Int64Array> = if covering {
             batch
@@ -700,14 +1005,14 @@ fn scan_key_column(
         };
 
         // Blob mode: covering from JSON payload if no duration column.
-        let payload_col: Option<&StringArray> = if covering && durations.is_none() && durations_u64.is_none()
-        {
-            batch
-                .column_by_name("payload")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        } else {
-            None
-        };
+        let payload_col: Option<&StringArray> =
+            if covering && durations.is_none() && durations_u64.is_none() {
+                batch
+                    .column_by_name("payload")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            } else {
+                None
+            };
 
         // Cogrouped: nested LIST<STRUCT> of listens - hoist list length + duration sum.
         let listens_col: Option<&ListArray> = if covering {
@@ -718,45 +1023,80 @@ fn scan_key_column(
             None
         };
 
+        let timestamp_col: Option<&dyn Array> = if covering {
+            batch
+                .column_by_name("timestamp")
+                .or_else(|| batch.column_by_name("timestamp_ms"))
+                .map(|c| c.as_ref())
+        } else {
+            None
+        };
+
         for i in 0..n {
-            let key = users.value(i).to_string();
+            let Some(key) = encode_row_key(&batch, key_columns, i)? else {
+                continue;
+            };
             let entry = map.entry(key).or_default();
-            entry.0.push(row_base + i as u64);
+            entry.rows.push(row_base + i as u64);
+            if !covering {
+                continue;
+            }
             if let Some(list) = listens_col {
-                if let Some((count, dur)) = covering_from_nested_listens(list, i) {
-                    entry.1 = entry.1.saturating_add(count);
-                    entry.2 = entry.2.saturating_add(dur);
+                if let Some((count, dur, min_ts, max_ts)) = covering_from_nested_listens(list, i)
+                {
+                    entry.listen_count = entry.listen_count.saturating_add(count);
+                    entry.total_duration_ms = entry.total_duration_ms.saturating_add(dur);
+                    if let Some(t) = min_ts {
+                        fold_ts(&mut entry.min_ts, &mut entry.max_ts, t);
+                    }
+                    if let Some(t) = max_ts {
+                        fold_ts(&mut entry.min_ts, &mut entry.max_ts, t);
+                    }
                 } else {
-                    entry.1 += 1;
-                }
-            } else if let Some(d) = durations {
-                entry.1 += 1;
-                if !d.is_null(i) {
-                    entry.2 = entry.2.saturating_add(d.value(i).max(0) as u64);
-                }
-            } else if let Some(d) = durations_u64 {
-                entry.1 += 1;
-                if !d.is_null(i) {
-                    entry.2 = entry.2.saturating_add(d.value(i));
+                    entry.listen_count += 1;
                 }
             } else if let Some(p) = payload_col {
                 // Count listens inside JSON blob.
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(p.value(i)) {
                     if let Some(arr) = v.get("listens").and_then(|x| x.as_array()) {
-                        entry.1 += arr.len() as u64;
+                        entry.listen_count += arr.len() as u64;
                         for item in arr {
                             if let Some(d) = item.get("duration_ms").and_then(|x| x.as_i64()) {
-                                entry.2 = entry.2.saturating_add(d.max(0) as u64);
+                                entry.total_duration_ms =
+                                    entry.total_duration_ms.saturating_add(d.max(0) as u64);
+                            }
+                            if let Some(ts) = item
+                                .get("timestamp_ms")
+                                .and_then(|x| x.as_i64())
+                                .or_else(|| item.get("timestamp").and_then(|x| x.as_i64()))
+                            {
+                                fold_ts(&mut entry.min_ts, &mut entry.max_ts, ts);
                             }
                         }
                     } else {
-                        entry.1 += 1;
+                        entry.listen_count += 1;
                     }
                 } else {
-                    entry.1 += 1;
+                    entry.listen_count += 1;
                 }
             } else {
-                entry.1 += 1;
+                entry.listen_count += 1;
+                if let Some(d) = durations {
+                    if !d.is_null(i) {
+                        entry.total_duration_ms =
+                            entry.total_duration_ms.saturating_add(d.value(i).max(0) as u64);
+                    }
+                } else if let Some(d) = durations_u64 {
+                    if !d.is_null(i) {
+                        entry.total_duration_ms =
+                            entry.total_duration_ms.saturating_add(d.value(i));
+                    }
+                }
+                if let Some(ts_col) = timestamp_col {
+                    if let Some(ts) = timestamp_ms_at(ts_col, i) {
+                        fold_ts(&mut entry.min_ts, &mut entry.max_ts, ts);
+                    }
+                }
             }
         }
         row_base += n as u64;
@@ -764,16 +1104,18 @@ fn scan_key_column(
 
     let mut out: Vec<_> = map
         .into_iter()
-        .map(|(k, (rows, count, dur))| {
+        .map(|(k, agg)| {
             let cov = if covering {
                 Some(CoveringValues {
-                    listen_count: count,
-                    total_duration_ms: dur,
+                    listen_count: agg.listen_count,
+                    total_duration_ms: agg.total_duration_ms,
+                    min_ts: agg.min_ts,
+                    max_ts: agg.max_ts,
                 })
             } else {
                 None
             };
-            (k, rows, cov)
+            (k, agg.rows, cov)
         })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1012,5 +1354,166 @@ mod tests {
                 5
             );
         }
+    }
+
+    fn first_string_in_col(paths: &[PathBuf], col: &str) -> String {
+        use arrow::array::{Array, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        for path in paths {
+            let file = File::open(path).unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let arr = batch
+                    .column_by_name(col)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        return arr.value(i).to_string();
+                    }
+                }
+            }
+        }
+        panic!("no values for column {col}");
+    }
+
+    fn first_track_for_user(paths: &[PathBuf], user: &str) -> String {
+        use arrow::array::{Array, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        for path in paths {
+            let file = File::open(path).unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let users = batch
+                    .column_by_name("user_id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let tracks = batch
+                    .column_by_name("track_uri")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for i in 0..batch.num_rows() {
+                    if users.value(i) == user {
+                        return tracks.value(i).to_string();
+                    }
+                }
+            }
+        }
+        panic!("user {user} not found");
+    }
+
+    #[test]
+    fn default_index_finds_user_0000() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 2)).unwrap();
+        IndexBuilder::new(&idx_root, 8)
+            .build_fragment(&paths, "frag-default", None)
+            .unwrap();
+        let index = load_index(&idx_root).unwrap();
+        assert!(!index.lookup("user_0000").is_empty());
+    }
+
+    #[test]
+    fn index_by_track_uri_lookup_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let mut opts = tiny_opts(&data, WriteMode::Sorted, 1);
+        opts.num_users = 8;
+        opts.listens_per_user = 3;
+        let paths = write_sample_dataset(&opts).unwrap();
+        let track = first_string_in_col(&paths, "track_uri");
+        IndexBuilder::new(&idx_root, 4)
+            .with_key_columns(vec!["track_uri".into()])
+            .build_fragment(&paths, "frag-track", None)
+            .unwrap();
+        let index = load_index(&idx_root).unwrap();
+        let entries = index.lookup(&track);
+        assert!(
+            !entries.is_empty(),
+            "expected hits for track_uri {track}"
+        );
+        let via_encode = index.lookup(&encode_key(&[track.as_str()]));
+        assert_eq!(entries.len(), via_encode.len());
+    }
+
+    #[test]
+    fn compound_user_and_track_key_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let mut opts = tiny_opts(&data, WriteMode::Sorted, 1);
+        opts.num_users = 8;
+        opts.listens_per_user = 3;
+        let paths = write_sample_dataset(&opts).unwrap();
+        let track = first_track_for_user(&paths, "user_0000");
+        IndexBuilder::new(&idx_root, 4)
+            .with_key_columns(vec!["user_id".into(), "track_uri".into()])
+            .build_fragment(&paths, "frag-compound", None)
+            .unwrap();
+        let index = load_index(&idx_root).unwrap();
+        let key = encode_key(&["user_0000", track.as_str()]);
+        let entries = index.lookup(&key);
+        assert!(
+            !entries.is_empty(),
+            "expected compound key hit for {key:?} track={track}"
+        );
+    }
+
+    #[test]
+    fn covering_min_max_ts_on_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 2)).unwrap();
+        IndexBuilder::new(&idx_root, 8)
+            .with_covering(true)
+            .build_fragment(&paths, "frag-ts", None)
+            .unwrap();
+        let index = load_index(&idx_root).unwrap();
+        let entries = index.lookup("user_0000");
+        assert!(!entries.is_empty());
+        for e in entries {
+            let cov = e.covering.as_ref().expect("covering");
+            let min_ts = cov.min_ts.expect("min_ts");
+            let max_ts = cov.max_ts.expect("max_ts");
+            assert!(min_ts <= max_ts, "min_ts={min_ts} max_ts={max_ts}");
+        }
+    }
+
+    #[test]
+    fn missing_key_column_errors_with_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let mut opts = tiny_opts(&data, WriteMode::Sorted, 1);
+        opts.num_users = 4;
+        opts.listens_per_user = 2;
+        let paths = write_sample_dataset(&opts).unwrap();
+        let err = IndexBuilder::new(&idx_root, 4)
+            .with_key_columns(vec!["definitely_missing".into()])
+            .build_fragment(&paths, "frag-miss", None)
+            .expect_err("missing key column should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("definitely_missing"),
+            "error should mention the column name, got: {msg}"
+        );
     }
 }
