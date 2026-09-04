@@ -10,6 +10,7 @@
 //! - `contiguous` - interleaved multi-column span for one ranged read
 
 use crate::prepared::{self, ByteSpan, FrameLoc, PreparedManifest};
+use crate::s3::{S3ChunkReader, S3Client};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,7 +28,7 @@ pub struct PageLoc {
 }
 
 /// One index entry: key lives in a specific file at specific rows.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RapIndexEntry {
     pub key: String,
     pub file: u32,
@@ -51,6 +52,23 @@ pub struct RapIndexEntry {
     /// Key's primary fetch is 4KB-aligned.
     #[serde(default)]
     pub aligned: Option<bool>,
+    /// True = forget this key (drop prior entries for the key).
+    #[serde(default)]
+    pub tombstone: bool,
+    #[serde(default)]
+    pub file_etag: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+/// Identity of a data file referenced by a fragment (size / etag for staleness checks).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct FileIdent {
+    pub path: String,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -77,6 +95,28 @@ pub struct IndexFragmentMeta {
     /// Iceberg snapshot this fragment was built from, if any.
     #[serde(default)]
     pub iceberg_snapshot_id: Option<i64>,
+    /// Optional size/etag identity for `files` (and extras). Empty on old fragments.
+    #[serde(default)]
+    pub file_idents: Vec<FileIdent>,
+    /// Paths removed from the live set (Iceberg overwrite/expire). Applied in registry order.
+    #[serde(default)]
+    pub dropped_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactReport {
+    pub fragment_id: String,
+    pub keys: usize,
+    pub entries: usize,
+    pub files: usize,
+    pub dropped_tombstoned_keys: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyReport {
+    pub checked: usize,
+    pub stale: Vec<String>,
+    pub skipped: usize,
 }
 
 fn parse_iceberg_snapshot_note(note: &str) -> Option<i64> {
@@ -244,6 +284,9 @@ impl IndexBuilder {
                     contiguous: None,
                     prepared_file: None,
                     aligned: None,
+                    tombstone: false,
+                    file_etag: None,
+                    file_size: None,
                 });
             }
         }
@@ -258,6 +301,26 @@ impl IndexBuilder {
                 &path_to_ord,
                 self.num_buckets,
             )?;
+        }
+
+        let file_idents: Vec<FileIdent> = file_dict
+            .iter()
+            .enumerate()
+            .map(|(i, stored)| {
+                let open = parquet_files
+                    .get(i)
+                    .map(|p| p.as_path())
+                    .unwrap_or_else(|| Path::new(stored));
+                probe_file_ident(stored, open)
+            })
+            .collect();
+        for bucket in &mut buckets {
+            for e in bucket {
+                if let Some(ident) = file_idents.get(e.file as usize) {
+                    e.file_etag = ident.etag.clone();
+                    e.file_size = ident.size;
+                }
+            }
         }
 
         for (bi, entries) in buckets.iter().enumerate() {
@@ -280,19 +343,20 @@ impl IndexBuilder {
             key_columns: self.key_columns.clone(),
             value_columns: self.value_columns.clone(),
             iceberg_snapshot_id,
+            file_idents,
+            dropped_files: Vec::new(),
         };
         serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, &meta)?;
 
-        let registry_path = self.root.join("registry.json");
-        let mut registry: Vec<String> = if registry_path.exists() {
-            serde_json::from_reader(File::open(&registry_path)?)?
+        let mut registry: Vec<String> = if self.root.join("registry.json").exists() {
+            read_registry(&self.root)?
         } else {
             Vec::new()
         };
         if !registry.iter().any(|id| id == fragment_id) {
             registry.push(fragment_id.to_string());
         }
-        serde_json::to_writer_pretty(File::create(&registry_path)?, &registry)?;
+        write_registry(&self.root, &registry)?;
 
         Ok(frag_dir)
     }
@@ -383,6 +447,9 @@ fn merge_prepared_into_buckets(
                         Some(prepared_rel.clone())
                     },
                     aligned: Some(k.aligned),
+                    tombstone: false,
+                    file_etag: None,
+                    file_size: None,
                 });
             }
         }
@@ -396,9 +463,16 @@ fn capture_page_locs(path: &Path, rows: &[u64], value_columns: &[String]) -> Res
     use parquet::file::metadata::PageIndexPolicy;
     use std::collections::HashSet;
 
-    let file = File::open(path)?;
+    let uri = path.to_string_lossy();
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
-    let arrow_meta = ArrowReaderMetadata::load(&file, options)?;
+    let arrow_meta = if S3Client::is_remote_uri(&uri) {
+        let (bucket, key) = S3Client::parse_uri(&uri)?;
+        let reader = S3ChunkReader::open(S3Client::from_env(), bucket, key)?;
+        ArrowReaderMetadata::load(&reader, options)?
+    } else {
+        let file = File::open(path)?;
+        ArrowReaderMetadata::load(&file, options)?
+    };
     let pq = arrow_meta.metadata();
     let offset_indexes = pq
         .offset_index()
@@ -503,8 +577,13 @@ fn read_bucket_entries(frag_dir: &Path, bi: u32) -> Result<Vec<RapIndexEntry>> {
         .join(format!("bucket_{bi:03}.jsonl"));
     if bin_path.exists() {
         let bytes = fs::read(&bin_path)?;
-        bincode::deserialize(&bytes).context("bincode deserialize")
-    } else if jsonl_path.exists() {
+        match bincode::deserialize(&bytes) {
+            Ok(v) => return Ok(v),
+            Err(_) if jsonl_path.exists() => {}
+            Err(e) => return Err(e).context("bincode deserialize"),
+        }
+    }
+    if jsonl_path.exists() {
         read_jsonl(&jsonl_path)
     } else {
         Ok(Vec::new())
@@ -532,6 +611,8 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
     let mut files: Vec<PathBuf> = Vec::new();
     let mut entries_by_key: HashMap<String, Vec<RapIndexEntry>> = HashMap::new();
     let mut fragments: Vec<IndexFragmentMeta> = Vec::new();
+    let mut dropped: HashSet<String> = HashSet::new();
+    let forgotten = load_forgotten(&root);
 
     for frag_id in registry {
         let frag_dir = root.join("fragments").join(&frag_id);
@@ -544,6 +625,10 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
             let global = files.len() as u32;
             files.push(abs);
             local_to_global.push(global);
+            mark_file_present(&mut dropped, &root, rel);
+        }
+        for d in &meta.dropped_files {
+            mark_file_dropped(&mut dropped, &root, d);
         }
 
         let wanted: Option<HashSet<u32>> = only_keys.map(|ks| {
@@ -569,21 +654,42 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
                         continue;
                     }
                 }
-                if (e.file as usize) < local_to_global.len() {
-                    e.file = local_to_global[e.file as usize];
+                let local = e.file as usize;
+                if local < local_to_global.len() {
+                    e.file = local_to_global[local];
                 }
                 // IndexBuilder stores full row lists and records key_columns.
                 // Compact `[first]+value_count` encoding is lake-only (empty key_columns).
                 if meta.key_columns.is_empty() {
                     expand_compact_rows(e);
                 }
-                entries_by_key
-                    .entry(e.key.clone())
-                    .or_default()
-                    .push(e.clone());
+                if e.tombstone {
+                    absorb_entry(&mut entries_by_key, e.clone());
+                    continue;
+                }
+                let stored = files
+                    .get(e.file as usize)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let rel = meta.files.get(local).map(|s| s.as_str()).unwrap_or("");
+                if file_is_dropped(&dropped, &root, rel)
+                    || file_is_dropped(&dropped, &root, &stored)
+                {
+                    continue;
+                }
+                absorb_entry(&mut entries_by_key, e.clone());
             }
         }
         fragments.push(meta);
+    }
+    retain_undropped_entries(&mut entries_by_key, &dropped, &root, |ord| {
+        files
+            .get(ord as usize)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    for k in &forgotten {
+        entries_by_key.remove(k);
     }
 
     Ok(RapIndex {
@@ -625,8 +731,16 @@ pub fn load_index_entries_for_keys(
 ) -> Result<RapIndex> {
     let mut entries_by_key: HashMap<String, Vec<RapIndexEntry>> = HashMap::new();
     let keep_keys: HashSet<&str> = keys.iter().map(|s| s.as_str()).collect();
+    let forgotten = load_forgotten(root);
+    let mut dropped: HashSet<String> = HashSet::new();
     let mut file_base = 0usize;
     for meta in fragments {
+        for rel in &meta.files {
+            mark_file_present(&mut dropped, root, rel);
+        }
+        for d in &meta.dropped_files {
+            mark_file_dropped(&mut dropped, root, d);
+        }
         let frag_dir = root.join("fragments").join(&meta.fragment_id);
         let wanted: HashSet<u32> = keys
             .iter()
@@ -646,13 +760,33 @@ pub fn load_index_entries_for_keys(
                 if meta.key_columns.is_empty() {
                     expand_compact_rows(e);
                 }
-                entries_by_key
-                    .entry(e.key.clone())
-                    .or_default()
-                    .push(e.clone());
+                if e.tombstone {
+                    absorb_entry(&mut entries_by_key, e.clone());
+                    continue;
+                }
+                let stored = files
+                    .get(e.file as usize)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let rel = meta.files.get(local).map(|s| s.as_str()).unwrap_or("");
+                if file_is_dropped(&dropped, root, rel)
+                    || file_is_dropped(&dropped, root, &stored)
+                {
+                    continue;
+                }
+                absorb_entry(&mut entries_by_key, e.clone());
             }
         }
         file_base += n_files;
+    }
+    retain_undropped_entries(&mut entries_by_key, &dropped, root, |ord| {
+        files
+            .get(ord as usize)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    for k in &forgotten {
+        entries_by_key.remove(k);
     }
     Ok(RapIndex {
         root: root.to_path_buf(),
@@ -662,9 +796,517 @@ pub fn load_index_entries_for_keys(
     })
 }
 
+fn absorb_entry(entries_by_key: &mut HashMap<String, Vec<RapIndexEntry>>, e: RapIndexEntry) {
+    if e.tombstone {
+        entries_by_key.remove(&e.key);
+    } else {
+        entries_by_key.entry(e.key.clone()).or_default().push(e);
+    }
+}
+
+fn is_remote_uri(s: &str) -> bool {
+    S3Client::is_remote_uri(s)
+}
+
+fn probe_remote_ident(uri: &str) -> (Option<String>, Option<u64>) {
+    let Ok((bucket, key)) = S3Client::parse_uri(uri) else {
+        return (None, None);
+    };
+    match S3Client::from_env().head_object_meta(&bucket, &key) {
+        Ok(meta) => (meta.etag, Some(meta.size)),
+        Err(_) => (None, None),
+    }
+}
+
+fn probe_file_ident(stored: &str, open_path: &Path) -> FileIdent {
+    if is_remote_uri(stored) {
+        let (etag, size) = probe_remote_ident(stored);
+        return FileIdent {
+            path: stored.to_string(),
+            etag,
+            size,
+        };
+    }
+    let size = fs::metadata(open_path)
+        .or_else(|_| fs::metadata(stored))
+        .ok()
+        .map(|m| m.len());
+    FileIdent {
+        path: stored.to_string(),
+        etag: None,
+        size,
+    }
+}
+
+fn read_registry(root: &Path) -> Result<Vec<String>> {
+    let registry_path = root.join("registry.json");
+    if !registry_path.exists() {
+        bail!("no RAP index at {} (missing registry.json)", root.display());
+    }
+    serde_json::from_reader(File::open(&registry_path)?)
+        .with_context(|| format!("read {}", registry_path.display()))
+}
+
+fn write_registry(root: &Path, ids: &[String]) -> Result<()> {
+    let path = root.join("registry.json");
+    let tmp = root.join(".registry.json.tmp");
+    {
+        let mut f = File::create(&tmp).context("create registry tmp")?;
+        serde_json::to_writer_pretty(&mut f, ids).context("write registry tmp")?;
+        f.sync_all().ok();
+    }
+    fs::rename(&tmp, &path).context("publish registry.json")
+}
+
+fn forgotten_path(root: &Path) -> PathBuf {
+    root.join("forgotten.jsonl")
+}
+
+fn normalize_stored_key(s: &str) -> String {
+    let s = s.trim();
+    let s = s.strip_prefix("file://").unwrap_or(s);
+    s.replace('\\', "/")
+}
+
+/// Stored path plus the resolved open path, so Iceberg `dropped_files` matches
+/// both relative dictionary entries and absolute `files` vec paths.
+fn path_identity_keys(root: &Path, stored: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |s: &str| {
+        let n = normalize_stored_key(s);
+        if !n.is_empty() && !out.contains(&n) {
+            out.push(n);
+        }
+    };
+    push(stored);
+    let resolved = resolve_data_path(root, stored);
+    push(&resolved.to_string_lossy());
+    out
+}
+
+fn mark_file_present(dropped: &mut HashSet<String>, root: &Path, stored: &str) {
+    for k in path_identity_keys(root, stored) {
+        dropped.remove(&k);
+    }
+}
+
+fn mark_file_dropped(dropped: &mut HashSet<String>, root: &Path, stored: &str) {
+    for k in path_identity_keys(root, stored) {
+        dropped.insert(k);
+    }
+}
+
+fn file_is_dropped(dropped: &HashSet<String>, root: &Path, stored: &str) -> bool {
+    path_identity_keys(root, stored)
+        .iter()
+        .any(|k| dropped.contains(k))
+}
+
+/// Dropped files on a later fragment must evict entries already absorbed.
+fn retain_undropped_entries(
+    entries_by_key: &mut HashMap<String, Vec<RapIndexEntry>>,
+    dropped: &HashSet<String>,
+    root: &Path,
+    file_of: impl Fn(u32) -> String,
+) {
+    if dropped.is_empty() {
+        return;
+    }
+    for ents in entries_by_key.values_mut() {
+        ents.retain(|e| {
+            if e.tombstone {
+                return true;
+            }
+            !file_is_dropped(dropped, root, &file_of(e.file))
+        });
+    }
+    entries_by_key.retain(|_, ents| !ents.is_empty());
+}
+
+fn load_forgotten(root: &Path) -> HashSet<String> {
+    let path = forgotten_path(root);
+    let Ok(f) = File::open(&path) else {
+        return HashSet::new();
+    };
+    let mut out = HashSet::new();
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        let k = line.trim();
+        if !k.is_empty() {
+            out.insert(k.to_string());
+        }
+    }
+    out
+}
+
+fn append_forgotten(root: &Path, keys: &[String]) -> Result<()> {
+    fs::create_dir_all(root)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(forgotten_path(root))
+        .context("open forgotten.jsonl")?;
+    for k in keys {
+        if k.is_empty() {
+            continue;
+        }
+        writeln!(f, "{k}")?;
+    }
+    Ok(())
+}
+
+fn last_fragment_meta(root: &Path) -> Result<Option<IndexFragmentMeta>> {
+    let registry_path = root.join("registry.json");
+    if !registry_path.exists() {
+        return Ok(None);
+    }
+    let registry: Vec<String> = serde_json::from_reader(File::open(&registry_path)?)?;
+    let Some(id) = registry.last() else {
+        return Ok(None);
+    };
+    let man = root.join("fragments").join(id).join("manifest.json");
+    if !man.exists() {
+        return Ok(None);
+    }
+    let meta = serde_json::from_reader(File::open(&man)?)?;
+    Ok(Some(meta))
+}
+
+fn write_fragment_dir(
+    root: &Path,
+    meta: &IndexFragmentMeta,
+    buckets: &[Vec<RapIndexEntry>],
+) -> Result<PathBuf> {
+    let frag_dir = root.join("fragments").join(&meta.fragment_id);
+    fs::create_dir_all(frag_dir.join("buckets"))?;
+    for (bi, entries) in buckets.iter().enumerate() {
+        let jsonl_path = frag_dir
+            .join("buckets")
+            .join(format!("bucket_{bi:03}.jsonl"));
+        let bin_path = frag_dir.join("buckets").join(format!("bucket_{bi:03}.bin"));
+        write_jsonl(&jsonl_path, entries)?;
+        write_bincode(&bin_path, entries)?;
+    }
+    serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, meta)?;
+    Ok(frag_dir)
+}
+
+fn bucketize_entries(entries: impl IntoIterator<Item = RapIndexEntry>, num_buckets: u32) -> Vec<Vec<RapIndexEntry>> {
+    let n = num_buckets.max(1);
+    let mut buckets: Vec<Vec<RapIndexEntry>> = (0..n).map(|_| Vec::new()).collect();
+    for e in entries {
+        let b = key_bucket(&e.key, n) as usize;
+        buckets[b].push(e);
+    }
+    buckets
+}
+
+/// Load all fragments, apply tombstones, last `(key, file)` wins, write one fragment,
+/// rewrite `registry.json` to only that id. Old fragment directories are kept.
+pub fn compact_index(root: impl AsRef<Path>, fragment_id: Option<&str>) -> Result<CompactReport> {
+    let root = root.as_ref();
+    let registry = read_registry(root)?;
+    let fragment_id = fragment_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("compact-{}", chrono::Utc::now().timestamp_millis()));
+
+    let mut files: Vec<String> = Vec::new();
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    let mut entries_by_key: HashMap<String, Vec<RapIndexEntry>> = HashMap::new();
+    let mut ever_tombstoned: HashSet<String> = HashSet::new();
+    let mut last_meta: Option<IndexFragmentMeta> = None;
+    let mut dropped: HashSet<String> = HashSet::new();
+    let mut iceberg_snapshot_id: Option<i64> = None;
+
+    for frag_id in &registry {
+        let frag_dir = root.join("fragments").join(frag_id);
+        let meta: IndexFragmentMeta =
+            serde_json::from_reader(File::open(frag_dir.join("manifest.json"))?)?;
+
+        let mut local_to_global: Vec<u32> = Vec::with_capacity(meta.files.len());
+        for rel in &meta.files {
+            local_to_global.push(files.len() as u32);
+            files.push(rel.clone());
+            resolved.push(resolve_data_path(root, rel));
+            mark_file_present(&mut dropped, root, rel);
+        }
+        for d in &meta.dropped_files {
+            mark_file_dropped(&mut dropped, root, d);
+        }
+        if let Some(id) = meta.iceberg_snapshot_id.or_else(|| {
+            meta.note.as_deref().and_then(parse_iceberg_snapshot_note)
+        }) {
+            iceberg_snapshot_id = Some(id);
+        }
+
+        for bi in 0..meta.num_buckets {
+            let mut entries = read_bucket_entries(&frag_dir, bi)?;
+            for e in &mut entries {
+                let local = e.file as usize;
+                if local < local_to_global.len() {
+                    e.file = local_to_global[local];
+                }
+                if meta.key_columns.is_empty() {
+                    expand_compact_rows(e);
+                }
+                if e.tombstone {
+                    ever_tombstoned.insert(e.key.clone());
+                } else {
+                    let rel = meta.files.get(local).map(|s| s.as_str()).unwrap_or("");
+                    let stored = files.get(e.file as usize).cloned().unwrap_or_default();
+                    if file_is_dropped(&dropped, root, rel)
+                        || file_is_dropped(&dropped, root, &stored)
+                    {
+                        continue;
+                    }
+                }
+                absorb_entry(&mut entries_by_key, e.clone());
+            }
+        }
+        last_meta = Some(meta);
+    }
+    retain_undropped_entries(&mut entries_by_key, &dropped, root, |ord| {
+        files.get(ord as usize).cloned().unwrap_or_default()
+    });
+
+    let dropped_tombstoned_keys = ever_tombstoned
+        .iter()
+        .filter(|k| !entries_by_key.contains_key(*k))
+        .count();
+
+    // Last (key, stored-path) wins; rebuild a unique file dictionary.
+    let mut path_to_ord: HashMap<String, u32> = HashMap::new();
+    let mut new_files: Vec<String> = Vec::new();
+    let mut live: Vec<RapIndexEntry> = Vec::new();
+    let mut keys_sorted: Vec<String> = entries_by_key.keys().cloned().collect();
+    keys_sorted.sort();
+    for key in keys_sorted {
+        let ents = entries_by_key.remove(&key).unwrap_or_default();
+        let mut by_path: HashMap<String, RapIndexEntry> = HashMap::new();
+        let mut path_order: Vec<String> = Vec::new();
+        for e in ents {
+            let path = files
+                .get(e.file as usize)
+                .cloned()
+                .unwrap_or_else(|| {
+                    resolved
+                        .get(e.file as usize)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+            if !by_path.contains_key(&path) {
+                path_order.push(path.clone());
+            }
+            by_path.insert(path, e);
+        }
+        for path in path_order {
+            let mut e = by_path.remove(&path).unwrap();
+            let ord = if let Some(&o) = path_to_ord.get(&path) {
+                o
+            } else {
+                let o = new_files.len() as u32;
+                path_to_ord.insert(path.clone(), o);
+                new_files.push(path);
+                o
+            };
+            e.file = ord;
+            live.push(e);
+        }
+    }
+    let forgotten = load_forgotten(root);
+    live.retain(|e| !forgotten.contains(&e.key));
+
+    let file_idents: Vec<FileIdent> = new_files
+        .iter()
+        .map(|stored| probe_file_ident(stored, &resolve_data_path(root, stored)))
+        .collect();
+    for e in &mut live {
+        if let Some(ident) = file_idents.get(e.file as usize) {
+            e.file_etag = ident.etag.clone();
+            e.file_size = ident.size;
+        }
+    }
+
+    let num_buckets = last_meta
+        .as_ref()
+        .map(|m| m.num_buckets.max(1))
+        .unwrap_or(16);
+    let key_columns = last_meta
+        .as_ref()
+        .map(|m| m.key_columns.clone())
+        .unwrap_or_default();
+    let value_columns = last_meta
+        .as_ref()
+        .map(|m| m.value_columns.clone())
+        .unwrap_or_default();
+
+    let keys = {
+        let set: HashSet<&str> = live.iter().map(|e| e.key.as_str()).collect();
+        set.len()
+    };
+    let entries = live.len();
+    let n_files = new_files.len();
+    let buckets = bucketize_entries(live, num_buckets);
+    let meta = IndexFragmentMeta {
+        fragment_id: fragment_id.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        files: new_files,
+        num_buckets,
+        note: Some("compacted".to_string()),
+        key_columns,
+        value_columns,
+        // Newest Iceberg snapshot across fragments (forget fragments have none).
+        iceberg_snapshot_id,
+        file_idents,
+        dropped_files: Vec::new(),
+    };
+    write_fragment_dir(root, &meta, &buckets)?;
+    write_registry(root, &[fragment_id.clone()])?;
+
+    Ok(CompactReport {
+        fragment_id,
+        keys,
+        entries,
+        files: n_files,
+        dropped_tombstoned_keys,
+    })
+}
+
+/// Append a fragment of tombstone entries that forget `keys` on subsequent loads.
+pub fn forget_keys(
+    root: impl AsRef<Path>,
+    keys: &[String],
+    fragment_id: Option<&str>,
+) -> Result<PathBuf> {
+    let root = root.as_ref();
+    fs::create_dir_all(root)?;
+    let prev = last_fragment_meta(root)?;
+    let num_buckets = prev.as_ref().map(|m| m.num_buckets.max(1)).unwrap_or(16);
+    let key_columns = prev
+        .as_ref()
+        .map(|m| m.key_columns.clone())
+        .unwrap_or_else(default_key_columns);
+    let value_columns = prev
+        .as_ref()
+        .map(|m| m.value_columns.clone())
+        .unwrap_or_else(default_value_columns);
+    let fragment_id = fragment_id.map(|s| s.to_string()).unwrap_or_else(|| {
+        format!("forget-{}", chrono::Utc::now().timestamp_millis())
+    });
+
+    let tombstones: Vec<RapIndexEntry> = keys
+        .iter()
+        .map(|k| RapIndexEntry {
+            key: k.clone(),
+            file: 0,
+            row_numbers: Vec::new(),
+            tombstone: true,
+            ..Default::default()
+        })
+        .collect();
+    let buckets = bucketize_entries(tombstones, num_buckets);
+    let meta = IndexFragmentMeta {
+        fragment_id: fragment_id.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        files: Vec::new(),
+        num_buckets,
+        note: Some(format!("forget {} key(s)", keys.len())),
+        key_columns,
+        value_columns,
+        iceberg_snapshot_id: None,
+        file_idents: Vec::new(),
+        dropped_files: Vec::new(),
+    };
+    let frag_dir = write_fragment_dir(root, &meta, &buckets)?;
+    append_forgotten(root, keys)?;
+
+    let mut registry: Vec<String> = if root.join("registry.json").exists() {
+        read_registry(root)?
+    } else {
+        Vec::new()
+    };
+    if !registry.iter().any(|id| id == &fragment_id) {
+        registry.push(fragment_id);
+    }
+    write_registry(root, &registry)?;
+    Ok(frag_dir)
+}
+
+fn local_file_meta(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Check stored file identity (size / etag) against the live objects.
+pub fn verify_index_files(root: impl AsRef<Path>) -> Result<VerifyReport> {
+    let root = root.as_ref();
+    let registry = read_registry(root)?;
+    let mut checked = 0usize;
+    let mut skipped = 0usize;
+    let mut stale = Vec::new();
+
+    for frag_id in registry {
+        let frag_dir = root.join("fragments").join(&frag_id);
+        let meta: IndexFragmentMeta =
+            serde_json::from_reader(File::open(frag_dir.join("manifest.json"))?)?;
+        let idents: Vec<FileIdent> = if meta.file_idents.is_empty() {
+            meta.files
+                .iter()
+                .map(|p| FileIdent {
+                    path: p.clone(),
+                    etag: None,
+                    size: None,
+                })
+                .collect()
+        } else {
+            meta.file_idents
+        };
+
+        for ident in idents {
+            let has_ident = ident.etag.is_some() || ident.size.is_some();
+            let live = if is_remote_uri(&ident.path) {
+                let (etag, size) = probe_remote_ident(&ident.path);
+                match size {
+                    Some(sz) => Some((etag, sz)),
+                    None => None,
+                }
+            } else {
+                let resolved = resolve_data_path(root, &ident.path);
+                local_file_meta(&resolved).map(|sz| (None, sz))
+            };
+
+            match live {
+                None => {
+                    checked += 1;
+                    stale.push(ident.path);
+                }
+                Some((etag, size)) => {
+                    if !has_ident {
+                        skipped += 1;
+                        continue;
+                    }
+                    checked += 1;
+                    let size_mismatch = ident.size.map(|s| s != size).unwrap_or(false);
+                    let etag_mismatch = match (&ident.etag, &etag) {
+                        (Some(want), Some(got)) => want != got,
+                        _ => false,
+                    };
+                    if size_mismatch || etag_mismatch {
+                        stale.push(ident.path);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(VerifyReport {
+        checked,
+        stale,
+        skipped,
+    })
+}
+
 fn resolve_data_path(index_root: &Path, rel: &str) -> PathBuf {
-    // Keep object-store URIs intact (s3://… or http://host/bucket/key).
-    if rel.starts_with("s3://") || rel.starts_with("http://") || rel.starts_with("https://") {
+    // Keep object-store URIs intact (s3://… / s3a://… / http(s)://…).
+    if S3Client::is_remote_uri(rel) {
         return PathBuf::from(rel);
     }
     let p = PathBuf::from(rel);
@@ -981,11 +1623,29 @@ fn scan_key_column(
     key_columns: &[String],
     covering: bool,
 ) -> Result<Vec<(String, Vec<u64>, Option<CoveringValues>)>> {
-    use arrow::array::{Array, Int64Array, ListArray, StringArray, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+    let uri = path.to_string_lossy();
+    if S3Client::is_remote_uri(&uri) {
+        let (bucket, key) = S3Client::parse_uri(&uri)?;
+        let reader = S3ChunkReader::open(S3Client::from_env(), bucket, key)
+            .with_context(|| format!("s3 chunk reader {uri}"))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(reader)
+            .with_context(|| format!("parquet builder {uri}"))?;
+        return scan_key_column_builder(builder, key_columns, covering);
+    }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("parquet builder {}", path.display()))?;
+    scan_key_column_builder(builder, key_columns, covering)
+}
+
+fn scan_key_column_builder<T: parquet::file::reader::ChunkReader + 'static>(
+    builder: parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<T>,
+    key_columns: &[String],
+    covering: bool,
+) -> Result<Vec<(String, Vec<u64>, Option<CoveringValues>)>> {
+    use arrow::array::{Array, Int64Array, ListArray, StringArray, UInt64Array};
     let schema = builder.schema();
     for col in key_columns {
         schema
@@ -1141,6 +1801,7 @@ mod tests {
     use super::*;
     use crate::writer::{WriteMode, WriterOptions, write_sample_dataset};
     use std::collections::HashSet;
+    use std::io::Write;
 
     fn tiny_opts(dir: &Path, mode: WriteMode, files: usize) -> WriterOptions {
         WriterOptions {
@@ -1527,6 +2188,168 @@ mod tests {
         assert!(
             msg.contains("definitely_missing"),
             "error should mention the column name, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn forget_key_hides_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 2)).unwrap();
+        IndexBuilder::new(&idx_root, 8)
+            .build_fragment(&paths, "frag-001", None)
+            .unwrap();
+        forget_keys(&idx_root, &[String::from("user_0000")], Some("forget-001")).unwrap();
+
+        let index = load_index(&idx_root).unwrap();
+        assert!(
+            index.lookup("user_0000").is_empty(),
+            "tombstone should hide user_0000"
+        );
+        assert!(
+            !index.lookup("user_0001").is_empty(),
+            "other keys must still hit"
+        );
+
+        let keyed = load_index_for_keys(&idx_root, &[String::from("user_0000")]).unwrap();
+        assert!(keyed.lookup("user_0000").is_empty());
+    }
+
+    #[test]
+    fn forget_is_sticky_across_new_data_fragment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 2)).unwrap();
+        let builder = IndexBuilder::new(&idx_root, 8);
+        builder.build_fragment(&paths, "frag-001", None).unwrap();
+        forget_keys(&idx_root, &[String::from("user_0000")], Some("forget-001")).unwrap();
+        builder.build_fragment(&paths, "frag-002", Some("later")).unwrap();
+        let index = load_index(&idx_root).unwrap();
+        assert!(
+            index.lookup("user_0000").is_empty(),
+            "forgotten keys must not resurrect after a later data fragment"
+        );
+        assert!(!index.lookup("user_0001").is_empty());
+    }
+
+    #[test]
+    fn compact_drops_tombstones_and_keeps_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 2)).unwrap();
+        let builder = IndexBuilder::new(&idx_root, 8);
+        builder.build_fragment(&paths, "frag-001", Some("first")).unwrap();
+        builder.build_fragment(&paths, "frag-002", Some("second")).unwrap();
+        forget_keys(&idx_root, &[String::from("user_0000")], Some("forget-001")).unwrap();
+
+        let report = compact_index(&idx_root, Some("compact-001")).unwrap();
+        assert_eq!(report.fragment_id, "compact-001");
+        assert!(report.dropped_tombstoned_keys >= 1);
+        assert!(report.keys >= 1);
+        assert!(report.entries >= 1);
+
+        let registry: Vec<String> =
+            serde_json::from_reader(File::open(idx_root.join("registry.json")).unwrap()).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0], "compact-001");
+        assert!(idx_root.join("fragments").join("frag-001").exists());
+        assert!(idx_root.join("fragments").join("frag-002").exists());
+
+        let index = load_index(&idx_root).unwrap();
+        assert!(index.lookup("user_0000").is_empty());
+        assert!(!index.lookup("user_0001").is_empty());
+        assert_eq!(index.fragments.len(), 1);
+    }
+
+    #[test]
+    fn compact_honors_dropped_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 2)).unwrap();
+        IndexBuilder::new(&idx_root, 8)
+            .build_fragment(&paths, "frag-001", None)
+            .unwrap();
+        let man = idx_root.join("fragments/frag-001/manifest.json");
+        let mut meta: IndexFragmentMeta =
+            serde_json::from_reader(File::open(&man).unwrap()).unwrap();
+        assert!(meta.files.len() >= 2);
+        let drop_path = meta.files[0].clone();
+        let keep_path = meta.files[1].clone();
+        let before = load_index(&idx_root).unwrap();
+        let gone = key_only_in_stored(&before, &drop_path);
+        let kept = key_only_in_stored(&before, &keep_path);
+        meta.dropped_files = vec![drop_path.clone()];
+        serde_json::to_writer_pretty(File::create(&man).unwrap(), &meta).unwrap();
+
+        let full = load_index(&idx_root).unwrap();
+        let keyed = load_index_for_keys(&idx_root, &[gone.clone()]).unwrap();
+        assert!(
+            full.lookup(&gone).is_empty(),
+            "{gone} lives in dropped file"
+        );
+        assert!(keyed.lookup(&gone).is_empty());
+        assert!(!full.lookup(&kept).is_empty());
+
+        compact_index(&idx_root, Some("compact-drop")).unwrap();
+        let after = load_index(&idx_root).unwrap();
+        assert!(after.lookup(&gone).is_empty());
+        assert!(!after.lookup(&kept).is_empty());
+        assert!(
+            after.fragments[0]
+                .files
+                .iter()
+                .all(|f| normalize_stored_key(f) != normalize_stored_key(&drop_path)),
+            "compacted dict should omit dropped path {drop_path}"
+        );
+    }
+
+    fn key_only_in_stored(index: &RapIndex, stored: &str) -> String {
+        let want = resolve_data_path(&index.root, stored);
+        let want = want.canonicalize().unwrap_or(want);
+        for (k, ents) in &index.entries_by_key {
+            if ents.is_empty() {
+                continue;
+            }
+            let only_here = ents.iter().all(|e| {
+                index.file_path(e.file).ok().map(|p| {
+                    p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == want
+                }).unwrap_or(false)
+            });
+            if only_here {
+                return k.clone();
+            }
+        }
+        panic!("no key lives only in {stored}");
+    }
+
+    #[test]
+    fn verify_detects_resized_parquet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 1)).unwrap();
+        IndexBuilder::new(&idx_root, 4)
+            .build_fragment(&paths, "frag-v", None)
+            .unwrap();
+        let ok = verify_index_files(&idx_root).unwrap();
+        assert!(ok.stale.is_empty(), "fresh index should be clean: {ok:?}");
+        assert!(ok.checked >= 1);
+
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&paths[0])
+            .unwrap();
+        f.write_all(b"x").unwrap();
+        drop(f);
+
+        let bad = verify_index_files(&idx_root).unwrap();
+        assert!(
+            !bad.stale.is_empty(),
+            "resized parquet must be reported stale: {bad:?}"
         );
     }
 }

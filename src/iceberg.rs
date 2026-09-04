@@ -1,7 +1,8 @@
-//! Incremental Needle index from a local Iceberg table's current snapshot.
+//! Incremental Needle index from a local or object-store Iceberg table's current snapshot.
 //!
-//! Subset: `metadata/*.metadata.json` + Avro manifest-list / manifests. Object
-//! stores other than `s3://` URIs stored as path strings are not fetched.
+//! Subset: `metadata/*.metadata.json` + Avro manifest-list / manifests. Metadata
+//! and Avro are fetched via `S3Client::get_object` for `s3://` / `https://`
+//! (data-file URIs stay as `s3://…` in the index).
 //!
 //! Avro is a simplified Iceberg subset: we read `manifest_path` from the
 //! manifest-list and `status` + nested `data_file.file_path` (also `file-path`)
@@ -10,13 +11,13 @@
 //! table metadata uses hyphens (`current-snapshot-id`, `manifest-list`).
 
 use crate::index::{IndexBuilder, IndexFragmentMeta};
+use crate::s3::S3Client;
 use anyhow::{Context, Result};
 use apache_avro::types::Value as AvroValue;
 use apache_avro::Reader;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -100,8 +101,9 @@ pub fn index_iceberg_table(opts: &IcebergIndexOpts) -> Result<IcebergIndexReport
     }
 
     let live = list_live_files(&loaded)?;
-    let already = previous_file_keys(&metas, &opts.index);
-    let new_files: Vec<PathBuf> = live
+    let already = fragment_live_file_keys(&metas, &opts.index, false);
+    let iceberg_live = fragment_live_file_keys(&metas, &opts.index, true);
+    let added: Vec<PathBuf> = live
         .iter()
         .filter(|p| {
             !file_match_keys(p, &opts.index)
@@ -110,16 +112,33 @@ pub fn index_iceberg_table(opts: &IcebergIndexOpts) -> Result<IcebergIndexReport
         })
         .cloned()
         .collect();
+    let live_keys: HashSet<String> = live
+        .iter()
+        .flat_map(|p| file_match_keys(p, &opts.index))
+        .collect();
+    let removed: Vec<String> = iceberg_live
+        .into_iter()
+        .filter(|k| !live_keys.contains(k))
+        .collect();
 
-    // New snapshot with no added files (rewrites / same live set): index the
-    // current live files into a new fragment rather than skipping.
-    let files_to_index: Vec<PathBuf> = if new_files.is_empty() { live } else { new_files };
-    if files_to_index.is_empty() {
+    // Same live set, new snapshot: record snapshot id, do not re-scan Parquet.
+    if added.is_empty() && removed.is_empty() {
+        let key_columns = if opts.key_columns.is_empty() {
+            vec!["user_id".to_string()]
+        } else {
+            opts.key_columns.clone()
+        };
+        let note = format!("iceberg-snapshot:{snapshot_id}");
+        IndexBuilder::new(&opts.index, opts.buckets)
+            .with_covering(opts.covering)
+            .with_key_columns(key_columns)
+            .with_value_columns(opts.value_columns.clone())
+            .build_fragment(&[], &fragment_id, Some(&note))?;
         return Ok(IcebergIndexReport {
             snapshot_id,
             fragment_id,
             files_indexed: 0,
-            skipped: false,
+            skipped: true,
             table_location,
         });
     }
@@ -134,22 +153,88 @@ pub fn index_iceberg_table(opts: &IcebergIndexOpts) -> Result<IcebergIndexReport
         .with_covering(opts.covering)
         .with_key_columns(key_columns)
         .with_value_columns(opts.value_columns.clone())
-        .build_fragment(&files_to_index, &fragment_id, Some(&note))?;
+        .build_fragment(&added, &fragment_id, Some(&note))?;
+    if !removed.is_empty() {
+        patch_dropped_files(&opts.index, &fragment_id, &removed)?;
+    }
 
     Ok(IcebergIndexReport {
         snapshot_id,
         fragment_id,
-        files_indexed: files_to_index.len(),
+        files_indexed: added.len(),
         skipped: false,
         table_location,
     })
 }
 
+fn fragment_is_iceberg(meta: &IndexFragmentMeta) -> bool {
+    meta.iceberg_snapshot_id.is_some()
+        || meta
+            .note
+            .as_deref()
+            .is_some_and(|n| n.starts_with("iceberg-snapshot:"))
+}
+
+/// Live file identity keys after applying each fragment's `files` then `dropped_files`.
+fn fragment_live_file_keys(
+    metas: &[IndexFragmentMeta],
+    index_root: &Path,
+    iceberg_only: bool,
+) -> HashSet<String> {
+    let mut live = HashSet::new();
+    for meta in metas {
+        if iceberg_only && !fragment_is_iceberg(meta) {
+            continue;
+        }
+        for stored in &meta.files {
+            for k in stored_file_keys(stored, index_root) {
+                live.insert(k);
+            }
+        }
+        for d in &meta.dropped_files {
+            live.remove(d);
+            for k in stored_file_keys(d, index_root) {
+                live.remove(&k);
+            }
+        }
+    }
+    live
+}
+
+fn patch_dropped_files(index: &Path, fragment_id: &str, dropped: &[String]) -> Result<()> {
+    let man = index
+        .join("fragments")
+        .join(fragment_id)
+        .join("manifest.json");
+    let mut meta: IndexFragmentMeta = serde_json::from_reader(
+        File::open(&man).with_context(|| format!("open {}", man.display()))?,
+    )?;
+    meta.dropped_files = dropped.to_vec();
+    let tmp = man.with_file_name(".manifest.json.tmp");
+    serde_json::to_writer_pretty(File::create(&tmp)?, &meta)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, &man).with_context(|| format!("publish {}", man.display()))?;
+    Ok(())
+}
+
+fn read_bytes(path: &Path) -> Result<Vec<u8>> {
+    let uri = path.to_string_lossy();
+    if S3Client::is_remote_uri(&uri) {
+        let (bucket, key) = S3Client::parse_uri(&uri)
+            .with_context(|| format!("parse object uri {uri}"))?;
+        S3Client::from_env()
+            .get_object(&bucket, &key)
+            .with_context(|| format!("s3 get {uri}"))
+    } else {
+        fs::read(path).with_context(|| format!("read {}", path.display()))
+    }
+}
+
 fn load_table(table: &Path) -> Result<LoadedTable> {
     let metadata_path = find_current_metadata(table)?;
-    let file = File::open(&metadata_path)
+    let bytes = read_bytes(&metadata_path)
         .with_context(|| format!("open Iceberg metadata {}", metadata_path.display()))?;
-    let meta: TableMetadataJson = serde_json::from_reader(BufReader::new(file))
+    let meta: TableMetadataJson = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse Iceberg metadata {}", metadata_path.display()))?;
     let current_snapshot_id = meta
         .current_snapshot_id
@@ -189,6 +274,10 @@ fn load_table(table: &Path) -> Result<LoadedTable> {
 }
 
 fn find_current_metadata(table: &Path) -> Result<PathBuf> {
+    let table_uri = table.to_string_lossy();
+    if S3Client::is_remote_uri(&table_uri) {
+        return find_current_metadata_remote(&table_uri);
+    }
     let meta_dir = table.join("metadata");
     anyhow::ensure!(
         meta_dir.is_dir(),
@@ -197,8 +286,9 @@ fn find_current_metadata(table: &Path) -> Result<PathBuf> {
     );
     let hint_path = meta_dir.join("version-hint.text");
     if hint_path.is_file() {
-        let hint = fs::read_to_string(&hint_path)
+        let hint = read_bytes(&hint_path)
             .with_context(|| format!("read {}", hint_path.display()))?;
+        let hint = String::from_utf8_lossy(&hint);
         if let Some(p) = resolve_version_hint(&meta_dir, hint.trim()) {
             return Ok(p);
         }
@@ -211,6 +301,108 @@ fn find_current_metadata(table: &Path) -> Result<PathBuf> {
     );
     files.sort_by_key(|(v, _)| *v);
     Ok(files.pop().unwrap().1)
+}
+
+fn find_current_metadata_remote(table_uri: &str) -> Result<PathBuf> {
+    let (bucket, prefix) = S3Client::parse_uri(table_uri)
+        .with_context(|| format!("parse Iceberg table uri {table_uri}"))?;
+    let prefix = prefix.trim_end_matches('/');
+    let meta_prefix = if prefix.is_empty() {
+        "metadata".to_string()
+    } else {
+        format!("{prefix}/metadata")
+    };
+    let client = S3Client::from_env();
+    let hint_key = format!("{meta_prefix}/version-hint.text");
+    let listed = list_metadata_json_objects(&client, &bucket, &meta_prefix);
+    if let Ok(bytes) = client.get_object(&bucket, &hint_key) {
+        let hint = String::from_utf8_lossy(&bytes);
+        let hint = hint.trim();
+        if !hint.is_empty() {
+            if let Ok(files) = &listed {
+                if let Some(p) = pick_metadata_from_hint(files, hint) {
+                    return Ok(p);
+                }
+            }
+            for name in version_hint_filenames(hint) {
+                let key = format!("{meta_prefix}/{name}");
+                if client.head_object(&bucket, &key).is_ok()
+                    || client.get_object(&bucket, &key).is_ok()
+                {
+                    return Ok(PathBuf::from(S3Client::s3_uri(&bucket, &key)));
+                }
+            }
+        }
+    }
+    let mut files = listed.with_context(|| {
+        format!("list Iceberg metadata s3://{bucket}/{meta_prefix}/")
+    })?;
+    anyhow::ensure!(
+        !files.is_empty(),
+        "no *.metadata.json under s3://{bucket}/{meta_prefix}/"
+    );
+    files.sort_by_key(|(v, _)| *v);
+    Ok(files.pop().unwrap().1)
+}
+
+fn version_hint_filenames(hint: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut push = |s: String| {
+        if !s.is_empty() && !names.contains(&s) {
+            names.push(s);
+        }
+    };
+    push(hint.to_string());
+    if !hint.ends_with(".metadata.json") {
+        push(format!("{hint}.metadata.json"));
+    }
+    let num = hint.strip_prefix('v').unwrap_or(hint);
+    if let Ok(v) = num.parse::<i64>() {
+        push(format!("v{v}.metadata.json"));
+        push(format!("v{v:05}.metadata.json"));
+        push(format!("{v:05}.metadata.json"));
+        push(format!("{v}.metadata.json"));
+    }
+    names
+}
+
+fn pick_metadata_from_hint(files: &[(i64, PathBuf)], hint: &str) -> Option<PathBuf> {
+    if hint.is_empty() {
+        return None;
+    }
+    for name in version_hint_filenames(hint) {
+        for (_, p) in files {
+            if p.file_name().map(|n| n.to_string_lossy()) == Some(name.as_str().into()) {
+                return Some(p.clone());
+            }
+        }
+    }
+    let num = hint.strip_prefix('v').unwrap_or(hint);
+    let v: i64 = num.parse().ok()?;
+    files
+        .iter()
+        .find(|(ver, _)| *ver == v)
+        .map(|(_, p)| p.clone())
+}
+
+fn list_metadata_json_objects(
+    client: &S3Client,
+    bucket: &str,
+    meta_prefix: &str,
+) -> Result<Vec<(i64, PathBuf)>> {
+    let list_prefix = format!("{}/", meta_prefix.trim_end_matches('/'));
+    let keys = client.list_objects(bucket, &list_prefix)?;
+    let mut out = Vec::new();
+    for key in keys {
+        let name = key.rsplit('/').next().unwrap_or(key.as_str());
+        if !name.ends_with(".metadata.json") {
+            continue;
+        }
+        if let Some(v) = parse_metadata_version(name) {
+            out.push((v, PathBuf::from(S3Client::s3_uri(bucket, &key))));
+        }
+    }
+    Ok(out)
 }
 
 fn resolve_version_hint(meta_dir: &Path, hint: &str) -> Option<PathBuf> {
@@ -302,6 +494,11 @@ fn list_live_files(loaded: &LoadedTable) -> Result<Vec<PathBuf>> {
             let Some(data_file) = avro_field(entry, &["data_file", "data-file"]) else {
                 continue;
             };
+            // Iceberg v2: content 0/missing = data, 1 = position deletes, 2 = equality deletes.
+            match avro_i32_field(data_file, &["content"]) {
+                Some(1) | Some(2) => continue,
+                _ => {}
+            }
             let Some(fp) = avro_string_field(
                 data_file,
                 &["file_path", "file-path"],
@@ -320,8 +517,8 @@ fn list_live_files(loaded: &LoadedTable) -> Result<Vec<PathBuf>> {
 }
 
 fn read_avro(path: &Path) -> Result<Vec<AvroValue>> {
-    let file = File::open(path).with_context(|| format!("open avro {}", path.display()))?;
-    let reader = Reader::new(BufReader::new(file))
+    let bytes = read_bytes(path).with_context(|| format!("open avro {}", path.display()))?;
+    let reader = Reader::new(&bytes[..])
         .with_context(|| format!("avro reader {}", path.display()))?;
     reader
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -380,18 +577,28 @@ fn avro_string_field(v: &AvroValue, names: &[&str]) -> Option<String> {
 }
 
 fn avro_status(entry: &AvroValue) -> i32 {
-    match avro_field(entry, &["status"]).map(unwrap_union) {
-        Some(AvroValue::Int(i)) => *i,
-        Some(AvroValue::Long(i)) => *i as i32,
-        Some(AvroValue::Enum(i, _)) => *i as i32,
-        _ => 0,
+    avro_i32_field(entry, &["status"]).unwrap_or(0)
+}
+
+fn avro_i32_field(v: &AvroValue, names: &[&str]) -> Option<i32> {
+    match avro_field(v, names).map(unwrap_union) {
+        Some(AvroValue::Int(i)) => Some(*i),
+        Some(AvroValue::Long(i)) => Some(*i as i32),
+        Some(AvroValue::Enum(i, _)) => Some(*i as i32),
+        _ => None,
     }
+}
+
+fn is_object_store_uri(s: &str) -> bool {
+    S3Client::is_remote_uri(s)
+        || s.starts_with("s3a://")
+        || s.starts_with("s3n://")
 }
 
 /// Map Iceberg path strings onto local PathBufs / s3 URI PathBufs.
 fn resolve_iceberg_path(raw: &str, table: &Path, table_location: &str) -> PathBuf {
     let raw = raw.trim();
-    if raw.starts_with("s3://") || raw.starts_with("s3a://") || raw.starts_with("s3n://") {
+    if is_object_store_uri(raw) {
         return PathBuf::from(raw);
     }
     if let Some(local) = strip_file_uri(raw) {
@@ -401,10 +608,7 @@ fn resolve_iceberg_path(raw: &str, table: &Path, table_location: &str) -> PathBu
     if p.is_absolute() {
         return p.to_path_buf();
     }
-    if table_location.starts_with("s3://")
-        || table_location.starts_with("s3a://")
-        || table_location.starts_with("s3n://")
-    {
+    if is_object_store_uri(table_location) {
         let loc = table_location.trim_end_matches('/');
         return PathBuf::from(format!("{loc}/{raw}"));
     }
@@ -454,18 +658,6 @@ fn file_match_keys(path: &Path, index_root: &Path) -> Vec<String> {
         push(rel.to_string_lossy().to_string());
     }
     keys
-}
-
-fn previous_file_keys(metas: &[IndexFragmentMeta], index_root: &Path) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for meta in metas {
-        for stored in &meta.files {
-            for k in stored_file_keys(stored, index_root) {
-                out.insert(k);
-            }
-        }
-    }
-    out
 }
 
 fn stored_file_keys(stored: &str, index_root: &Path) -> Vec<String> {
@@ -805,5 +997,165 @@ mod tests {
         let rap = load_index(&index).unwrap();
         assert_eq!(rap.fragments.len(), 2);
         assert!(!rap.lookup("user_0000").is_empty());
+    }
+
+    #[test]
+    fn index_iceberg_table_drops_removed_files_and_survives_compact() {
+        use crate::index::compact_index;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("table");
+        let data = table.join("data");
+        let index = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data)).unwrap();
+        assert!(paths.len() >= 2, "need two parquet files to drop one");
+        write_iceberg_table(&table, &paths, 1, 1).unwrap();
+
+        let opts = index_opts(&table, &index);
+        let first = index_iceberg_table(&opts).unwrap();
+        assert_eq!(first.files_indexed, paths.len());
+        let rap = load_index(&index).unwrap();
+        let gone_key = key_only_in(&rap, &paths[0]);
+        let kept_key = key_only_in(&rap, &paths[1]);
+
+        let kept = vec![paths[1].clone()];
+        write_iceberg_table(&table, &kept, 2, 2).unwrap();
+        let second = index_iceberg_table(&opts).unwrap();
+        assert!(!second.skipped);
+        assert_eq!(second.snapshot_id, 2);
+        assert_eq!(second.files_indexed, 0, "no new parquet files");
+        let rap = load_index(&index).unwrap();
+        assert!(
+            rap.lookup(&gone_key).is_empty(),
+            "dropped file must hide {gone_key}"
+        );
+        assert!(
+            !rap.lookup(&kept_key).is_empty(),
+            "kept file must still hit {kept_key}"
+        );
+        assert!(
+            rap.fragments.iter().any(|m| !m.dropped_files.is_empty()),
+            "snapshot 2 fragment should list dropped files"
+        );
+
+        let report = compact_index(&index, Some("compact-ice")).unwrap();
+        assert_eq!(report.fragment_id, "compact-ice");
+        let rap = load_index(&index).unwrap();
+        assert!(
+            rap.lookup(&gone_key).is_empty(),
+            "compact must not resurrect dropped Iceberg files ({gone_key})"
+        );
+        assert!(!rap.lookup(&kept_key).is_empty());
+        assert_eq!(rap.fragments.len(), 1);
+        assert_eq!(rap.fragments[0].iceberg_snapshot_id, Some(2));
+
+        // Re-adding file 0 in a later snapshot must reindex it.
+        write_iceberg_table(&table, &paths, 3, 3).unwrap();
+        let third = index_iceberg_table(&opts).unwrap();
+        assert!(!third.skipped);
+        assert_eq!(third.files_indexed, 1, "re-added file 0 only");
+        let rap = load_index(&index).unwrap();
+        assert!(!rap.lookup(&gone_key).is_empty());
+        assert!(!rap.lookup(&kept_key).is_empty());
+    }
+
+    fn key_only_in(index: &crate::index::RapIndex, want: &Path) -> String {
+        let want = want.canonicalize().unwrap_or_else(|_| want.to_path_buf());
+        for (k, ents) in &index.entries_by_key {
+            if ents.is_empty() {
+                continue;
+            }
+            let only_here = ents.iter().all(|e| {
+                index
+                    .file_path(e.file)
+                    .ok()
+                    .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == want)
+                    .unwrap_or(false)
+            });
+            if only_here {
+                return k.clone();
+            }
+        }
+        panic!("no key lives only in {}", want.display());
+    }
+
+    #[test]
+    fn resolve_iceberg_path_keeps_object_store_uris() {
+        let table = Path::new("/tmp/iceberg-table");
+        assert_eq!(
+            resolve_iceberg_path("s3://bkt/wh/f.parquet", table, "s3://bkt/wh")
+                .to_string_lossy(),
+            "s3://bkt/wh/f.parquet"
+        );
+        assert_eq!(
+            resolve_iceberg_path(
+                "https://bkt.s3.amazonaws.com/wh/f.parquet",
+                table,
+                "https://bkt.s3.amazonaws.com/wh"
+            )
+            .to_string_lossy(),
+            "https://bkt.s3.amazonaws.com/wh/f.parquet"
+        );
+        assert_eq!(
+            resolve_iceberg_path("metadata/m.avro", table, "s3://bkt/wh").to_string_lossy(),
+            "s3://bkt/wh/metadata/m.avro"
+        );
+        assert_eq!(
+            resolve_iceberg_path("data/f.parquet", table, "https://host/bkt/wh")
+                .to_string_lossy(),
+            "https://host/bkt/wh/data/f.parquet"
+        );
+    }
+
+    #[test]
+    fn read_bytes_local_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("x.txt");
+        fs::write(&p, b"abc").unwrap();
+        assert_eq!(read_bytes(&p).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn version_hint_filenames_cover_common_layouts() {
+        let names = version_hint_filenames("1");
+        assert!(names.contains(&"v1.metadata.json".to_string()));
+        assert!(names.contains(&"00001.metadata.json".to_string()));
+        assert!(names.contains(&"1.metadata.json".to_string()));
+    }
+
+    #[test]
+    fn iceberg_metadata_from_minio_if_present() {
+        let client = S3Client::from_env();
+        if std::net::TcpStream::connect(&client.cfg.endpoint).is_err() {
+            eprintln!("skip: minio not listening");
+            return;
+        }
+        let prefix = ".rap-iceberg-test/table1";
+        let body = br#"{"format-version":2,"location":"s3://rap-lake/.rap-iceberg-test/table1","current-snapshot-id":9,"snapshots":[{"snapshot-id":9,"manifest-list":"s3://rap-lake/.rap-iceberg-test/table1/metadata/snap.avro"}]}"#;
+        if client
+            .put_object(
+                "rap-lake",
+                &format!("{prefix}/metadata/v1.metadata.json"),
+                body,
+            )
+            .is_err()
+        {
+            eprintln!("skip: minio put failed");
+            return;
+        }
+        let _ = client.put_object(
+            "rap-lake",
+            &format!("{prefix}/metadata/version-hint.text"),
+            b"1",
+        );
+        let table = PathBuf::from(format!("s3://rap-lake/{prefix}"));
+        let meta = find_current_metadata(&table).expect("remote metadata");
+        assert!(
+            meta.to_string_lossy().ends_with("v1.metadata.json"),
+            "got {}",
+            meta.display()
+        );
+        let bytes = read_bytes(&meta).expect("get metadata json");
+        assert!(bytes.starts_with(b"{"));
     }
 }

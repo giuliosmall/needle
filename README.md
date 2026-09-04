@@ -110,7 +110,12 @@ needle query user_0042 --covering-only --format json
 needle explain user_0042
 needle query --dimension track_uri --range-start spotify:track:000 --range-end spotify:track:fff
 needle stats --index data/rap-index
+needle forget --index data/rap-index --key user_0000
+needle compact --index data/rap-index --fragment compact-001
+needle verify --index data/rap-index
 ```
+
+`forget` suppresses keys from Needle lookups (sticky across later index fragments). It does not rewrite Parquet. Stop or let `needled` reload after compact/forget (it watches `registry.json`).
 
 `--format json` (or `--json`) prints one JSON object to stdout. Point queries load
 only the index buckets for that key. `needle query --help` / `needle index --help` list
@@ -197,7 +202,7 @@ src/
   query.rs             Point query + naive baseline
   writer.rs            Sample lake writers (sorted / cogrouped / …)
   storage.rs           RangeReader trait (local + HTTP)
-  s3.rs                Path-style S3 / MinIO SigV4 + Range GET
+  s3.rs                S3 SigV4 + Range GET (MinIO path-style HTTP, AWS TLS virtual-host)
   lake.rs              Lake generate / index / query / stress
   secondary.rs         Hash + sorted secondary indexes
   parquet_lowlevel/    Custom page writer (frames, align, interleaved, paged)
@@ -209,7 +214,7 @@ NOTES.md               Article mapping & fidelity notes
 
 ## Status / honesty
 
-- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range, MinIO lake harness, broad unit/E2E suite.
+- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host), Iceberg incremental index, compact/forget/verify, `needled` + SQL over key hits, MinIO lake harness, broad unit/E2E suite.
 - **Custom Parquet prep** (ZSTD multi-frame pages, skippable alignment, interleaving) uses a low-level writer so layouts live **inside** `.parquet` files readable by Arrow.
 - This is an R&D recreation, not Spotify’s production RAP.
 

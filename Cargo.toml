@@ -35,6 +35,7 @@ apache-avro = { version = "0.17", features = ["snappy", "zstandard"] }
 
 # HTTP Range + local demo server (article: ranged reads over object storage)
 # Minimal HTTP client is implemented with std::net (no ureq/reqwest - rustc 1.85).
+native-tls = "0.2"
 tiny_http = "0.12"
 zstd = "0.13"
 hmac = "0.12"

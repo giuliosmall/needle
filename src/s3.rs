@@ -1,7 +1,7 @@
-//! Minimal path-style S3 client for local MinIO (no cloud / no gcloud).
+//! Minimal S3 client for local MinIO (path-style HTTP) and AWS (virtual-hosted HTTPS).
 //!
-//! Raw TCP + AWS SigV4 - same rustc-1.85 constraint as `HttpRange` (no reqwest).
-//! Supports Range GET, full GET, PUT, HEAD, ListObjectsV2.
+//! Raw TCP (+ optional `native_tls`) + AWS SigV4 - same rustc-1.85 constraint as
+//! `HttpRange` (no reqwest). Supports Range GET, full GET, PUT, HEAD, ListObjectsV2.
 //! Anonymous GET works when the bucket allows download (our lake setup).
 
 use anyhow::{Context, Result, bail};
@@ -66,22 +66,50 @@ pub struct S3Config {
     pub secret_key: String,
     pub region: String,
     pub anonymous_read: bool,
+    /// HTTPS/TLS. Env `RAP_S3_TLS` / `NEEDLE_S3_TLS` = 1/true; also true when
+    /// `endpoint` contains `amazonaws.com` (or was given as `https://…`).
+    pub use_tls: bool,
+    /// Path-style (`/{bucket}/{key}`, Host: endpoint). Env `RAP_S3_PATH_STYLE`
+    /// defaults true (MinIO). `false` = virtual-hosted (`/{key}`, Host: `{bucket}.{host}`).
+    pub path_style: bool,
+}
+
+fn env_first(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|n| std::env::var(n).ok())
 }
 
 impl Default for S3Config {
     fn default() -> Self {
+        let raw_endpoint = env_first(&["NEEDLE_S3_ENDPOINT", "RAP_S3_ENDPOINT"])
+            .unwrap_or_else(|| "127.0.0.1:9000".into());
+        let scheme_https = raw_endpoint.trim().starts_with("https://");
+        let endpoint = normalize_endpoint(&raw_endpoint);
+        let env_tls = env_first(&["NEEDLE_S3_TLS", "RAP_S3_TLS"]);
         Self {
-            endpoint: std::env::var("RAP_S3_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:9000".into()),
-            access_key: std::env::var("RAP_S3_ACCESS_KEY")
-                .unwrap_or_else(|_| "minioadmin".into()),
-            secret_key: std::env::var("RAP_S3_SECRET_KEY")
-                .unwrap_or_else(|_| "minioadmin".into()),
-            region: std::env::var("RAP_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
-            anonymous_read: std::env::var("RAP_S3_ANON_READ")
+            endpoint: endpoint.clone(),
+            access_key: env_first(&["NEEDLE_S3_ACCESS_KEY", "RAP_S3_ACCESS_KEY"])
+                .unwrap_or_else(|| "minioadmin".into()),
+            secret_key: env_first(&["NEEDLE_S3_SECRET_KEY", "RAP_S3_SECRET_KEY"])
+                .unwrap_or_else(|| "minioadmin".into()),
+            region: env_first(&["NEEDLE_S3_REGION", "RAP_S3_REGION"])
+                .unwrap_or_else(|| "us-east-1".into()),
+            anonymous_read: env_first(&["NEEDLE_S3_ANON_READ", "RAP_S3_ANON_READ"])
                 .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(true),
+                .unwrap_or(!endpoint.contains("amazonaws.com")),
+            use_tls: infer_use_tls(&endpoint, env_tls.as_deref(), scheme_https),
+            path_style: infer_path_style(
+                env_first(&["NEEDLE_S3_PATH_STYLE", "RAP_S3_PATH_STYLE"]).as_deref(),
+                &endpoint,
+            ),
         }
     }
+}
+
+/// HEAD result: object size plus optional ETag (quotes stripped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadObject {
+    pub size: u64,
+    pub etag: Option<String>,
 }
 
 #[derive(Clone)]
@@ -103,37 +131,88 @@ impl S3Client {
     }
 
     pub fn parse_uri(uri: &str) -> Result<(String, String)> {
-        if let Some(rest) = uri.strip_prefix("s3://") {
-            let (bucket, key) = rest
-                .split_once('/')
-                .ok_or_else(|| anyhow::anyhow!("s3 uri missing key: {uri}"))?;
-            return Ok((bucket.to_string(), key.to_string()));
+        if let Some(rest) = strip_s3_scheme(uri) {
+            if rest.is_empty() {
+                bail!("s3 uri missing bucket: {uri}");
+            }
+            return Ok(match rest.split_once('/') {
+                Some((bucket, key)) => (bucket.to_string(), key.to_string()),
+                None => (rest.to_string(), String::new()),
+            });
         }
-        if let Some(bare) = uri.strip_prefix("http://") {
-            let (_host, path) = bare
-                .split_once('/')
-                .ok_or_else(|| anyhow::anyhow!("http s3 uri missing path: {uri}"))?;
-            let (bucket, key) = path
-                .split_once('/')
-                .ok_or_else(|| anyhow::anyhow!("http s3 uri missing key: {uri}"))?;
-            return Ok((bucket.to_string(), key.to_string()));
+        if let Some(bare) = uri
+            .strip_prefix("https://")
+            .or_else(|| uri.strip_prefix("http://"))
+        {
+            return parse_http_s3_uri(bare, uri);
         }
         bail!("not an s3/http object uri: {uri}");
     }
 
     pub fn is_remote_uri(uri: &str) -> bool {
-        uri.starts_with("s3://") || (uri.starts_with("http://") && uri.contains("/"))
+        uri.starts_with("s3://")
+            || uri.starts_with("s3a://")
+            || uri.starts_with("s3n://")
+            || ((uri.starts_with("http://") || uri.starts_with("https://")) && uri.contains('/'))
     }
 
     pub fn s3_uri(bucket: &str, key: &str) -> String {
         format!("s3://{bucket}/{key}")
     }
 
+    fn object_path(&self, bucket: &str, key: &str) -> String {
+        if self.cfg.path_style {
+            if key.is_empty() {
+                format!("/{bucket}")
+            } else {
+                format!("/{bucket}/{key}")
+            }
+        } else if key.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{key}")
+        }
+    }
+
+    /// Host header value (virtual-hosted strips the endpoint port).
+    fn host_header(&self, bucket: &str) -> String {
+        if self.cfg.path_style {
+            self.cfg.endpoint.clone()
+        } else {
+            let host = split_host_port(&self.cfg.endpoint).0;
+            format!("{bucket}.{host}")
+        }
+    }
+
+    /// TCP connect address (`host:port`); adds :443 when TLS and no port given.
+    fn connect_addr(&self, bucket: &str) -> String {
+        if self.cfg.path_style {
+            let (host, port) = split_host_port(&self.cfg.endpoint);
+            match port {
+                Some(p) => format!("{host}:{p}"),
+                None if self.cfg.use_tls => format!("{host}:443"),
+                None => format!("{host}:80"),
+            }
+        } else {
+            let (ep_host, ep_port) = split_host_port(&self.cfg.endpoint);
+            let host = format!("{bucket}.{ep_host}");
+            match ep_port {
+                Some(p) => format!("{host}:{p}"),
+                None if self.cfg.use_tls => format!("{host}:443"),
+                None => format!("{host}:80"),
+            }
+        }
+    }
+
+    fn sni_name(&self, bucket: &str) -> String {
+        split_host_port(&self.host_header(bucket)).0.to_string()
+    }
+
     pub fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
-        let uri = format!("/{bucket}/{key}");
+        let uri = self.object_path(bucket, key);
         // MinIO accepts UNSIGNED-PAYLOAD; hashing 1M tiny bodies was wasted CPU.
         let (status, _h, resp) =
-            self.http("PUT", &uri, "", body, "UNSIGNED-PAYLOAD", None, true)?;
+            self.http("PUT", bucket, &uri, "", body, "UNSIGNED-PAYLOAD", None, true)?;
         if !(200..300).contains(&status) {
             self.stats.mc_fallbacks.fetch_add(1, Ordering::Relaxed);
             static FIRST: std::sync::Once = std::sync::Once::new();
@@ -216,11 +295,11 @@ impl S3Client {
     }
 
     pub fn get_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>> {
-        let uri = format!("/{bucket}/{key}");
+        let uri = self.object_path(bucket, key);
         let payload_hash = hex_sha256(b"");
         let sign = !self.cfg.anonymous_read;
         let (status, _h, body) =
-            self.http("GET", &uri, "", &[], &payload_hash, None, sign)?;
+            self.http("GET", bucket, &uri, "", &[], &payload_hash, None, sign)?;
         if status != 200 {
             bail!(
                 "S3 GET {uri} status {status}: {}",
@@ -235,13 +314,13 @@ impl S3Client {
     }
 
     pub fn get_range(&self, bucket: &str, key: &str, range: &Range<u64>) -> Result<Vec<u8>> {
-        let uri = format!("/{bucket}/{key}");
+        let uri = self.object_path(bucket, key);
         let payload_hash = hex_sha256(b"");
         let end_incl = range.end.saturating_sub(1);
         let range_hdr = format!("bytes={}-{}", range.start, end_incl);
         let sign = !self.cfg.anonymous_read;
         let (status, _h, body) =
-            self.http("GET", &uri, "", &[], &payload_hash, Some(&range_hdr), sign)?;
+            self.http("GET", bucket, &uri, "", &[], &payload_hash, Some(&range_hdr), sign)?;
         if !(status == 206 || status == 200) {
             bail!(
                 "S3 Range GET {uri} {range_hdr} status {status}: {}",
@@ -256,23 +335,22 @@ impl S3Client {
     }
 
     pub fn head_object(&self, bucket: &str, key: &str) -> Result<u64> {
-        let uri = format!("/{bucket}/{key}");
+        Ok(self.head_object_meta(bucket, key)?.size)
+    }
+
+    pub fn head_object_meta(&self, bucket: &str, key: &str) -> Result<HeadObject> {
+        let uri = self.object_path(bucket, key);
         let payload_hash = hex_sha256(b"");
         let sign = !self.cfg.anonymous_read;
         let (status, headers, body) =
-            self.http("HEAD", &uri, "", &[], &payload_hash, None, sign)?;
+            self.http("HEAD", bucket, &uri, "", &[], &payload_hash, None, sign)?;
         if status != 200 {
             bail!(
                 "S3 HEAD {uri} status {status}: {}",
                 String::from_utf8_lossy(&body)
             );
         }
-        for line in headers.lines() {
-            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                return Ok(v.trim().parse()?);
-            }
-        }
-        bail!("S3 HEAD missing Content-Length");
+        parse_head_headers(&headers)
     }
 
     pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
@@ -292,10 +370,10 @@ impl S3Client {
                 .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
                 .collect::<Vec<_>>()
                 .join("&");
-            let uri = format!("/{bucket}");
+            let uri = self.object_path(bucket, "");
             let payload_hash = hex_sha256(b"");
             let (status, _h, body) =
-                self.http("GET", &uri, &query, &[], &payload_hash, None, true)?;
+                self.http("GET", bucket, &uri, &query, &[], &payload_hash, None, true)?;
             if status != 200 {
                 bail!(
                     "S3 ListObjects {bucket} status {status}: {}",
@@ -327,6 +405,7 @@ impl S3Client {
     fn http(
         &self,
         method: &str,
+        bucket: &str,
         canonical_uri: &str,
         query: &str,
         body: &[u8],
@@ -334,10 +413,21 @@ impl S3Client {
         range: Option<&str>,
         sign: bool,
     ) -> Result<(u16, String, Vec<u8>)> {
-        match self.http_once(method, canonical_uri, query, body, payload_hash, range, sign, true) {
+        match self.http_once(
+            method,
+            bucket,
+            canonical_uri,
+            query,
+            body,
+            payload_hash,
+            range,
+            sign,
+            true,
+        ) {
             Ok(v) => Ok(v),
             Err(_) => self.http_once(
                 method,
+                bucket,
                 canonical_uri,
                 query,
                 body,
@@ -353,6 +443,7 @@ impl S3Client {
     fn http_once(
         &self,
         method: &str,
+        bucket: &str,
         canonical_uri: &str,
         query: &str,
         body: &[u8],
@@ -361,7 +452,8 @@ impl S3Client {
         sign: bool,
         try_reuse: bool,
     ) -> Result<(u16, String, Vec<u8>)> {
-        let host = &self.cfg.endpoint;
+        let host = self.host_header(bucket);
+        let connect_to = self.connect_addr(bucket);
         let now = chrono::Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
@@ -442,9 +534,9 @@ impl S3Client {
         );
 
         let mut stream = if try_reuse {
-            take_pooled(host).unwrap_or(connect_host(host)?)
+            take_pooled(&connect_to).unwrap_or(self.connect_stream(bucket)?)
         } else {
-            connect_host(host)?
+            self.connect_stream(bucket)?
         };
         if let Err(e) = stream.write_all(req.as_bytes()) {
             return Err(e.into());
@@ -456,29 +548,68 @@ impl S3Client {
 
         let (status, headers, body_out, reuse) = read_http_response(&mut stream, method)?;
         if reuse {
-            put_pooled(host, stream);
+            put_pooled(&connect_to, stream);
         }
         Ok((status, headers, body_out))
     }
+
+    fn connect_stream(&self, bucket: &str) -> Result<S3Stream> {
+        let addr = self.connect_addr(bucket);
+        let tcp = TcpStream::connect(&addr).with_context(|| format!("connect {addr}"))?;
+        tcp.set_nodelay(true)?;
+        tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(60)))?;
+        if self.cfg.use_tls {
+            let sni = self.sni_name(bucket);
+            let connector = native_tls::TlsConnector::new().context("tls connector")?;
+            let tls = connector
+                .connect(&sni, tcp)
+                .map_err(|e| anyhow::anyhow!("tls handshake {sni}: {e}"))?;
+            Ok(S3Stream::Tls(tls))
+        } else {
+            Ok(S3Stream::Plain(tcp))
+        }
+    }
 }
 
+enum S3Stream {
+    Plain(TcpStream),
+    Tls(native_tls::TlsStream<TcpStream>),
+}
+
+impl Read for S3Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            S3Stream::Plain(s) => s.read(buf),
+            S3Stream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for S3Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            S3Stream::Plain(s) => s.write(buf),
+            S3Stream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            S3Stream::Plain(s) => s.flush(),
+            S3Stream::Tls(s) => s.flush(),
+        }
+    }
+}
 
 thread_local! {
-    static POOLED: RefCell<Option<(String, TcpStream)>> = RefCell::new(None);
+    static POOLED: RefCell<Option<(String, S3Stream)>> = RefCell::new(None);
 }
 
-fn connect_host(host: &str) -> Result<TcpStream> {
-    let stream = TcpStream::connect(host).with_context(|| format!("connect {host}"))?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
-    Ok(stream)
-}
-
-fn take_pooled(host: &str) -> Option<TcpStream> {
+fn take_pooled(addr: &str) -> Option<S3Stream> {
     POOLED.with(|slot| {
         match slot.borrow_mut().take() {
-            Some((h, s)) if h == host => Some(s),
+            Some((h, s)) if h == addr => Some(s),
             Some((_, s)) => {
                 drop(s);
                 None
@@ -488,9 +619,9 @@ fn take_pooled(host: &str) -> Option<TcpStream> {
     })
 }
 
-fn put_pooled(host: &str, stream: TcpStream) {
+fn put_pooled(addr: &str, stream: S3Stream) {
     POOLED.with(|slot| {
-        *slot.borrow_mut() = Some((host.to_string(), stream));
+        *slot.borrow_mut() = Some((addr.to_string(), stream));
     });
 }
 
@@ -503,7 +634,7 @@ fn header_has_close(headers: &str) -> bool {
 
 /// Read one HTTP/1.1 response; `reuse` is true when the socket can be pooled.
 fn read_http_response(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
     method: &str,
 ) -> Result<(u16, String, Vec<u8>, bool)> {
     let mut resp = Vec::with_capacity(1024);
@@ -623,6 +754,140 @@ fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+fn parse_head_headers(headers: &str) -> Result<HeadObject> {
+    let mut size = None;
+    let mut etag = None;
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            size = Some(value.trim().parse::<u64>().with_context(|| {
+                format!("S3 HEAD Content-Length {}", value.trim())
+            })?);
+        } else if name.trim().eq_ignore_ascii_case("etag") {
+            let v = value.trim().trim_matches('"');
+            if !v.is_empty() {
+                etag = Some(v.to_string());
+            }
+        }
+    }
+    let size = size.ok_or_else(|| anyhow::anyhow!("S3 HEAD missing Content-Length"))?;
+    Ok(HeadObject { size, etag })
+}
+
+fn parse_env_bool(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn infer_use_tls(endpoint: &str, env_tls: Option<&str>, scheme_https: bool) -> bool {
+    if let Some(v) = env_tls {
+        return parse_env_bool(v);
+    }
+    scheme_https || endpoint.contains("amazonaws.com")
+}
+
+fn infer_path_style(rap_path_style: Option<&str>, endpoint: &str) -> bool {
+    match rap_path_style {
+        Some(v) => parse_env_bool(v),
+        None => !endpoint.contains("amazonaws.com"),
+    }
+}
+
+fn normalize_endpoint(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    s.trim_end_matches('/').to_string()
+}
+
+fn strip_s3_scheme(uri: &str) -> Option<&str> {
+    uri.strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("s3a://"))
+        .or_else(|| uri.strip_prefix("s3n://"))
+}
+
+fn parse_http_s3_uri(bare: &str, uri: &str) -> Result<(String, String)> {
+    let (hostport, path) = bare
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("http s3 uri missing path: {uri}"))?;
+    let path = path.split_once('?').map(|(p, _)| p).unwrap_or(path);
+    let host = split_host_port(hostport).0;
+    if let Some(bucket) = virtual_hosted_s3_bucket(host) {
+        return Ok((bucket.to_string(), path.to_string()));
+    }
+    let (bucket, key) = path
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("http s3 uri missing key: {uri}"))?;
+    Ok((bucket.to_string(), key.to_string()))
+}
+
+/// Split `host` or `host:port` (IPv6 `[::1]:443` supported). Port must be all digits.
+fn split_host_port(endpoint: &str) -> (&str, Option<&str>) {
+    let endpoint = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(endpoint);
+    if let Some(rest) = endpoint.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let host = &endpoint[..=end];
+            let after = &rest[end + 1..];
+            if let Some(port) = after.strip_prefix(':') {
+                if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                    return (host, Some(port));
+                }
+            }
+            return (host, None);
+        }
+    }
+    if let Some((h, p)) = endpoint.rsplit_once(':') {
+        if !h.is_empty() && !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) {
+            return (h, Some(p));
+        }
+    }
+    (endpoint, None)
+}
+
+fn is_s3_service_host(lower: &str) -> bool {
+    if lower == "s3.amazonaws.com" {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("s3.") {
+        return rest == "amazonaws.com" || rest.ends_with(".amazonaws.com") || rest.ends_with("amazonaws.com");
+    }
+    if let Some(rest) = lower.strip_prefix("s3-") {
+        return rest.ends_with(".amazonaws.com") || rest.ends_with("amazonaws.com");
+    }
+    false
+}
+
+/// Virtual-hosted AWS host → bucket (`bucket.s3.amazonaws.com`, `bucket.s3.region.amazonaws.com`).
+fn virtual_hosted_s3_bucket(host: &str) -> Option<&str> {
+    let host = host.trim_end_matches('.');
+    let lower = host.to_ascii_lowercase();
+    if is_s3_service_host(&lower) {
+        return None;
+    }
+    if let Some(idx) = lower.find(".s3.") {
+        let rest = &lower[idx + 1..];
+        if rest.ends_with("amazonaws.com") && idx > 0 {
+            return Some(&host[..idx]);
+        }
+    }
+    if let Some(idx) = lower.find(".s3-") {
+        let rest = &lower[idx + 1..];
+        if rest.ends_with("amazonaws.com") && idx > 0 {
+            return Some(&host[..idx]);
+        }
+    }
+    None
+}
+
 fn extract_xml_tags(xml: &str, tag: &str) -> Vec<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -690,13 +955,13 @@ impl S3ChunkReader {
     pub fn open(client: S3Client, bucket: impl Into<String>, key: impl Into<String>) -> Result<Self> {
         let bucket = bucket.into();
         let key = key.into();
-        let len = match client.head_object(&bucket, &key) {
-            Ok(n) => n,
+        let len = match client.head_object_meta(&bucket, &key) {
+            Ok(h) => h.size,
             Err(_) => {
                 // Retry signed HEAD if anonymous download does not cover HEAD.
                 let mut signed = client.clone();
                 signed.cfg.anonymous_read = false;
-                signed.head_object(&bucket, &key)?
+                signed.head_object_meta(&bucket, &key)?.size
             }
         };
         Ok(Self {
@@ -813,6 +1078,146 @@ mod tests {
         let (b, k) = S3Client::parse_uri("s3://rap-lake/date=2024-01-01/part.parquet").unwrap();
         assert_eq!(b, "rap-lake");
         assert_eq!(k, "date=2024-01-01/part.parquet");
+    }
+
+    #[test]
+    fn parse_https_virtual_hosted_uri() {
+        let (b, k) = S3Client::parse_uri("https://bucket.s3.amazonaws.com/key").unwrap();
+        assert_eq!(b, "bucket");
+        assert_eq!(k, "key");
+        let (b, k) = S3Client::parse_uri(
+            "https://my-bucket.s3.us-east-1.amazonaws.com/path/to/obj.parquet",
+        )
+        .unwrap();
+        assert_eq!(b, "my-bucket");
+        assert_eq!(k, "path/to/obj.parquet");
+        let (b, k) =
+            S3Client::parse_uri("https://bucket.s3.amazonaws.com:443/dir/file").unwrap();
+        assert_eq!(b, "bucket");
+        assert_eq!(k, "dir/file");
+    }
+
+    #[test]
+    fn parse_https_path_style_uri() {
+        let (b, k) = S3Client::parse_uri("https://s3.amazonaws.com/bucket/key").unwrap();
+        assert_eq!(b, "bucket");
+        assert_eq!(k, "key");
+        let (b, k) =
+            S3Client::parse_uri("https://minio.example.com/mybucket/dir/file.parquet").unwrap();
+        assert_eq!(b, "mybucket");
+        assert_eq!(k, "dir/file.parquet");
+        let (b, k) =
+            S3Client::parse_uri("http://127.0.0.1:9000/rap-lake/date=2024-01-01/part.parquet")
+                .unwrap();
+        assert_eq!(b, "rap-lake");
+        assert_eq!(k, "date=2024-01-01/part.parquet");
+    }
+
+    #[test]
+    fn is_remote_uri_https() {
+        assert!(S3Client::is_remote_uri("https://bucket.s3.amazonaws.com/key"));
+        assert!(S3Client::is_remote_uri("https://host/bucket/key"));
+        assert!(S3Client::is_remote_uri("s3://bucket/key"));
+        assert!(S3Client::is_remote_uri("s3a://bucket/key"));
+        assert!(S3Client::is_remote_uri("http://127.0.0.1:9000/bucket/key"));
+        assert!(!S3Client::is_remote_uri("/local/path"));
+        assert!(!S3Client::is_remote_uri("file:///tmp/x"));
+    }
+
+    #[test]
+    fn s3config_tls_default_for_amazonaws_endpoint() {
+        assert!(infer_use_tls("s3.amazonaws.com", None, false));
+        assert!(infer_use_tls("s3.us-east-1.amazonaws.com", None, false));
+        assert!(!infer_use_tls("127.0.0.1:9000", None, false));
+        assert!(!infer_use_tls("minio.local:9000", None, false));
+        assert!(infer_use_tls("127.0.0.1:9000", Some("1"), false));
+        assert!(infer_use_tls("127.0.0.1:9000", Some("true"), false));
+        assert!(!infer_use_tls("s3.amazonaws.com", Some("0"), false));
+        assert!(!infer_use_tls("s3.amazonaws.com", Some("false"), false));
+        assert!(infer_use_tls("127.0.0.1:9000", None, true));
+        assert!(infer_path_style(None, "127.0.0.1:9000"));
+        assert!(!infer_path_style(None, "s3.amazonaws.com"));
+        assert!(!infer_path_style(Some("0"), "127.0.0.1:9000"));
+        assert!(!infer_path_style(Some("false"), "127.0.0.1:9000"));
+        assert!(infer_path_style(Some("1"), "s3.amazonaws.com"));
+    }
+
+    #[test]
+    fn virtual_hosted_request_shape() {
+        let client = S3Client::new(S3Config {
+            endpoint: "s3.us-east-1.amazonaws.com".into(),
+            access_key: "x".into(),
+            secret_key: "y".into(),
+            region: "us-east-1".into(),
+            anonymous_read: true,
+            use_tls: true,
+            path_style: false,
+        });
+        assert_eq!(
+            client.object_path("mybkt", "date=2024-01-01/part.parquet"),
+            "/date=2024-01-01/part.parquet"
+        );
+        assert_eq!(
+            client.host_header("mybkt"),
+            "mybkt.s3.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            client.connect_addr("mybkt"),
+            "mybkt.s3.us-east-1.amazonaws.com:443"
+        );
+        assert_eq!(client.sni_name("mybkt"), "mybkt.s3.us-east-1.amazonaws.com");
+    }
+
+    #[test]
+    fn path_style_request_shape_minio() {
+        let client = S3Client::new(S3Config {
+            endpoint: "127.0.0.1:9000".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            region: "us-east-1".into(),
+            anonymous_read: true,
+            use_tls: false,
+            path_style: true,
+        });
+        assert_eq!(client.object_path("rap-lake", "a/b"), "/rap-lake/a/b");
+        assert_eq!(client.host_header("rap-lake"), "127.0.0.1:9000");
+        assert_eq!(client.connect_addr("rap-lake"), "127.0.0.1:9000");
+        assert!(!client.cfg.use_tls);
+        assert!(client.cfg.path_style);
+    }
+
+    #[test]
+    fn parse_etag_header_any_case() {
+        let m = parse_head_headers(
+            "HTTP/1.1 200 OK\r\nContent-Length: 42\r\nETag: \"abcDEF\"\r\n",
+        )
+        .unwrap();
+        assert_eq!(m.size, 42);
+        assert_eq!(m.etag.as_deref(), Some("abcDEF"));
+        let m2 = parse_head_headers("HTTP/1.1 200 OK\r\ncontent-length: 1\r\netag: xyz\r\n")
+            .unwrap();
+        assert_eq!(m2.size, 1);
+        assert_eq!(m2.etag.as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn head_object_meta_etag_on_minio() {
+        let client = S3Client::from_env();
+        if std::net::TcpStream::connect(&client.cfg.endpoint).is_err() {
+            eprintln!("skip: minio not listening");
+            return;
+        }
+        let key = ".rap-bench/head-etag-test.bin";
+        let body = b"hello-etag";
+        if client.put_object("rap-lake", key, body).is_err() {
+            eprintln!("skip: minio put failed");
+            return;
+        }
+        let meta = client.head_object_meta("rap-lake", key).unwrap();
+        assert_eq!(meta.size, body.len() as u64);
+        if let Some(etag) = meta.etag {
+            assert!(!etag.contains('"'), "etag quotes should be stripped: {etag}");
+        }
     }
 
     #[test]

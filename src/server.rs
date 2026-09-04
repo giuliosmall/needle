@@ -8,16 +8,17 @@
 use crate::index::{
     load_index, load_index_entries_for_keys, load_index_file_dictionary, IndexFragmentMeta,
 };
-use crate::query::{ExplainResult, ListenRow, QueryOptions, QueryResult, RapQuerier};
+use crate::query::{ExplainResult, QueryOptions, QueryResult, RapQuerier};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::fs;
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Bind / load options for [`start`] and [`serve_forever`].
 pub struct DaemonOptions {
@@ -86,24 +87,76 @@ pub fn serve_forever(opts: DaemonOptions) -> Result<()> {
     let (server, state, addr) = bind_and_load(opts)?;
     eprintln!(
         "needled listening on http://{}  index={}  lazy_buckets={}",
-        addr, index_display, state.lazy_buckets
+        addr,
+        index_display,
+        state.lazy_buckets
     );
     let stop = Arc::new(AtomicBool::new(false));
     serve_loop(server, state, stop);
     Ok(())
 }
 
-struct DaemonState {
-    lazy_buckets: bool,
-    root: PathBuf,
+struct LoadedInner {
     files: Arc<Vec<PathBuf>>,
     fragments: Vec<IndexFragmentMeta>,
-    /// Present when `lazy_buckets` is false; holds the process `MetaCache`.
     querier: Option<RapQuerier>,
+    registry_mtime: Option<SystemTime>,
+}
+
+struct DaemonState {
+    index_dir: PathBuf,
+    lazy_buckets: bool,
+    inner: Mutex<LoadedInner>,
+}
+
+fn registry_mtime(index: &Path) -> Option<SystemTime> {
+    fs::metadata(index.join("registry.json"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+fn load_inner(opts: &DaemonOptions) -> Result<LoadedInner> {
+    let mt = registry_mtime(&opts.index);
+    if opts.lazy_buckets {
+        let (files, fragments, _root) = load_index_file_dictionary(&opts.index)?;
+        Ok(LoadedInner {
+            files,
+            fragments,
+            querier: None,
+            registry_mtime: mt,
+        })
+    } else {
+        let index = load_index(&opts.index)?;
+        Ok(LoadedInner {
+            files: Arc::clone(&index.files),
+            fragments: index.fragments.clone(),
+            querier: Some(RapQuerier::new(index)),
+            registry_mtime: mt,
+        })
+    }
+}
+
+fn refresh_if_changed(state: &DaemonState) -> Result<()> {
+    let mt = registry_mtime(&state.index_dir);
+    let mut inner = state.inner.lock().unwrap();
+    if inner.registry_mtime == mt {
+        return Ok(());
+    }
+    *inner = load_inner(&DaemonOptions {
+        index: state.index_dir.clone(),
+        bind: String::new(),
+        lazy_buckets: state.lazy_buckets,
+    })?;
+    Ok(())
 }
 
 fn bind_and_load(opts: DaemonOptions) -> Result<(tiny_http::Server, Arc<DaemonState>, SocketAddr)> {
-    let state = Arc::new(load_state(&opts)?);
+    let inner = load_inner(&opts)?;
+    let state = Arc::new(DaemonState {
+        index_dir: opts.index.clone(),
+        lazy_buckets: opts.lazy_buckets,
+        inner: Mutex::new(inner),
+    });
     let bind = if opts.bind.trim().is_empty() {
         "127.0.0.1:7780".to_string()
     } else {
@@ -137,28 +190,6 @@ fn open_http(bind: &str) -> Result<tiny_http::Server> {
     tiny_http::Server::http(bind).map_err(|e| anyhow::anyhow!("bind {bind}: {e}"))
 }
 
-fn load_state(opts: &DaemonOptions) -> Result<DaemonState> {
-    if opts.lazy_buckets {
-        let (files, fragments, root) = load_index_file_dictionary(&opts.index)?;
-        Ok(DaemonState {
-            lazy_buckets: true,
-            root,
-            files,
-            fragments,
-            querier: None,
-        })
-    } else {
-        let index = load_index(&opts.index)?;
-        Ok(DaemonState {
-            lazy_buckets: false,
-            root: index.root.clone(),
-            files: Arc::clone(&index.files),
-            fragments: index.fragments.clone(),
-            querier: Some(RapQuerier::new(index)),
-        })
-    }
-}
-
 fn serve_loop(server: tiny_http::Server, state: Arc<DaemonState>, stop: Arc<AtomicBool>) {
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -178,6 +209,7 @@ fn serve_loop(server: tiny_http::Server, state: Arc<DaemonState>, stop: Arc<Atom
 }
 
 fn handle_one(request: tiny_http::Request, state: &DaemonState) {
+    let _ = refresh_if_changed(state);
     if request.method() != &tiny_http::Method::Get {
         respond_json(request, 405, json!({"error": "method not allowed"}));
         return;
@@ -226,22 +258,25 @@ fn with_querier<T>(
     key: &str,
     f: impl FnOnce(&RapQuerier) -> Result<T>,
 ) -> Result<T> {
-    if let Some(q) = &state.querier {
+    let inner = state.inner.lock().unwrap();
+    if let Some(q) = &inner.querier {
         f(q)
     } else {
         let index = load_index_entries_for_keys(
-            &state.root,
-            Arc::clone(&state.files),
-            &state.fragments,
+            &state.index_dir,
+            Arc::clone(&inner.files),
+            &inner.fragments,
             &[key.to_string()],
         )?;
+        drop(inner);
         let q = RapQuerier::new(index);
         f(&q)
     }
 }
 
 fn stats_json(state: &DaemonState) -> Value {
-    let fragments: Vec<Value> = state
+    let inner = state.inner.lock().unwrap();
+    let fragments: Vec<Value> = inner
         .fragments
         .iter()
         .map(|m| {
@@ -256,13 +291,13 @@ fn stats_json(state: &DaemonState) -> Value {
         })
         .collect();
     let mut body = json!({
-        "index": state.root.display().to_string(),
+        "index": state.index_dir.display().to_string(),
         "lazy_buckets": state.lazy_buckets,
-        "num_files": state.files.len(),
-        "num_fragments": state.fragments.len(),
+        "num_files": inner.files.len(),
+        "num_fragments": inner.fragments.len(),
         "fragments": fragments,
     });
-    if let Some(q) = &state.querier {
+    if let Some(q) = &inner.querier {
         body["num_keys"] = json!(q.index.num_keys());
         body["num_entries"] = json!(q.index.num_entries());
         body["fragment_id"] = json!(q.index.fragments.first().map(|f| f.fragment_id.as_str()));
@@ -272,7 +307,7 @@ fn stats_json(state: &DaemonState) -> Value {
             .first()
             .map(|f| f.num_buckets)
             .unwrap_or(0));
-    } else if let Some(m) = state.fragments.first() {
+    } else if let Some(m) = inner.fragments.first() {
         body["fragment_id"] = json!(m.fragment_id);
         body["num_buckets"] = json!(m.num_buckets);
     }
@@ -283,8 +318,9 @@ fn query_result_json(result: &QueryResult) -> Value {
     let t = &result.timings;
     json!({
         "key": result.key,
-        "rows": result.rows.iter().map(listen_row_json).collect::<Vec<_>>(),
+        "rows": result.json_rows(),
         "covering": result.covering_hits,
+        "covering_values": result.covering_values_json(),
         "timings": {
             "index_lookup_ms": t.index_lookup.as_millis() as u64,
             "metadata_resolve_ms": t.metadata_resolve.as_millis() as u64,
@@ -302,17 +338,6 @@ fn query_result_json(result: &QueryResult) -> Value {
             "offset": result.offset,
             "limit": result.limit,
         },
-    })
-}
-
-fn listen_row_json(r: &ListenRow) -> Value {
-    json!({
-        "user_id": r.user_id,
-        "timestamp_ms": r.timestamp_ms,
-        "track_uri": r.track_uri,
-        "duration_ms": r.duration_ms,
-        "source_file": r.source_file,
-        "row_number": r.row_number,
     })
 }
 
@@ -469,7 +494,7 @@ fn respond_json(request: tiny_http::Request, status: u16, body: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::IndexBuilder;
+    use crate::index::{IndexBuilder, forget_keys};
     use crate::writer::{WriteMode, WriterOptions, write_sample_dataset};
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -597,13 +622,45 @@ mod tests {
 
         let (st, body) = http_get(&format!("{base}/v1/query?key=user_0000")).expect("GET query");
         assert_eq!(st, 200, "query status, body={body}");
-        assert!(
-            body.contains("user_0000") || body.contains("rows"),
-            "query body: {body}"
-        );
         let q: Value = serde_json::from_str(&body).expect("query json");
+        assert_eq!(q["key"], json!("user_0000"));
         let rows = q["rows"].as_array().expect("rows array");
         assert!(!rows.is_empty(), "expected rows for user_0000, body={body}");
+        for r in rows {
+            assert!(r.is_object(), "row must be a JSON object, got {r}");
+        }
+        assert!(
+            q["covering_values"].as_array().is_some(),
+            "generic covering payload: {body}"
+        );
+
+        handle.stop();
+    }
+
+    #[test]
+    fn daemon_reloads_after_forget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = tiny_dataset(tmp.path());
+        let handle = start(DaemonOptions {
+            index: idx.clone(),
+            bind: "127.0.0.1:0".into(),
+            lazy_buckets: false,
+        })
+        .expect("start needled");
+        let base = handle.base_url();
+        let (st, body) = http_get(&format!("{base}/v1/query?key=user_0000")).unwrap();
+        assert_eq!(st, 200, "{body}");
+        let q: Value = serde_json::from_str(&body).unwrap();
+        assert!(!q["rows"].as_array().unwrap().is_empty());
+
+        forget_keys(&idx, &[String::from("user_0000")], Some("forget-d")).unwrap();
+        let (st, body) = http_get(&format!("{base}/v1/query?key=user_0000")).unwrap();
+        assert_eq!(st, 200, "{body}");
+        let q: Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            q["rows"].as_array().unwrap().is_empty(),
+            "needled must reload after forget, body={body}"
+        );
 
         handle.stop();
     }

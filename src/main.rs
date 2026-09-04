@@ -8,6 +8,9 @@
 //!   needle sql       - SQL over the rows for one key (`hits` table)
 //!   needle explain   - plan a lookup (files, pages, estimated Range GETs)
 //!   needle stats     - fragment / manifest summary without loading buckets
+//!   needle compact   - rewrite the index to one fragment (apply tombstones)
+//!   needle forget    - append a tombstone fragment that hides keys
+//!   needle verify    - check indexed files against stored size/etag identity
 //!   needle bench     - compare naive scan vs RAP
 //!   needle serve     - tiny HTTP Range server for object-store demo
 //!   needle daemon    - HTTP query daemon (`GET /v1/query?key=…`)
@@ -17,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate};
 use clap::{Parser, Subcommand, ValueEnum};
 use needle::iceberg::{self, IcebergIndexOpts};
-use needle::index::{IndexBuilder, load_index, load_index_for_keys};
+use needle::index::{IndexBuilder, compact_index, forget_keys, load_index, load_index_for_keys, verify_index_files};
 use needle::query::{QueryOptions, RapQuerier, collect_demo_ranges, naive_scan};
 use needle::secondary::{self, refs_to_primary_entries};
 use needle::lake::{self, LakeGenerateOpts};
@@ -230,6 +233,46 @@ enum Cmd {
     },
     /// Print index fragment stats (registry + manifests only; does not load buckets).
     Stats {
+        #[arg(long, default_value = "data/rap-index")]
+        index: PathBuf,
+        /// Output format (`table` or `json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+        /// Shorthand for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Compact fragments into one (apply tombstones; last (key,file) wins).
+    Compact {
+        #[arg(long, default_value = "data/rap-index")]
+        index: PathBuf,
+        #[arg(long)]
+        fragment: Option<String>,
+        /// Output format (`table` or `json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+        /// Shorthand for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Append tombstone entries that hide keys from subsequent lookups.
+    Forget {
+        #[arg(long, default_value = "data/rap-index")]
+        index: PathBuf,
+        /// Key to forget (repeatable).
+        #[arg(long, required = true)]
+        key: Vec<String>,
+        #[arg(long)]
+        fragment: Option<String>,
+        /// Output format (`table` or `json`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+        /// Shorthand for `--format json`.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Verify indexed files against stored size / etag identity.
+    Verify {
         #[arg(long, default_value = "data/rap-index")]
         index: PathBuf,
         /// Output format (`table` or `json`).
@@ -686,6 +729,69 @@ fn main() -> Result<()> {
             json,
         } => {
             run_stats(&index, resolve_format(format, json))?;
+        }
+        Cmd::Compact {
+            index,
+            fragment,
+            format,
+            json,
+        } => {
+            let report = compact_index(&index, fragment.as_deref())?;
+            match resolve_format(format, json) {
+                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
+                OutputFormat::Table => println!(
+                    "compacted → {}  keys={} entries={} files={} dropped_tombstoned_keys={}",
+                    report.fragment_id,
+                    report.keys,
+                    report.entries,
+                    report.files,
+                    report.dropped_tombstoned_keys
+                ),
+            }
+        }
+        Cmd::Forget {
+            index,
+            key,
+            fragment,
+            format,
+            json,
+        } => {
+            let frag = forget_keys(&index, &key, fragment.as_deref())?;
+            match resolve_format(format, json) {
+                OutputFormat::Json => {
+                    let v = serde_json::json!({
+                        "fragment": frag.display().to_string(),
+                        "keys": key,
+                    });
+                    println!("{}", serde_json::to_string(&v)?);
+                }
+                OutputFormat::Table => println!(
+                    "suppressed {} key(s) from Needle lookups → {} (Parquet unchanged)",
+                    key.len(),
+                    frag.display()
+                ),
+            }
+        }
+        Cmd::Verify {
+            index,
+            format,
+            json,
+        } => {
+            let report = verify_index_files(&index)?;
+            match resolve_format(format, json) {
+                OutputFormat::Json => println!("{}", serde_json::to_string(&report)?),
+                OutputFormat::Table => {
+                    println!(
+                        "verify: checked={} stale={} skipped={}",
+                        report.checked,
+                        report.stale.len(),
+                        report.skipped
+                    );
+                    for p in &report.stale {
+                        println!("  stale {p}");
+                    }
+                }
+            }
         }
         Cmd::Bench {
             key,
@@ -1742,6 +1848,7 @@ fn query_result_json(
         "key": result.key,
         "rows": rows,
         "covering": result.covering_hits,
+        "covering_values": result.covering_values_json(),
         "timings": {
             "index_load_ms": index_load.as_millis() as u64,
             "index_lookup_ms": t.index_lookup.as_millis() as u64,

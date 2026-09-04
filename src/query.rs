@@ -78,6 +78,16 @@ pub struct QueryTimings {
     pub used_prepared_layout: bool,
 }
 
+/// Structured covering stats for one kept index entry (generic `value_count` aliases `listen_count`).
+#[derive(Debug, Clone)]
+pub struct CoveringHit {
+    pub file: String,
+    pub listen_count: u64,
+    pub total_duration_ms: u64,
+    pub min_ts: Option<i64>,
+    pub max_ts: Option<i64>,
+}
+
 #[derive(Debug)]
 pub struct QueryResult {
     pub key: String,
@@ -86,6 +96,7 @@ pub struct QueryResult {
     pub batch: RecordBatch,
     pub timings: QueryTimings,
     pub covering_hits: Vec<String>,
+    pub covering_values: Vec<CoveringHit>,
     pub page_descriptions: Vec<String>,
     /// Total values available before pagination (from value_count / row lists).
     pub total_value_count: u64,
@@ -105,6 +116,27 @@ impl QueryResult {
     pub fn json_rows(&self) -> Vec<serde_json::Value> {
         batch_to_json_rows(&self.batch)
     }
+
+    /// Covering payload: `value_count` is the generic alias of `listen_count`.
+    pub fn covering_values_json(&self) -> Vec<serde_json::Value> {
+        covering_values_json(&self.covering_values)
+    }
+}
+
+/// Covering payload objects for daemon / CLI JSON.
+pub fn covering_values_json(hits: &[CoveringHit]) -> Vec<serde_json::Value> {
+    hits.iter()
+        .map(|c| {
+            serde_json::json!({
+                "file": c.file,
+                "value_count": c.listen_count,
+                "listen_count": c.listen_count,
+                "total_duration_ms": c.total_duration_ms,
+                "min_ts": c.min_ts,
+                "max_ts": c.max_ts,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -187,13 +219,13 @@ impl RapQuerier {
             .map(|e| e.value_count.unwrap_or(e.row_numbers.len() as u64))
             .sum();
 
-        let covering_hits = covering_lines(&self.index, &kept)?;
+        let (covering_hits, covering_values) = covering_from_entries(&self.index, &kept)?;
 
         if opts.covering_only {
             return Ok(QueryResult {
                 key: key.to_string(),
                 rows: Vec::new(),
-                batch: empty_record_batch(),
+                batch: empty_projected_batch(opts),
                 timings: QueryTimings {
                     index_lookup,
                     metadata_resolve: Duration::ZERO,
@@ -207,6 +239,7 @@ impl RapQuerier {
                     used_prepared_layout: false,
                 },
                 covering_hits,
+                covering_values,
                 page_descriptions: Vec::new(),
                 total_value_count,
                 offset: opts.offset,
@@ -334,7 +367,7 @@ impl RapQuerier {
         }
         let batch = if parquet_batches.is_empty() {
             if rows.is_empty() {
-                empty_record_batch()
+                empty_projected_batch(opts)
             } else {
                 listen_rows_to_batch(&rows)
             }
@@ -360,6 +393,7 @@ impl RapQuerier {
                 used_prepared_layout,
             },
             covering_hits,
+            covering_values,
             page_descriptions,
             total_value_count,
             offset: opts.offset,
@@ -517,18 +551,40 @@ fn apply_predicates(entries: &[RapIndexEntry], opts: &QueryOptions) -> (Vec<RapI
     (kept, skipped)
 }
 
-fn covering_lines(index: &RapIndex, entries: &[RapIndexEntry]) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+fn covering_from_entries(
+    index: &RapIndex,
+    entries: &[RapIndexEntry],
+) -> Result<(Vec<String>, Vec<CoveringHit>)> {
+    let mut lines = Vec::new();
+    let mut values = Vec::new();
     for e in entries {
         if let Some(c) = &e.covering {
-            let path = index.file_path(e.file)?.display().to_string();
-            out.push(format!(
-                "file={path} listen_count={} total_duration_ms={}",
+            let file = index.file_path(e.file)?.display().to_string();
+            let mut line = format!(
+                "file={file} listen_count={} total_duration_ms={}",
                 c.listen_count, c.total_duration_ms
-            ));
+            );
+            if let Some(min_ts) = c.min_ts {
+                line.push_str(&format!(" min_ts={min_ts}"));
+            }
+            if let Some(max_ts) = c.max_ts {
+                line.push_str(&format!(" max_ts={max_ts}"));
+            }
+            lines.push(line);
+            values.push(CoveringHit {
+                file,
+                listen_count: c.listen_count,
+                total_duration_ms: c.total_duration_ms,
+                min_ts: c.min_ts,
+                max_ts: c.max_ts,
+            });
         }
     }
-    Ok(out)
+    Ok((lines, values))
+}
+
+fn covering_lines(index: &RapIndex, entries: &[RapIndexEntry]) -> Result<Vec<String>> {
+    Ok(covering_from_entries(index, entries)?.0)
 }
 
 fn row_in_time_window(r: &ListenRow, opts: &QueryOptions) -> bool {
@@ -1071,8 +1127,16 @@ fn is_blob_schema(batch: &RecordBatch) -> bool {
     batch.column_by_name("payload").is_some() && batch.column_by_name("track_uri").is_none()
 }
 
-fn empty_record_batch() -> RecordBatch {
-    RecordBatch::new_empty(Arc::new(Schema::empty()))
+fn empty_projected_batch(opts: &QueryOptions) -> RecordBatch {
+    let cols = projected_columns(opts);
+    if cols.is_empty() {
+        return RecordBatch::new_empty(Arc::new(Schema::empty()));
+    }
+    let fields: Vec<Field> = cols
+        .into_iter()
+        .map(|n| Field::new(n, DataType::Utf8, true))
+        .collect();
+    RecordBatch::new_empty(Arc::new(Schema::new(fields)))
 }
 
 fn listen_row_schema() -> Arc<Schema> {
@@ -1102,7 +1166,7 @@ fn listen_rows_to_batch(rows: &[ListenRow]) -> RecordBatch {
         schema,
         vec![user_id, timestamp_ms, track_uri, duration_ms],
     )
-    .unwrap_or_else(|_| empty_record_batch())
+    .unwrap_or_else(|_| empty_projected_batch(&QueryOptions::default()))
 }
 
 fn assemble_parquet_batch(batches: &[RecordBatch], key: &str, opts: &QueryOptions) -> RecordBatch {

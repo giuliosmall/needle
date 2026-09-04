@@ -549,6 +549,7 @@ fn index_entries_fast(
             contiguous: None,
             prepared_file: None,
             aligned: None,
+            ..Default::default()
         });
     }
     Ok(entries)
@@ -642,6 +643,7 @@ fn index_entries_from_bytes(bytes: &[u8], file_ord: u32) -> Result<(Vec<RapIndex
             contiguous: None,
             prepared_file: None,
             aligned: None,
+            ..Default::default()
         });
     }
     Ok((entries, keys))
@@ -1266,6 +1268,7 @@ fn index_entries_from_pages(
             contiguous: None,
             prepared_file: None,
             aligned: None,
+            ..Default::default()
         });
     }
     Ok(entries)

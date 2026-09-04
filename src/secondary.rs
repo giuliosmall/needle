@@ -386,6 +386,7 @@ pub fn refs_to_primary_entries(refs: &[SecondaryRef]) -> Vec<RapIndexEntry> {
             contiguous: None,
             prepared_file: None,
             aligned: None,
+            ..Default::default()
         })
         .collect()
 }

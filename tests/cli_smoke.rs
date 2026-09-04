@@ -19,7 +19,10 @@ fn cli_help_lists_commands() {
         .stdout(predicate::str::contains("stats"))
         .stdout(predicate::str::contains("daemon"))
         .stdout(predicate::str::contains("sql"))
-        .stdout(predicate::str::contains("iceberg-index"));
+        .stdout(predicate::str::contains("iceberg-index"))
+        .stdout(predicate::str::contains("compact"))
+        .stdout(predicate::str::contains("forget"))
+        .stdout(predicate::str::contains("verify"));
 }
 
 #[test]
@@ -47,6 +50,29 @@ fn cli_new_subcommand_help() {
         .success()
         .stdout(predicate::str::contains("key-column"))
         .stdout(predicate::str::contains("--table"));
+
+    Command::cargo_bin("needle")
+        .unwrap()
+        .args(["compact", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--index"))
+        .stdout(predicate::str::contains("fragment"));
+
+    Command::cargo_bin("needle")
+        .unwrap()
+        .args(["forget", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--key"))
+        .stdout(predicate::str::contains("--index"));
+
+    Command::cargo_bin("needle")
+        .unwrap()
+        .args(["verify", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--index"));
 }
 
 #[test]
