@@ -1389,6 +1389,7 @@ pub fn lake_query(index_dir: &Path, key: &str, limit: usize) -> Result<LakeQuery
             offset: 0,
             limit: Some(limit),
             http_base: None,
+            ..Default::default()
         },
     )?;
 
@@ -1530,6 +1531,7 @@ pub fn lake_bench(
                     offset: 0,
                     limit: Some(20),
                     http_base: None,
+                    ..Default::default()
                 },
             )?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1816,6 +1818,7 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
                     offset: 0,
                     limit: Some(opts.limit),
                     http_base: None,
+                    ..Default::default()
                 },
             );
         }
@@ -1863,6 +1866,7 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
                             offset: 0,
                             limit: Some(limit),
                             http_base: None,
+                            ..Default::default()
                         },
                     );
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1936,6 +1940,7 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
                             offset: 0,
                             limit: Some(limit),
                             http_base: None,
+                            ..Default::default()
                         },
                     );
                     let ms = t0.elapsed().as_secs_f64() * 1000.0;

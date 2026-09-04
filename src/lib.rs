@@ -17,5 +17,5 @@ pub mod writer;
 
 pub use index::{IndexBuilder, RapIndex, RapIndexEntry};
 pub use metadata::{CachedFileMeta, MetaCache};
-pub use query::{QueryOptions, QueryResult, RapQuerier};
+pub use query::{ExplainResult, QueryOptions, QueryResult, RapQuerier};
 pub use writer::{WriteMode, WriterOptions, write_sample_dataset};
