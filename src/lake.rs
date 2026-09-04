@@ -5,16 +5,18 @@
 //! locs, then point queries issue HTTP Range / S3 GetObject Range against MinIO.
 
 use crate::index::{
-    CoveringValues, IndexFragmentMeta, PageLoc, RapIndexEntry, key_bucket, load_index_for_keys,
-    load_index_file_dictionary, load_index_entries_for_keys,
+    key_bucket, load_index_entries_for_keys, load_index_file_dictionary, load_index_for_keys,
+    write_registry, CoveringValues, IndexFragmentMeta, PageLoc, RapIndexEntry,
 };
-use crate::parquet_lowlevel::{pages_for_rows, write_paged_plain_into, write_tiny_plain_into, PageLocInfo, TinyRow};
+use crate::parquet_lowlevel::{
+    pages_for_rows, write_paged_plain_into, write_tiny_plain_into, PageLocInfo, TinyRow,
+};
 use crate::query::{QueryOptions, QueryResult, RapQuerier};
 use crate::s3::{S3Client, S3RangeReader, S3StatsSnap};
 use crate::storage::RangeReader;
-use anyhow::{Context, Result, bail};
-use std::collections::HashMap;
+use anyhow::{bail, Context, Result};
 use arrow::array::{Int64Array, StringArray};
+use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::file::metadata::PageIndexPolicy;
 use rand::rngs::StdRng;
@@ -22,8 +24,8 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{self, File};
-use bytes::Bytes;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -192,7 +194,10 @@ pub fn minio_up() -> Result<()> {
             "Bucket `{DEFAULT_BUCKET}` ready (endpoint={}, anon_read={})",
             client.cfg.endpoint, client.cfg.anonymous_read
         );
-        println!("Credentials: {} / {} (local-only)", client.cfg.access_key, client.cfg.secret_key);
+        println!(
+            "Credentials: {} / {} (local-only)",
+            client.cfg.access_key, client.cfg.secret_key
+        );
         return Ok(());
     }
     let minio = PathBuf::from(TOOLS_MINIO);
@@ -256,7 +261,12 @@ pub fn lake_generate(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
     if opts.clear_index && opts.index_dir.exists() {
         fs::remove_dir_all(&opts.index_dir)?;
     }
-    fs::create_dir_all(opts.index_dir.join("fragments").join(&opts.fragment_id).join("buckets"))?;
+    fs::create_dir_all(
+        opts.index_dir
+            .join("fragments")
+            .join(&opts.fragment_id)
+            .join("buckets"),
+    )?;
 
     let num_buckets = opts.index_buckets.max(1);
     let writers: Vec<Mutex<BufWriter<File>>> = (0..num_buckets)
@@ -300,90 +310,92 @@ pub fn lake_generate(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
     let dates = Arc::new(dates);
 
     pool.install(|| {
-        (0..opts_c.files).into_par_iter().try_for_each(|i| -> Result<()> {
-            let mut rng = StdRng::seed_from_u64(opts_c.seed.wrapping_add(i as u64));
-            let day_i = i % dates.len();
-            let hb = (i / dates.len()) % opts_c.hash_buckets.max(1);
-            let key_path = lake_object_key(&opts_c.prefix, &dates[day_i], hb, i);
+        (0..opts_c.files)
+            .into_par_iter()
+            .try_for_each(|i| -> Result<()> {
+                let mut rng = StdRng::seed_from_u64(opts_c.seed.wrapping_add(i as u64));
+                let day_i = i % dates.len();
+                let hb = (i / dates.len()) % opts_c.hash_buckets.max(1);
+                let key_path = lake_object_key(&opts_c.prefix, &dates[day_i], hb, i);
 
-            // Deterministic user ids so point queries hit known keys.
-            // Spread users across files: ~files distinct primary keys when rows_per_file small.
-            let base_user = i; // one primary user per file
-            let mut listens = Vec::with_capacity(opts_c.rows_per_file);
-            for r in 0..opts_c.rows_per_file.max(1) {
-                let uid = if r == 0 {
-                    base_user
-                } else {
-                    // occasional second key in same file
-                    base_user.wrapping_add(r * 9973)
-                };
-                listens.push(TinyListen {
-                    user_id: format!("user_{uid}"),
-                    timestamp_ms: 1_700_000_000_000i64
-                        + (day_i as i64) * 86_400_000
-                        + (r as i64) * 180_000
-                        + rng.gen_range(0..10_000),
-                    track_uri: format!("spotify:track:{:08}", rng.gen_range(0..50_000)),
-                    duration_ms: rng.gen_range(60_000..300_000),
+                // Deterministic user ids so point queries hit known keys.
+                // Spread users across files: ~files distinct primary keys when rows_per_file small.
+                let base_user = i; // one primary user per file
+                let mut listens = Vec::with_capacity(opts_c.rows_per_file);
+                for r in 0..opts_c.rows_per_file.max(1) {
+                    let uid = if r == 0 {
+                        base_user
+                    } else {
+                        // occasional second key in same file
+                        base_user.wrapping_add(r * 9973)
+                    };
+                    listens.push(TinyListen {
+                        user_id: format!("user_{uid}"),
+                        timestamp_ms: 1_700_000_000_000i64
+                            + (day_i as i64) * 86_400_000
+                            + (r as i64) * 180_000
+                            + rng.gen_range(0..10_000),
+                        track_uri: format!("spotify:track:{:08}", rng.gen_range(0..50_000)),
+                        duration_ms: rng.gen_range(60_000..300_000),
+                    });
+                }
+                listens.sort_by(|a, b| {
+                    a.user_id
+                        .cmp(&b.user_id)
+                        .then(a.timestamp_ms.cmp(&b.timestamp_ms))
                 });
-            }
-            listens.sort_by(|a, b| {
-                a.user_id
-                    .cmp(&b.user_id)
-                    .then(a.timestamp_ms.cmp(&b.timestamp_ms))
-            });
 
-            // Encode into a thread-local buffer (PLAIN UNCOMPRESSED, no ArrowWriter).
-            let nbytes = PQ_BUF.with(|slot| -> Result<usize> {
-                let mut buf = slot.borrow_mut();
-                buf.clear();
-                let t_enc = Instant::now();
-                write_tiny_plain_into(&mut buf, &listens)?;
-                encode_ns.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                let t_put = Instant::now();
-                client.put_object(&opts_c.bucket, &key_path, &buf)?;
-                put_ns.fetch_add(t_put.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                Ok(buf.len())
-            })?;
-            // Fast path: index from in-memory listens; contiguous span = whole object
-            // (tiny files - one ranged read). Skips footer parse at generate-time.
-            // File ordinal = generation index (deterministic; no global dict lock).
-            let t_idx = Instant::now();
-            let entries = index_entries_fast(&listens, nbytes as u64, i as u32)?;
+                // Encode into a thread-local buffer (PLAIN UNCOMPRESSED, no ArrowWriter).
+                let nbytes = PQ_BUF.with(|slot| -> Result<usize> {
+                    let mut buf = slot.borrow_mut();
+                    buf.clear();
+                    let t_enc = Instant::now();
+                    write_tiny_plain_into(&mut buf, &listens)?;
+                    encode_ns.fetch_add(t_enc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let t_put = Instant::now();
+                    client.put_object(&opts_c.bucket, &key_path, &buf)?;
+                    put_ns.fetch_add(t_put.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    Ok(buf.len())
+                })?;
+                // Fast path: index from in-memory listens; contiguous span = whole object
+                // (tiny files - one ranged read). Skips footer parse at generate-time.
+                // File ordinal = generation index (deterministic; no global dict lock).
+                let t_idx = Instant::now();
+                let entries = index_entries_fast(&listens, nbytes as u64, i as u32)?;
 
-            for e in entries {
-                let b = key_bucket(&e.key, num_buckets) as usize;
-                let line = serde_json::to_string(&e)?;
-                let mut w = writers[b].lock().unwrap();
-                writeln!(w, "{line}")?;
-            }
-            index_ns.fetch_add(t_idx.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                for e in entries {
+                    let b = key_bucket(&e.key, num_buckets) as usize;
+                    let line = serde_json::to_string(&e)?;
+                    let mut w = writers[b].lock().unwrap();
+                    writeln!(w, "{line}")?;
+                }
+                index_ns.fetch_add(t_idx.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
-            uploaded.fetch_add(1, Ordering::Relaxed);
-            bytes_up.fetch_add(nbytes as u64, Ordering::Relaxed);
+                uploaded.fetch_add(1, Ordering::Relaxed);
+                bytes_up.fetch_add(nbytes as u64, Ordering::Relaxed);
 
-            if i < 8 {
-                sample_uris
-                    .lock()
-                    .unwrap()
-                    .push(S3Client::s3_uri(&opts_c.bucket, &key_path));
-                sample_keys
-                    .lock()
-                    .unwrap()
-                    .push(format!("user_{base_user}"));
-            }
+                if i < 8 {
+                    sample_uris
+                        .lock()
+                        .unwrap()
+                        .push(S3Client::s3_uri(&opts_c.bucket, &key_path));
+                    sample_keys
+                        .lock()
+                        .unwrap()
+                        .push(format!("user_{base_user}"));
+                }
 
-            let done = uploaded.load(Ordering::Relaxed);
-            if done > 0 && done % 10_000 == 0 {
-                let secs = t0.elapsed().as_secs_f64();
-                let rate = done as f64 / secs.max(1e-6);
-                eprintln!(
-                    "  lake-generate progress: ~{done}/{} ({:.1}s, {:.0} obj/s)",
-                    opts_c.files, secs, rate
-                );
-            }
-            Ok(())
-        })
+                let done = uploaded.load(Ordering::Relaxed);
+                if done > 0 && done % 10_000 == 0 {
+                    let secs = t0.elapsed().as_secs_f64();
+                    let rate = done as f64 / secs.max(1e-6);
+                    eprintln!(
+                        "  lake-generate progress: ~{done}/{} ({:.1}s, {:.0} obj/s)",
+                        opts_c.files, secs, rate
+                    );
+                }
+                Ok(())
+            })
     })?;
 
     // Flush writers + write bincode twins.
@@ -431,10 +443,7 @@ pub fn lake_generate(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
     };
     let frag_dir = opts.index_dir.join("fragments").join(&opts.fragment_id);
     serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, &meta)?;
-    serde_json::to_writer_pretty(
-        File::create(opts.index_dir.join("registry.json"))?,
-        &vec![opts.fragment_id.clone()],
-    )?;
+    write_registry(&opts.index_dir, &[opts.fragment_id.clone()])?;
 
     let n = uploaded.load(Ordering::Relaxed);
     let b = bytes_up.load(Ordering::Relaxed);
@@ -500,7 +509,6 @@ fn read_jsonl_entries(path: &Path) -> Result<Vec<RapIndexEntry>> {
     Ok(out)
 }
 
-
 fn index_entries_fast(
     listens: &[TinyListen],
     object_size: u64,
@@ -538,13 +546,11 @@ fn index_entries_fast(
             row_numbers: rows,
             value_count: Some(vc),
             covering: cov,
-            page_locs: Some(vec![
-                PageLoc {
-                    column: "*".into(),
-                    offset: 0,
-                    size: object_size as u32,
-                },
-            ]),
+            page_locs: Some(vec![PageLoc {
+                column: "*".into(),
+                offset: 0,
+                size: object_size as u32,
+            }]),
             frame_locs: None,
             contiguous: None,
             prepared_file: None,
@@ -555,15 +561,18 @@ fn index_entries_fast(
     Ok(entries)
 }
 
-
-fn index_entries_from_bytes(bytes: &[u8], file_ord: u32) -> Result<(Vec<RapIndexEntry>, Vec<String>)> {
+fn index_entries_from_bytes(
+    bytes: &[u8],
+    file_ord: u32,
+) -> Result<(Vec<RapIndexEntry>, Vec<String>)> {
     let owned = Bytes::copy_from_slice(bytes);
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
     let arrow_meta = ArrowReaderMetadata::load(&owned, options)?;
     let pq = arrow_meta.metadata();
 
     // Scan user_id column via arrow reader over in-memory bytes.
-    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(owned.clone())?;
+    let builder =
+        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(owned.clone())?;
     let reader = builder.build()?;
     let mut key_rows: std::collections::BTreeMap<String, Vec<u64>> =
         std::collections::BTreeMap::new();
@@ -630,7 +639,10 @@ fn index_entries_from_bytes(bytes: &[u8], file_ord: u32) -> Result<(Vec<RapIndex
             None
         };
         let cov = covering.get(&key).cloned();
-        let vc = cov.as_ref().map(|c| c.listen_count).unwrap_or(rows.len() as u64);
+        let vc = cov
+            .as_ref()
+            .map(|c| c.listen_count)
+            .unwrap_or(rows.len() as u64);
         keys.push(key.clone());
         entries.push(RapIndexEntry {
             key,
@@ -648,8 +660,6 @@ fn index_entries_from_bytes(bytes: &[u8], file_ord: u32) -> Result<(Vec<RapIndex
     }
     Ok((entries, keys))
 }
-
-
 
 fn capture_page_locs_mem(
     pq: &parquet::file::metadata::ParquetMetaData,
@@ -730,12 +740,20 @@ pub fn lake_index_from_bucket(
     if keys.is_empty() {
         bail!("no parquet objects under s3://{bucket}/{prefix}");
     }
-    println!("Indexing {} objects from s3://{bucket}/{prefix} …", keys.len());
+    println!(
+        "Indexing {} objects from s3://{bucket}/{prefix} …",
+        keys.len()
+    );
 
     if index_dir.exists() {
         fs::remove_dir_all(index_dir)?;
     }
-    fs::create_dir_all(index_dir.join("fragments").join(fragment_id).join("buckets"))?;
+    fs::create_dir_all(
+        index_dir
+            .join("fragments")
+            .join(fragment_id)
+            .join("buckets"),
+    )?;
     let num_buckets = index_buckets.max(1);
     let writers: Vec<Mutex<BufWriter<File>>> = (0..num_buckets)
         .map(|bi| {
@@ -750,26 +768,28 @@ pub fn lake_index_from_bucket(
     let file_dict: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let client = Arc::new(client);
 
-    keys.par_iter().enumerate().try_for_each(|(i, key)| -> Result<()> {
-        let bytes = client.get_object(bucket, key)?;
-        let uri = S3Client::s3_uri(bucket, key);
-        let ordinal = {
-            let mut d = file_dict.lock().unwrap();
-            let ord = d.len() as u32;
-            d.push(uri);
-            ord
-        };
-        let (entries, _) = index_entries_from_bytes(&bytes, ordinal)?;
-        for e in entries {
-            let b = key_bucket(&e.key, num_buckets) as usize;
-            let line = serde_json::to_string(&e)?;
-            writeln!(writers[b].lock().unwrap(), "{line}")?;
-        }
-        if i > 0 && i % 5_000 == 0 {
-            eprintln!("  lake-index progress: {i}/{}", keys.len());
-        }
-        Ok(())
-    })?;
+    keys.par_iter()
+        .enumerate()
+        .try_for_each(|(i, key)| -> Result<()> {
+            let bytes = client.get_object(bucket, key)?;
+            let uri = S3Client::s3_uri(bucket, key);
+            let ordinal = {
+                let mut d = file_dict.lock().unwrap();
+                let ord = d.len() as u32;
+                d.push(uri);
+                ord
+            };
+            let (entries, _) = index_entries_from_bytes(&bytes, ordinal)?;
+            for e in entries {
+                let b = key_bucket(&e.key, num_buckets) as usize;
+                let line = serde_json::to_string(&e)?;
+                writeln!(writers[b].lock().unwrap(), "{line}")?;
+            }
+            if i > 0 && i % 5_000 == 0 {
+                eprintln!("  lake-index progress: {i}/{}", keys.len());
+            }
+            Ok(())
+        })?;
 
     let mut files = file_dict.into_inner().unwrap();
     // Preserve order from parallel is nondeterministic - re-sort by URI and rewrite ordinals?
@@ -803,13 +823,15 @@ pub fn lake_index_from_bucket(
         ..Default::default()
     };
     serde_json::to_writer_pretty(
-        File::create(index_dir.join("fragments").join(fragment_id).join("manifest.json"))?,
+        File::create(
+            index_dir
+                .join("fragments")
+                .join(fragment_id)
+                .join("manifest.json"),
+        )?,
         &meta,
     )?;
-    serde_json::to_writer_pretty(
-        File::create(index_dir.join("registry.json"))?,
-        &vec![fragment_id.to_string()],
-    )?;
+    write_registry(index_dir, &[fragment_id.to_string()])?;
     println!(
         "lake-index done: {} files in {:?}",
         meta.files.len(),
@@ -1083,7 +1105,10 @@ pub fn lake_generate_fat(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
         bincode::serialize_into(&mut f, &entries)?;
         f.flush()?;
         if scale && bi % 256 == 0 {
-            eprintln!("  index bucket {bi}/{num_buckets} entries={}", entries.len());
+            eprintln!(
+                "  index bucket {bi}/{num_buckets} entries={}",
+                entries.len()
+            );
         }
     }
 
@@ -1113,10 +1138,7 @@ pub fn lake_generate_fat(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
     } else {
         serde_json::to_writer_pretty(mf, &meta)?;
     }
-    serde_json::to_writer_pretty(
-        File::create(opts.index_dir.join("registry.json"))?,
-        &vec![opts.fragment_id.clone()],
-    )?;
+    write_registry(&opts.index_dir, &[opts.fragment_id.clone()])?;
 
     let mut sizes = file_sizes.into_inner().unwrap();
     sizes.sort_by_key(|(i, _)| *i);
@@ -1210,7 +1232,6 @@ fn read_staged_entries(path: &Path) -> Result<Vec<RapIndexEntry>> {
     }
     Ok(out)
 }
-
 
 fn index_entries_from_pages(
     listens: &[TinyListen],
@@ -1308,7 +1329,6 @@ fn object_size(client: &S3Client, uri: &str, cached: Option<u64>) -> Result<u64>
     }
 }
 
-
 #[derive(Debug)]
 pub struct LakeQueryReport {
     pub result: QueryResult,
@@ -1375,12 +1395,17 @@ pub fn lake_query(index_dir: &Path, key: &str, limit: usize) -> Result<LakeQuery
     }
 
     let coalesced = coalesce_ranges(raw_ranges, 0);
-    let coalesced_span: u64 = coalesced.iter().map(|r| r.end.saturating_sub(r.start)).sum();
+    let coalesced_span: u64 = coalesced
+        .iter()
+        .map(|r| r.end.saturating_sub(r.start))
+        .sum();
 
     let naive_uris: Vec<String> = entries
         .iter()
         .filter_map(|e| {
-            idx.file_path(e.file).ok().map(|p| p.to_string_lossy().into_owned())
+            idx.file_path(e.file)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
         })
         .filter(|uri| S3Client::is_remote_uri(uri))
         .collect();
@@ -1460,11 +1485,7 @@ pub struct LakeBenchReport {
     pub fat: Option<bool>,
 }
 
-pub fn lake_bench(
-    index_dir: &Path,
-    keys: &[String],
-    rounds: usize,
-) -> Result<LakeBenchReport> {
+pub fn lake_bench(index_dir: &Path, keys: &[String], rounds: usize) -> Result<LakeBenchReport> {
     let idx = load_index_for_keys(index_dir, keys)?;
     let objects = {
         // File dictionary lives on the fragment even when we only loaded a few buckets.
@@ -1527,7 +1548,10 @@ pub fn lake_bench(
                 }
             }
             let coalesced = coalesce_ranges(raw_ranges, 0);
-            let coal_span: u64 = coalesced.iter().map(|r| r.end.saturating_sub(r.start)).sum();
+            let coal_span: u64 = coalesced
+                .iter()
+                .map(|r| r.end.saturating_sub(r.start))
+                .sum();
             let result = querier.query_with(
                 key,
                 &QueryOptions {
@@ -1572,11 +1596,12 @@ pub fn lake_bench(
     let p50 = percentile(&latencies, 0.50);
     let p99 = percentile(&latencies, 0.99);
     let avg = latencies.iter().sum::<f64>() / latencies.len().max(1) as f64;
-    let min_ratio = ratios
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
-    let min_ratio = if min_ratio.is_finite() { min_ratio } else { 0.0 };
+    let min_ratio = ratios.iter().cloned().fold(f64::INFINITY, f64::min);
+    let min_ratio = if min_ratio.is_finite() {
+        min_ratio
+    } else {
+        0.0
+    };
 
     let note = if fat {
         "FAT lake: RAP Range-GETs OffsetIndex pages; naive = full object GET of the candidate file. bytes_ranged / file_size should be ≪ 1%.".into()
@@ -1640,7 +1665,6 @@ fn dir_size(path: &Path) -> Result<u64> {
     }
     Ok(total)
 }
-
 
 #[derive(Debug, Clone)]
 pub struct LakeStressOpts {
@@ -1714,7 +1738,13 @@ fn sample_stress_keys(n: usize, seed: u64, key_space: u64) -> Vec<String> {
         }
     }
     // Deep / boundary keys
-    for d in [299_999u64, key_space.saturating_sub(1), 300_000, 7, key_space / 2] {
+    for d in [
+        299_999u64,
+        key_space.saturating_sub(1),
+        300_000,
+        7,
+        key_space / 2,
+    ] {
         if d < key_space {
             keys.push(format!("user_{d}"));
         }
@@ -1729,14 +1759,18 @@ fn sample_stress_keys(n: usize, seed: u64, key_space: u64) -> Vec<String> {
 
 fn infer_key_space(index_dir: &Path) -> Result<u64> {
     let man_path = index_dir.join("lake_manifest.json");
-    let text = fs::read_to_string(&man_path)
-        .with_context(|| format!("read {}", man_path.display()))?;
+    let text =
+        fs::read_to_string(&man_path).with_context(|| format!("read {}", man_path.display()))?;
     let v: serde_json::Value = serde_json::from_str(&text)?;
     let objects = v.get("objects").and_then(|x| x.as_u64()).unwrap_or(0);
     let rows = v.get("rows_per_file").and_then(|x| x.as_u64()).unwrap_or(0);
     // Fat lake: 32 listens/user default → users_per_file = rows/32.
     let listens = 32u64;
-    let users_per_file = if rows > 0 { (rows / listens).max(1) } else { 160 };
+    let users_per_file = if rows > 0 {
+        (rows / listens).max(1)
+    } else {
+        160
+    };
     Ok(objects.saturating_mul(users_per_file).max(1))
 }
 
@@ -1812,7 +1846,8 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
     if warmup_n > 0 {
         eprintln!("  warmup {warmup_n} queries…");
         let warm_keys: Vec<String> = keys[..warmup_n].to_vec();
-        let warm_idx = load_index_entries_for_keys(&root, Arc::clone(&files), &fragments, &warm_keys)?;
+        let warm_idx =
+            load_index_entries_for_keys(&root, Arc::clone(&files), &fragments, &warm_keys)?;
         let querier = RapQuerier::new(warm_idx).with_s3(client.clone());
         for k in &warm_keys {
             let _ = querier.query_with(
@@ -1883,10 +1918,8 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
                                 .fetch_add(r.timings.pages_touched as u64, Ordering::Relaxed);
                             if verify_every > 0 && orig_i % verify_every == 0 {
                                 let nonempty = !r.rows.is_empty() || r.total_value_count > 0;
-                                let cover_ok = r
-                                    .covering_hits
-                                    .iter()
-                                    .any(|h| h.contains("listen_count="));
+                                let cover_ok =
+                                    r.covering_hits.iter().any(|h| h.contains("listen_count="));
                                 if nonempty && (r.covering_hits.is_empty() || cover_ok) {
                                     acc.verify_ok.fetch_add(1, Ordering::Relaxed);
                                 } else {
@@ -2004,7 +2037,11 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
         verify_fail: acc.verify_fail.load(Ordering::Relaxed),
         wall_secs,
         qps,
-        avg_bytes_ranged: if ok > 0 { bytes as f64 / ok as f64 } else { 0.0 },
+        avg_bytes_ranged: if ok > 0 {
+            bytes as f64 / ok as f64
+        } else {
+            0.0
+        },
         avg_range_requests: if ok > 0 {
             ranges as f64 / ok as f64
         } else {
@@ -2049,7 +2086,11 @@ pub fn lake_e2e_small(files: usize, index_dir: &Path) -> Result<()> {
     };
     let man = lake_generate(&opts)?;
     assert!(man.objects as usize == files);
-    let key = man.sample_keys.first().cloned().unwrap_or_else(|| "user_0".into());
+    let key = man
+        .sample_keys
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "user_0".into());
     let report = lake_query(index_dir, &key, 10)?;
     if report.result.rows.is_empty() {
         bail!("lake e2e: no rows for {key}");
@@ -2093,7 +2134,11 @@ pub fn lake_e2e_fat_small(index_dir: &Path) -> Result<()> {
     if min_sz < 500_000 {
         bail!("fat e2e: file too small ({min_sz} bytes) - need multi-MB-ish for the proof");
     }
-    let key = man.sample_keys.first().cloned().unwrap_or_else(|| "user_0".into());
+    let key = man
+        .sample_keys
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "user_0".into());
     let report = lake_query(index_dir, &key, 32)?;
     if report.result.rows.is_empty() {
         bail!("fat e2e: no rows for {key}");

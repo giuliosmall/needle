@@ -16,19 +16,21 @@
 //!   needle daemon    - HTTP query daemon (`GET /v1/query?key=…`)
 //!   needle demo / demo-full - end-to-end demos
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate};
 use clap::{Parser, Subcommand, ValueEnum};
 use needle::iceberg::{self, IcebergIndexOpts};
-use needle::index::{IndexBuilder, compact_index, forget_keys, load_index, load_index_for_keys, verify_index_files};
-use needle::query::{QueryOptions, RapQuerier, collect_demo_ranges, naive_scan};
-use needle::secondary::{self, refs_to_primary_entries};
+use needle::index::{
+    compact_index, forget_keys, load_index, load_index_for_keys, verify_index_files, IndexBuilder,
+};
 use needle::lake::{self, LakeGenerateOpts};
-use needle::server::{self, DaemonOptions};
-use needle::sql::SqlOptions;
-use needle::storage::{RangeHttpServer, prove_http_matches_local};
 use needle::parquet_lowlevel;
-use needle::writer::{WriteMode, WriterOptions, write_sample_dataset};
+use needle::query::{collect_demo_ranges, naive_scan, QueryOptions, RapQuerier};
+use needle::secondary::{self, refs_to_primary_entries};
+use needle::server::{self, DaemonCli};
+use needle::sql::SqlOptions;
+use needle::storage::{prove_http_matches_local, RangeHttpServer};
+use needle::writer::{write_sample_dataset, WriteMode, WriterOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -166,6 +168,9 @@ enum Cmd {
         /// Keep entries whose covering listen_count is at least N.
         #[arg(long, value_name = "N")]
         min_listens: Option<u64>,
+        /// Skip file identity check (size/ETag/mtime) before Range-GET. Unsafe: may return rows from mutated files.
+        #[arg(long, default_value_t = false)]
+        no_verify: bool,
         /// Output format (`table` or `json`).
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
@@ -195,6 +200,9 @@ enum Cmd {
         /// Max rows to load into `hits` before running SQL (index pagination).
         #[arg(long)]
         limit: Option<usize>,
+        /// Skip file identity check (size/ETag/mtime) before Range-GET. Unsafe: may return rows from mutated files.
+        #[arg(long, default_value_t = false)]
+        no_verify: bool,
         /// Output format (`table` = JSON lines; `json` = `batch_to_json`).
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
@@ -224,6 +232,9 @@ enum Cmd {
         /// Keep entries whose covering listen_count is at least N.
         #[arg(long, value_name = "N")]
         min_listens: Option<u64>,
+        /// Skip file identity check (size/ETag/mtime) if this plan opens files. Unsafe.
+        #[arg(long, default_value_t = false)]
+        no_verify: bool,
         /// Output format (`table` or `json`).
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
@@ -302,18 +313,18 @@ enum Cmd {
     },
     /// HTTP query daemon (`GET /v1/query?key=…`).
     Daemon {
-        #[arg(long, default_value = "data/rap-index")]
-        index: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:7780")]
-        bind: String,
-        /// Load index buckets on demand instead of at startup.
-        #[arg(long, default_value_t = false)]
-        lazy_buckets: bool,
+        #[command(flatten)]
+        daemon: DaemonCli,
     },
     /// End-to-end demo: generate → index → query → bench.
     Demo {
         /// Data root (parquet + rap-index). Alias: --data-dir. Env: RAP_DATA_DIR.
-        #[arg(long, default_value = "data", visible_alias = "data-dir", env = "RAP_DATA_DIR")]
+        #[arg(
+            long,
+            default_value = "data",
+            visible_alias = "data-dir",
+            env = "RAP_DATA_DIR"
+        )]
         root: PathBuf,
         #[arg(long, default_value = "user_0042")]
         key: String,
@@ -328,7 +339,12 @@ enum Cmd {
     #[command(name = "demo-full")]
     DemoFull {
         /// Data root (per-mode subdirs). Alias: --data-dir. Env: RAP_DATA_DIR.
-        #[arg(long, default_value = "data", visible_alias = "data-dir", env = "RAP_DATA_DIR")]
+        #[arg(
+            long,
+            default_value = "data",
+            visible_alias = "data-dir",
+            env = "RAP_DATA_DIR"
+        )]
         root: PathBuf,
         #[arg(long, default_value = "user_0042")]
         key: String,
@@ -563,11 +579,8 @@ fn main() -> Result<()> {
                 .with_key_columns(key_column.clone())
                 .with_value_columns(value_column);
             let t0 = Instant::now();
-            let frag = builder.build_fragment(
-                &files,
-                &fragment,
-                Some("RAP external index fragment"),
-            )?;
+            let frag =
+                builder.build_fragment(&files, &fragment, Some("RAP external index fragment"))?;
             println!(
                 "Indexed {} file(s) → {} in {:?} (buckets={}, covering={}, key_columns={:?})",
                 files.len(),
@@ -642,6 +655,7 @@ fn main() -> Result<()> {
             until,
             covering_only,
             min_listens,
+            no_verify,
             format,
             json,
         } => {
@@ -662,6 +676,7 @@ fn main() -> Result<()> {
                 until,
                 covering_only,
                 min_listens,
+                !no_verify,
                 out,
             )?;
         }
@@ -673,6 +688,7 @@ fn main() -> Result<()> {
             since,
             until,
             limit,
+            no_verify,
             format,
             json,
         } => {
@@ -686,6 +702,7 @@ fn main() -> Result<()> {
                 until.as_deref(),
                 false,
                 None,
+                !no_verify,
             )?;
             let result = needle::sql::run_sql(&SqlOptions {
                 index,
@@ -703,6 +720,7 @@ fn main() -> Result<()> {
             until,
             covering_only,
             min_listens,
+            no_verify,
             format,
             json,
         } => {
@@ -719,6 +737,7 @@ fn main() -> Result<()> {
                 until.as_deref(),
                 covering_only,
                 min_listens,
+                !no_verify,
             )?;
             let expl = querier.explain(&key, &qopts)?;
             print_explain(&expl, out)?;
@@ -792,6 +811,9 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            if !report.stale.is_empty() {
+                bail!("{} stale file(s)", report.stale.len());
+            }
         }
         Cmd::Bench {
             key,
@@ -836,9 +858,7 @@ fn main() -> Result<()> {
                 println!("  Speedup: {speedup:.2}x (naive / RAP)");
             }
             if rap_count != naive_count {
-                println!(
-                    "  WARNING: row count mismatch RAP={rap_count} naive={naive_count}"
-                );
+                println!("  WARNING: row count mismatch RAP={rap_count} naive={naive_count}");
             }
         }
         Cmd::Serve { root, seconds } => {
@@ -852,16 +872,8 @@ fn main() -> Result<()> {
             println!("Stopping server.");
             server.stop();
         }
-        Cmd::Daemon {
-            index,
-            bind,
-            lazy_buckets,
-        } => {
-            server::serve_forever(DaemonOptions {
-                index,
-                bind,
-                lazy_buckets,
-            })?;
+        Cmd::Daemon { daemon } => {
+            server::serve_forever(daemon.into())?;
         }
         Cmd::Demo {
             root,
@@ -906,7 +918,7 @@ fn main() -> Result<()> {
             let mut parallelism = parallelism;
             let mut fragment = fragment;
             if fat {
-                if index == PathBuf::from("data/rap-lake-index") {
+                if index.as_os_str() == "data/rap-lake-index" {
                     index = PathBuf::from("data/rap-lake-index-fat");
                 }
                 if prefix.is_empty() {
@@ -995,7 +1007,10 @@ fn main() -> Result<()> {
                 let avg = man.bytes_uploaded as f64 / man.objects.max(1) as f64;
                 println!(
                     "file_size min/avg/max={}/{:.0}/{} (n={})",
-                    min_sz, avg, max_sz, man.file_sizes.len()
+                    min_sz,
+                    avg,
+                    max_sz,
+                    man.file_sizes.len()
                 );
             }
         }
@@ -1037,7 +1052,8 @@ fn main() -> Result<()> {
                 // Prefer sample keys from lake_manifest.json
                 let man_path = index.join("lake_manifest.json");
                 if man_path.exists() {
-                    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(man_path)?)?;
+                    let v: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(man_path)?)?;
                     v.get("sample_keys")
                         .and_then(|x| x.as_array())
                         .map(|a| {
@@ -1113,6 +1129,7 @@ fn run_query_cmd(
     until: Option<String>,
     covering_only: bool,
     min_listens: Option<u64>,
+    verify: bool,
     out: OutputFormat,
 ) -> Result<()> {
     let key = key.filter(|s| !s.is_empty());
@@ -1158,6 +1175,7 @@ fn run_query_cmd(
         until.as_deref(),
         covering_only,
         min_listens,
+        verify,
     )?;
     let result = querier.query_with(&key, &qopts)?;
     match out {
@@ -1271,9 +1289,8 @@ fn run_secondary_query(
             });
         } else {
             let rows = decode_secondary_rows(&sec, refs, key, offset, limit)?;
-            body["rows"] = serde_json::Value::Array(
-                rows.into_iter().map(serde_json::Value::String).collect(),
-            );
+            body["rows"] =
+                serde_json::Value::Array(rows.into_iter().map(serde_json::Value::String).collect());
         }
         println!("{}", serde_json::to_string(&body)?);
         return Ok(());
@@ -1305,7 +1322,10 @@ fn run_secondary_query(
     }
 
     let rows = decode_secondary_rows(&sec, refs, key, offset, limit)?;
-    println!("  decoded {} matching row(s) (showing up to {limit}):", rows.len());
+    println!(
+        "  decoded {} matching row(s) (showing up to {limit}):",
+        rows.len()
+    );
     for line in rows.iter().take(limit) {
         println!("    {line}");
     }
@@ -1333,7 +1353,11 @@ fn decode_secondary_rows(
     // Decode via primary Parquet using row numbers from secondary.
     let _entries = refs_to_primary_entries(refs);
     let mut rows = Vec::new();
-    for r in refs.iter().skip(offset).take(limit.max(1).saturating_mul(4)) {
+    for r in refs
+        .iter()
+        .skip(offset)
+        .take(limit.max(1).saturating_mul(4))
+    {
         let path = sec
             .files
             .get(r.file as usize)
@@ -1342,8 +1366,7 @@ fn decode_secondary_rows(
             continue;
         }
         let file = std::fs::File::open(path)?;
-        let builder =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
         let total = builder.metadata().file_metadata().num_rows() as u64;
         let mut sorted = r.row_numbers.clone();
         sorted.sort_unstable();
@@ -1516,7 +1539,10 @@ fn run_demo_full(
             for p in &paths {
                 let proof = parquet_lowlevel::verify_parquet_file(p)?;
                 let n = parquet_lowlevel::try_arrow_read(p)?;
-                println!("  custom writer {} - {proof}; arrow rows={n}", p.file_name().unwrap().to_string_lossy());
+                println!(
+                    "  custom writer {} - {proof}; arrow rows={n}",
+                    p.file_name().unwrap().to_string_lossy()
+                );
                 // Must not require sidecar data files.
                 for ext in ["rapz", "rapi"] {
                     let side = p.with_extension(ext);
@@ -1786,9 +1812,9 @@ fn parse_time_ms(s: &str, end_of_day: bool) -> Result<i64> {
     }
     match DateTime::parse_from_rfc3339(s) {
         Ok(dt) => Ok(dt.timestamp_millis()),
-        Err(e) => bail!(
-            "invalid time {s:?}: expected RFC3339, YYYY-MM-DD, or integer milliseconds ({e})"
-        ),
+        Err(e) => {
+            bail!("invalid time {s:?}: expected RFC3339, YYYY-MM-DD, or integer milliseconds ({e})")
+        }
     }
 }
 
@@ -1801,6 +1827,7 @@ fn build_query_options(
     until: Option<&str>,
     covering_only: bool,
     min_listens: Option<u64>,
+    verify: bool,
 ) -> Result<QueryOptions> {
     let cols = parse_columns(columns);
     Ok(QueryOptions {
@@ -1818,7 +1845,7 @@ fn build_query_options(
         },
         covering_only,
         min_listen_count: min_listens,
-        ..Default::default()
+        verify,
     })
 }
 
@@ -1901,9 +1928,7 @@ fn print_explain(expl: &needle::query::ExplainResult, out: OutputFormat) -> Resu
             );
             println!(
                 "  entries={} after_predicates={} skipped={}",
-                expl.num_entries,
-                expl.num_entries_after_predicates,
-                expl.skipped_by_predicate
+                expl.num_entries, expl.num_entries_after_predicates, expl.skipped_by_predicate
             );
             println!("  files: {:?}", expl.files);
             println!("  covering: {:?}", expl.covering);
@@ -1926,21 +1951,21 @@ fn print_explain(expl: &needle::query::ExplainResult, out: OutputFormat) -> Resu
 fn run_stats(index: &Path, out: OutputFormat) -> Result<()> {
     let registry_path = index.join("registry.json");
     if !registry_path.exists() {
-        bail!("no RAP index at {} (missing registry.json)", index.display());
+        bail!(
+            "no RAP index at {} (missing registry.json)",
+            index.display()
+        );
     }
     let registry: Vec<String> = serde_json::from_reader(std::fs::File::open(&registry_path)?)
         .with_context(|| format!("read {}", registry_path.display()))?;
 
     let mut fragments = Vec::new();
     for frag_id in &registry {
-        let man_path = index
-            .join("fragments")
-            .join(frag_id)
-            .join("manifest.json");
+        let man_path = index.join("fragments").join(frag_id).join("manifest.json");
         let raw = std::fs::read_to_string(&man_path)
             .with_context(|| format!("read {}", man_path.display()))?;
-        let mut man: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("parse {}", man_path.display()))?;
+        let mut man: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", man_path.display()))?;
         if man.get("fragment_id").is_none() {
             man["fragment_id"] = serde_json::Value::String(frag_id.clone());
         }
@@ -1968,14 +1993,8 @@ fn run_stats(index: &Path, out: OutputFormat) -> Result<()> {
                     .and_then(|v| v.as_array())
                     .map(|a| a.len())
                     .unwrap_or(0);
-                let buckets = man
-                    .get("num_buckets")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let created = man
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let buckets = man.get("num_buckets").and_then(|v| v.as_u64()).unwrap_or(0);
+                let created = man.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
                 print!("  {id}  files={n_files}  buckets={buckets}  created_at={created}");
                 if let Some(kc) = man.get("key_columns") {
                     if !kc.is_null() {

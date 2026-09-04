@@ -1,11 +1,11 @@
 //! Library-level end-to-end tests: generate → index → query for each write mode,
 //! plus secondary index, HTTP Range, pagination, and covering aggregates.
 
-use needle::index::{IndexBuilder, load_index};
-use needle::query::{QueryOptions, RapQuerier, naive_scan};
+use needle::index::{load_index, IndexBuilder};
+use needle::query::{naive_scan, QueryOptions, RapQuerier};
 use needle::secondary::{self, build_secondary, load_secondary};
-use needle::storage::{RangeHttpServer, prove_http_matches_local};
-use needle::writer::{WriteMode, WriterOptions, write_sample_dataset};
+use needle::storage::{prove_http_matches_local, RangeHttpServer};
+use needle::writer::{write_sample_dataset, WriteMode, WriterOptions};
 use std::path::{Path, PathBuf};
 
 fn opts(out: &Path, mode: WriteMode) -> WriterOptions {
@@ -156,8 +156,9 @@ fn e2e_secondary_exact_and_range() {
     let end = sec.sorted_keys[(sec.sorted_keys.len() - 1).min(5)].clone();
     let range = sec.lookup_range(&start, &end);
     assert!(!range.is_empty());
-    assert!(range.iter().all(|r| r.key.as_str() >= start.as_str()
-        && r.key.as_str() <= end.as_str()));
+    assert!(range
+        .iter()
+        .all(|r| r.key.as_str() >= start.as_str() && r.key.as_str() <= end.as_str()));
 
     // load_secondary_any discovers the fragment.
     let any = secondary::load_secondary_any(&idx, "track_uri").unwrap();
@@ -291,7 +292,10 @@ fn e2e_cogrouped_covering_matches_nested_sums() {
             "covering must hoist nested list length, not parquet row count"
         );
         assert!(!res.covering_hits.is_empty());
-        assert!(res.covering_hits.iter().any(|h| h.contains("listen_count=6")));
+        assert!(res
+            .covering_hits
+            .iter()
+            .any(|h| h.contains("listen_count=6")));
     }
 }
 
@@ -452,9 +456,7 @@ fn e2e_time_window() {
 #[test]
 fn e2e_explain_lists_files() {
     let (_t, q, _) = generate_index_query(WriteMode::Sorted);
-    let explain = q
-        .explain("user_0012", &QueryOptions::default())
-        .unwrap();
+    let explain = q.explain("user_0012", &QueryOptions::default()).unwrap();
     assert!(
         !explain.files.is_empty(),
         "explain() should list files, got {:?}",

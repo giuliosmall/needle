@@ -112,16 +112,16 @@ async fn exec_sql(
     let ctx = SessionContext::new();
     ctx.register_batch("hits", hits)
         .context("register table hits")?;
-    ctx.register_udtf(
-        "needle_lookup",
-        Arc::new(NeedleLookup { index, query }),
-    );
+    ctx.register_udtf("needle_lookup", Arc::new(NeedleLookup { index, query }));
     let df = ctx
         .sql(sql)
         .await
         .with_context(|| format!("plan sql: {sql}"))?;
     let schema = df.schema().inner().clone();
-    let batches = df.collect().await.with_context(|| format!("exec sql: {sql}"))?;
+    let batches = df
+        .collect()
+        .await
+        .with_context(|| format!("exec sql: {sql}"))?;
     Ok(concat_batches(&schema, &batches)?)
 }
 
@@ -209,17 +209,14 @@ fn cell_json(col: &dyn Array, row: usize) -> Result<serde_json::Value> {
     if let Some(a) = any.downcast_ref::<TimestampMillisecondArray>() {
         return Ok(serde_json::json!(a.value(row)));
     }
-    Ok(serde_json::Value::String(format!(
-        "{:?}",
-        col.data_type()
-    )))
+    Ok(serde_json::Value::String(format!("{:?}", col.data_type())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{IndexBuilder, load_index};
-    use crate::writer::{WriteMode, WriterOptions, write_sample_dataset};
+    use crate::index::{load_index, IndexBuilder};
+    use crate::writer::{write_sample_dataset, WriteMode, WriterOptions};
 
     fn setup() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();

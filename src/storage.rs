@@ -6,7 +6,7 @@
 //! - `HttpRange` - `reqwest` blocking client with `Range: bytes=start-end`
 //! - a tiny `tiny_http` server that serves Parquet/prepared files for demos
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
@@ -40,8 +40,8 @@ impl LocalFile {
 
 impl RangeReader for LocalFile {
     fn read_range(&self, range: &Range<u64>) -> Result<Vec<u8>> {
-        let mut f = File::open(&self.path)
-            .with_context(|| format!("open {}", self.path.display()))?;
+        let mut f =
+            File::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
         let len = (range.end - range.start) as usize;
         f.seek(SeekFrom::Start(range.start))?;
         let mut buf = vec![0u8; len];
@@ -78,7 +78,9 @@ impl RangeReader for HttpRange {
 
 fn http_get_range(url: &str, range: &Range<u64>) -> Result<Vec<u8>> {
     // Expect http://host:port/path
-    let bare = url.strip_prefix("http://").context("only http:// supported")?;
+    let bare = url
+        .strip_prefix("http://")
+        .context("only http:// supported")?;
     let (hostport, path) = bare.split_once('/').unwrap_or((bare, ""));
     let path = format!("/{}", path);
     let end_incl = range.end.saturating_sub(1);
@@ -86,8 +88,8 @@ fn http_get_range(url: &str, range: &Range<u64>) -> Result<Vec<u8>> {
         "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
         range.start, end_incl
     );
-    let mut stream = std::net::TcpStream::connect(hostport)
-        .with_context(|| format!("connect {hostport}"))?;
+    let mut stream =
+        std::net::TcpStream::connect(hostport).with_context(|| format!("connect {hostport}"))?;
     // Avoid indefinite hang if the peer keeps the socket open.
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -135,7 +137,6 @@ fn http_get_range(url: &str, range: &Range<u64>) -> Result<Vec<u8>> {
     Ok(resp[sep + 4..].to_vec())
 }
 
-
 /// Compare local vs HTTP Range byte-for-byte for a set of ranges (demo proof).
 pub fn prove_http_matches_local(
     path: &Path,
@@ -146,9 +147,7 @@ pub fn prove_http_matches_local(
     let url = format!(
         "{}/{}",
         base_url.trim_end_matches('/'),
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("file")
     );
     let http = HttpRange::new(url);
     let mut compared = 0u64;
@@ -215,8 +214,7 @@ impl RangeHttpServer {
     }
 
     pub fn stop(mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         // Wake the server with a dummy request.
         let _ = std::net::TcpStream::connect(self.addr);
         if let Some(h) = self.handle.take() {
@@ -227,8 +225,7 @@ impl RangeHttpServer {
 
 impl Drop for RangeHttpServer {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = std::net::TcpStream::connect(self.addr);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -236,11 +233,7 @@ impl Drop for RangeHttpServer {
     }
 }
 
-fn serve_loop(
-    server: tiny_http::Server,
-    root: PathBuf,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-) {
+fn serve_loop(server: tiny_http::Server, root: PathBuf, stop: Arc<std::sync::atomic::AtomicBool>) {
     loop {
         if stop.load(std::sync::atomic::Ordering::SeqCst) {
             break;
@@ -271,7 +264,8 @@ fn handle_request(request: tiny_http::Request, root: &Path) -> Result<()> {
     }
     let file_path = root.join(name);
     if !file_path.is_file() {
-        let _ = request.respond(tiny_http::Response::from_string("not found").with_status_code(404));
+        let _ =
+            request.respond(tiny_http::Response::from_string("not found").with_status_code(404));
         return Ok(());
     }
     let mut file = File::open(&file_path)?;
@@ -303,9 +297,7 @@ fn handle_request(request: tiny_http::Request, root: &Path) -> Result<()> {
             .with_header(
                 tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap(),
             )
-            .with_header(
-                tiny_http::Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
-            );
+            .with_header(tiny_http::Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap());
         request.respond(response)?;
     } else {
         let mut buf = Vec::new();
@@ -314,9 +306,7 @@ fn handle_request(request: tiny_http::Request, root: &Path) -> Result<()> {
             .with_header(
                 tiny_http::Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap(),
             )
-            .with_header(
-                tiny_http::Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap(),
-            );
+            .with_header(tiny_http::Header::from_bytes(&b"Connection"[..], &b"close"[..]).unwrap());
         request.respond(response)?;
     }
     Ok(())
@@ -329,11 +319,7 @@ fn parse_range(h: &str, total: u64) -> Result<(u64, u64)> {
         .strip_prefix("bytes=")
         .ok_or_else(|| anyhow::anyhow!("bad Range header: {h}"))?;
     let mut parts = rest.splitn(2, '-');
-    let start: u64 = parts
-        .next()
-        .unwrap_or("0")
-        .parse()
-        .context("range start")?;
+    let start: u64 = parts.next().unwrap_or("0").parse().context("range start")?;
     let end_s = parts.next().unwrap_or("");
     let end_incl: u64 = if end_s.is_empty() {
         total.saturating_sub(1)
@@ -345,7 +331,6 @@ fn parse_range(h: &str, total: u64) -> Result<(u64, u64)> {
     }
     Ok((start, end_incl))
 }
-
 
 #[cfg(test)]
 mod tests {

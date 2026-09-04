@@ -9,8 +9,8 @@
 //! 5. Parallel across columns/files (rayon)
 //! 6. Pagination via value_count + offset/limit over index row lists
 
-use crate::index::{RapIndex, RapIndexEntry};
-use crate::metadata::{MetaCache, ranged_read};
+use crate::index::{self, RapIndex, RapIndexEntry};
+use crate::metadata::{ranged_read, MetaCache};
 use crate::prepared::{self, FrameLoc};
 use crate::s3::{S3ChunkReader, S3Client, S3RangeReader};
 use crate::storage::{HttpRange, LocalFile, RangeReader};
@@ -20,10 +20,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{
-    ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
-};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
@@ -139,7 +137,7 @@ pub fn covering_values_json(hits: &[CoveringHit]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct QueryOptions {
     /// Skip this many values across the flattened row list (pagination).
     pub offset: usize,
@@ -157,6 +155,25 @@ pub struct QueryOptions {
     pub covering_only: bool,
     /// Drop index entries whose covering.listen_count is Some and < this.
     pub min_listen_count: Option<u64>,
+    /// Check stored file identity (size / ETag / mtime) before Range-GET or local open.
+    /// Default **true**. Set false (`--no-verify` / `verify=0`) to skip — unsafe.
+    pub verify: bool,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: None,
+            http_base: None,
+            columns: None,
+            since_ms: None,
+            until_ms: None,
+            covering_only: false,
+            min_listen_count: None,
+            verify: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +239,7 @@ impl RapQuerier {
         let (covering_hits, covering_values) = covering_from_entries(&self.index, &kept)?;
 
         if opts.covering_only {
+            // Covering is index-only: skip live identity IO.
             return Ok(QueryResult {
                 key: key.to_string(),
                 rows: Vec::new(),
@@ -246,6 +264,11 @@ impl RapQuerier {
                 limit: opts.limit,
                 skipped_by_predicate,
             });
+        }
+
+        if opts.verify {
+            // Fail the whole key before any Range-GET / File::open / footer load.
+            index::ensure_entries_fresh(&self.index, &kept, self.s3.as_ref())?;
         }
 
         // Pagination: slice row_numbers across remaining entries using offset/limit.
@@ -921,8 +944,10 @@ fn finish_decode_rows<T: parquet::file::reader::ChunkReader + 'static>(
     row_numbers: &[u64],
     proj: Option<&[String]>,
 ) -> Result<UnitDecode> {
-    let selection =
-        row_numbers_to_selection(row_numbers, builder.metadata().file_metadata().num_rows() as u64)?;
+    let selection = row_numbers_to_selection(
+        row_numbers,
+        builder.metadata().file_metadata().num_rows() as u64,
+    )?;
     let builder = apply_projection(builder, proj);
     let reader = builder.with_row_selection(selection).build()?;
 
@@ -1007,7 +1032,11 @@ fn i64_at(col: Option<&dyn Array>, i: usize) -> i64 {
     0
 }
 
-fn extract_listens(batch: &RecordBatch, path: &PathBuf, fallback_user: &str) -> Result<Vec<ListenRow>> {
+fn extract_listens(
+    batch: &RecordBatch,
+    path: &PathBuf,
+    fallback_user: &str,
+) -> Result<Vec<ListenRow>> {
     let n = batch.num_rows();
     let file_name = path
         .file_name()
@@ -1162,11 +1191,8 @@ fn listen_rows_to_batch(rows: &[ListenRow]) -> RecordBatch {
     let duration_ms: ArrayRef = Arc::new(Int64Array::from(
         rows.iter().map(|r| r.duration_ms).collect::<Vec<_>>(),
     ));
-    RecordBatch::try_new(
-        schema,
-        vec![user_id, timestamp_ms, track_uri, duration_ms],
-    )
-    .unwrap_or_else(|_| empty_projected_batch(&QueryOptions::default()))
+    RecordBatch::try_new(schema, vec![user_id, timestamp_ms, track_uri, duration_ms])
+        .unwrap_or_else(|_| empty_projected_batch(&QueryOptions::default()))
 }
 
 fn assemble_parquet_batch(batches: &[RecordBatch], key: &str, opts: &QueryOptions) -> RecordBatch {
@@ -1250,7 +1276,11 @@ fn filter_batch_by_key(batch: &RecordBatch, key: &str) -> RecordBatch {
     };
     let col = batch.column(idx);
     let mask: Vec<bool> = (0..batch.num_rows())
-        .map(|i| string_value_at(col.as_ref(), i).map(|s| s == key).unwrap_or(false))
+        .map(|i| {
+            string_value_at(col.as_ref(), i)
+                .map(|s| s == key)
+                .unwrap_or(false)
+        })
         .collect();
     let pred = BooleanArray::from(mask);
     arrow::compute::filter_record_batch(batch, &pred).unwrap_or_else(|_| batch.clone())
@@ -1348,7 +1378,10 @@ pub fn batch_to_json_rows(batch: &RecordBatch) -> Vec<serde_json::Value> {
     for i in 0..n {
         let mut map = serde_json::Map::new();
         for (j, name) in names.iter().enumerate() {
-            map.insert(name.clone(), array_value_to_json(batch.column(j).as_ref(), i));
+            map.insert(
+                name.clone(),
+                array_value_to_json(batch.column(j).as_ref(), i),
+            );
         }
         out.push(serde_json::Value::Object(map));
     }
@@ -1553,10 +1586,7 @@ pub fn naive_scan(files: &[PathBuf], key: &str) -> Result<(Vec<ListenRow>, Durat
 }
 
 /// Collect byte ranges that a RAP query would fetch (for HTTP proof demos).
-pub fn collect_demo_ranges(
-    querier: &RapQuerier,
-    key: &str,
-) -> Result<Vec<(PathBuf, Range<u64>)>> {
+pub fn collect_demo_ranges(querier: &RapQuerier, key: &str) -> Result<Vec<(PathBuf, Range<u64>)>> {
     let mut out = Vec::new();
     for e in querier.index.lookup(key) {
         let path = querier.index.file_path(e.file)?.to_path_buf();
@@ -1592,12 +1622,15 @@ pub fn collect_demo_ranges(
     Ok(out)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{IndexBuilder, load_index};
-    use crate::writer::{WriteMode, WriterOptions, write_sample_dataset};
+    use crate::index::{
+        file_ident_mismatch, load_index, probe_file_ident, stored_ident_for_entry,
+        verify_index_files, FileIdent, IndexBuilder, STALE_FILE_IDENTITY,
+    };
+    use crate::writer::{write_sample_dataset, WriteMode, WriterOptions};
+    use std::io::Write;
 
     fn setup(mode: WriteMode, covering: bool) -> (tempfile::TempDir, RapQuerier, Vec<PathBuf>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1638,11 +1671,7 @@ mod tests {
         for key in ["user_0000", "user_0010", "user_0019"] {
             let rap = querier.query(key).unwrap();
             let (naive, _) = naive_scan(&paths, key).unwrap();
-            assert_eq!(
-                row_sig(&rap.rows),
-                row_sig(&naive),
-                "mismatch for {key}"
-            );
+            assert_eq!(row_sig(&rap.rows), row_sig(&naive), "mismatch for {key}");
             assert_eq!(rap.rows.len(), 8);
         }
     }
@@ -1748,7 +1777,10 @@ mod tests {
             let sum_dur: u64 = res.rows.iter().map(|r| r.duration_ms.max(0) as u64).sum();
             assert_eq!(cov.listen_count, 8);
             assert_eq!(cov.total_duration_ms, sum_dur);
-            assert!(res.covering_hits.iter().any(|h| h.contains("listen_count=8")));
+            assert!(res
+                .covering_hits
+                .iter()
+                .any(|h| h.contains("listen_count=8")));
         }
     }
 
@@ -1847,7 +1879,9 @@ mod tests {
                 );
             }
             assert!(
-                res.page_descriptions.iter().any(|d| d.contains("track_uri")),
+                res.page_descriptions
+                    .iter()
+                    .any(|d| d.contains("track_uri")),
                 "expected track_uri in page_descriptions: {:?}",
                 res.page_descriptions
             );
@@ -1903,5 +1937,128 @@ mod tests {
             .unwrap();
         assert_eq!(res.record_batch().num_rows(), 0);
         assert!(res.rows.is_empty());
+    }
+
+    fn append_byte(path: &Path) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(b"x").unwrap();
+    }
+
+    fn rewrite_same_bytes(path: &Path) {
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn query_fails_on_stale_file_identity() {
+        let (_tmp, querier, paths) = setup(WriteMode::Sorted, true);
+        let key = "user_0000";
+        let ok = querier.query(key).unwrap();
+        assert!(!ok.rows.is_empty(), "unchanged file must query");
+
+        for p in &paths {
+            append_byte(p);
+        }
+
+        let report = verify_index_files(&querier.index.root).unwrap();
+        assert!(
+            !report.stale.is_empty(),
+            "verify must report stale after resize: {report:?}"
+        );
+
+        // Same comparison query uses: stored vs live size/mtime.
+        let e = &querier.index.lookup(key)[0];
+        let stored = stored_ident_for_entry(&querier.index, e);
+        let open = querier.index.file_path(e.file).unwrap();
+        let live = probe_file_ident(&open.to_string_lossy(), open);
+        assert!(
+            file_ident_mismatch(&stored, &live),
+            "query and verify share file_ident_mismatch; stored={stored:?} live={live:?}"
+        );
+
+        let err = querier.query(key).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STALE_FILE_IDENTITY),
+            "expected {STALE_FILE_IDENTITY}, got {msg}"
+        );
+        // Do not mix rows from other files with a stale one.
+        assert!(
+            querier.query(key).is_err(),
+            "stale identity must fail the whole key query"
+        );
+    }
+
+    #[test]
+    fn query_no_verify_returns_data_after_mutation() {
+        let (_tmp, querier, paths) = setup(WriteMode::Sorted, false);
+        let key = "user_0000";
+        let before = querier.query(key).unwrap();
+        assert!(!before.rows.is_empty());
+
+        for p in &paths {
+            rewrite_same_bytes(p);
+        }
+
+        let err = querier.query(key).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STALE_FILE_IDENTITY),
+            "mtime/inode change must fail strict query: {msg}"
+        );
+
+        let after = querier
+            .query_with(
+                key,
+                &QueryOptions {
+                    verify: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(after.rows.len(), before.rows.len());
+        assert!(!after.rows.is_empty());
+    }
+
+    #[test]
+    fn covering_only_skips_stale_identity_io() {
+        let (_tmp, querier, paths) = setup(WriteMode::Sorted, true);
+        for p in &paths {
+            append_byte(p);
+        }
+        let res = querier
+            .query_with(
+                "user_0005",
+                &QueryOptions {
+                    covering_only: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(res.rows.is_empty());
+        assert!(!res.covering_hits.is_empty());
+    }
+
+    #[test]
+    fn file_ident_mismatch_etag_abc_vs_xyz() {
+        let stored = FileIdent {
+            path: "s3://bucket/obj.parquet".into(),
+            etag: Some("abc".into()),
+            size: Some(10),
+            mtime_ms: None,
+        };
+        let live = FileIdent {
+            path: "s3://bucket/obj.parquet".into(),
+            etag: Some("xyz".into()),
+            size: Some(10),
+            mtime_ms: None,
+        };
+        assert!(file_ident_mismatch(&stored, &live));
+        let same = FileIdent {
+            etag: Some("abc".into()),
+            ..live
+        };
+        assert!(!file_ident_mismatch(&stored, &same));
     }
 }

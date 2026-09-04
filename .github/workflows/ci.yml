@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        # -D warnings plus allows for pre-existing style nits; new correctness lints still fail CI.
+        run: >
+          cargo clippy --workspace --all-targets -- -D warnings
+          -A clippy::type_complexity
+          -A clippy::suspicious_open_options
+          -A clippy::cloned_ref_to_slice_refs
+          -A clippy::manual_is_multiple_of
+          -A clippy::unnecessary_cast
+          -A clippy::manual_clamp
+          -A clippy::vec_init_then_push
+          -A clippy::manual_contains
+          -A clippy::single_match
+          -A clippy::collapsible_if
+          -A clippy::ptr_arg
+          -A clippy::manual_map
+          -A clippy::missing_const_for_thread_local
+          -A clippy::len_without_is_empty
+          -A clippy::io_other_error
+          -A clippy::manual_div_ceil
+          -A clippy::question_mark
+          -A clippy::map_clone
+          -A clippy::useless_vec
+          -A clippy::naive_bytecount
+          -A clippy::match_single_binding
+          -A clippy::explicit_auto_deref
+          -A clippy::uninlined_format_args
+          -A clippy::too_many_arguments
+          -A clippy::needless_range_loop
+          -A clippy::chunks_exact_to_as_chunks
+          -A clippy::cmp_owned
+      - name: test
+        run: cargo test --workspace

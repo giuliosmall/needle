@@ -2,14 +2,14 @@
 //! offset index, footer. See `mod.rs` for layout notes.
 
 use super::thrift::{
-    self, ColumnChunkInfo, Kv, PageLoc, RowGroupInfo, SchemaField, CONV_TIMESTAMP_MILLIS,
-    CONV_UTF8, CODEC_ZSTD, ENC_PLAIN, ENC_RLE, TYPE_BYTE_ARRAY, TYPE_INT64,
+    self, ColumnChunkInfo, Kv, PageLoc, RowGroupInfo, SchemaField, CODEC_ZSTD,
+    CONV_TIMESTAMP_MILLIS, CONV_UTF8, ENC_PLAIN, ENC_RLE, TYPE_BYTE_ARRAY, TYPE_INT64,
 };
 use crate::prepared::{
     encode_i64_plain, encode_str_plain, ByteSpan, FrameLoc, ListenRec, PreparedKeyMeta,
     PreparedManifest, ALIGN_BLOCK, ZSTD_SKIPPABLE_MAGIC,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -136,11 +136,8 @@ pub fn write_listens_parquet(
                 align && value_col(col_name),
                 extra.as_deref(),
             );
-            let header = thrift::data_page_v1_header(
-                uncompressed as i32,
-                payload.len() as i32,
-                num_values,
-            );
+            let header =
+                thrift::data_page_v1_header(uncompressed as i32, payload.len() as i32, num_values);
             if header.len() == header_size_guess {
                 break (header, payload, infos);
             }
@@ -453,11 +450,7 @@ pub fn verify_parquet_file(path: &Path) -> Result<String> {
     } else {
         0
     };
-    let created = md
-        .file_metadata()
-        .created_by()
-        .unwrap_or("-")
-        .to_string();
+    let created = md.file_metadata().created_by().unwrap_or("-").to_string();
     Ok(format!(
         "PAR1 ok  rows={rows} row_groups={rgs} cols={cols} created_by={created}"
     ))
@@ -475,7 +468,6 @@ pub fn try_arrow_read(path: &Path) -> Result<usize> {
     }
     Ok(n)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -515,8 +507,8 @@ mod tests {
     fn writes_readable_parquet() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.parquet");
-        let man = write_listens_parquet(&path, &sample(), Layout::ZstdFrames { align: false })
-            .unwrap();
+        let man =
+            write_listens_parquet(&path, &sample(), Layout::ZstdFrames { align: false }).unwrap();
         let proof = verify_parquet_file(&path).unwrap();
         assert!(proof.contains("PAR1 ok"), "{proof}");
         assert_eq!(man.keys.len(), 3);
@@ -546,7 +538,11 @@ mod tests {
         let ka = man.keys.iter().find(|k| k.key == "user_a").unwrap();
         let ts = ka.frames.iter().find(|f| f.column == "timestamp").unwrap();
         let tracks = ka.frames.iter().find(|f| f.column == "track_uri").unwrap();
-        let durs = ka.frames.iter().find(|f| f.column == "duration_ms").unwrap();
+        let durs = ka
+            .frames
+            .iter()
+            .find(|f| f.column == "duration_ms")
+            .unwrap();
         assert_eq!(read_frame_i64(&data, ts).unwrap(), vec![1, 2]);
         assert_eq!(read_frame_str(&data, tracks).unwrap(), vec!["t1", "t2"]);
         assert_eq!(read_frame_i64(&data, durs).unwrap(), vec![10, 20]);
@@ -556,7 +552,8 @@ mod tests {
     fn zstd_multi_frame_page_whole_and_individual() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("frames.parquet");
-        let man = write_listens_parquet(&path, &sample(), Layout::ZstdFrames { align: false }).unwrap();
+        let man =
+            write_listens_parquet(&path, &sample(), Layout::ZstdFrames { align: false }).unwrap();
         let data = fs::read(&path).unwrap();
 
         // Individual frames decode.
@@ -581,8 +578,8 @@ mod tests {
             })
             .collect();
         let start = ts_frames[0].offset as usize;
-        let end = ts_frames.last().unwrap().offset as usize
-            + ts_frames.last().unwrap().size as usize;
+        let end =
+            ts_frames.last().unwrap().offset as usize + ts_frames.last().unwrap().size as usize;
         let page_payload = &data[start..end];
         let plain = zstd::decode_all(page_payload).expect("multi-frame page decode");
         assert_eq!(decode_i64_plain(&plain).unwrap(), vec![1, 2, 3, 4]);
@@ -616,10 +613,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("interleaved.parquet");
         let rows = sample();
-        let man =
-            write_listens_parquet(&path, &rows, Layout::Interleaved { align: true }).unwrap();
+        let man = write_listens_parquet(&path, &rows, Layout::Interleaved { align: true }).unwrap();
         verify_parquet_file(&path).unwrap();
-        assert_eq!(try_arrow_read(&path).unwrap(), 4, "sibling chunks readable by Arrow");
+        assert_eq!(
+            try_arrow_read(&path).unwrap(),
+            4,
+            "sibling chunks readable by Arrow"
+        );
 
         let data = fs::read(&path).unwrap();
         let ka = man.keys.iter().find(|k| k.key == "user_a").unwrap();
@@ -629,7 +629,11 @@ mod tests {
         // Contiguous span should cover the host + skippable sibling frames.
         let ts = ka.frames.iter().find(|f| f.column == "timestamp").unwrap();
         let track = ka.frames.iter().find(|f| f.column == "track_uri").unwrap();
-        let dur = ka.frames.iter().find(|f| f.column == "duration_ms").unwrap();
+        let dur = ka
+            .frames
+            .iter()
+            .find(|f| f.column == "duration_ms")
+            .unwrap();
         assert!(ts.offset >= span.offset);
         assert!(track.offset >= span.offset);
         assert!(dur.offset >= span.offset);
@@ -660,7 +664,10 @@ mod tests {
         }
     }
 
-    fn walk_column_page_headers(data: &[u8], n_cols: usize) -> Vec<super::super::thrift::DataPageV1Header> {
+    fn walk_column_page_headers(
+        data: &[u8],
+        n_cols: usize,
+    ) -> Vec<super::super::thrift::DataPageV1Header> {
         use super::super::thrift::{decode_data_page_v1_header, PAGE_DATA};
         assert_eq!(&data[..4], b"PAR1");
         let mut pos = 4usize;

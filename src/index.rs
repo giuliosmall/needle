@@ -11,13 +11,31 @@
 
 use crate::prepared::{self, ByteSpan, FrameLoc, PreparedManifest};
 use crate::s3::{S3ChunkReader, S3Client};
-use anyhow::{Context, Result, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+
+/// On-disk `registry.json` major version written by this crate.
+pub const INDEX_FORMAT_VERSION: u32 = 1;
+
+/// Exclusive writer lock (`flock` on `<index>/.needle.lock`).
+#[must_use]
+#[derive(Debug)]
+pub struct IndexWriteLock {
+    _file: File,
+}
+
+/// `registry.json` object form (always written; legacy arrays are still read).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexRegistry {
+    pub format_version: u32,
+    pub fragments: Vec<String>,
+}
 
 /// Per-column page location stored directly in the index (article: one page per key).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,9 +77,11 @@ pub struct RapIndexEntry {
     pub file_etag: Option<String>,
     #[serde(default)]
     pub file_size: Option<u64>,
+    #[serde(default)]
+    pub file_mtime_ms: Option<i64>,
 }
 
-/// Identity of a data file referenced by a fragment (size / etag for staleness checks).
+/// Identity of a data file referenced by a fragment (size / etag / mtime for staleness checks).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct FileIdent {
     pub path: String,
@@ -69,6 +89,56 @@ pub struct FileIdent {
     pub etag: Option<String>,
     #[serde(default)]
     pub size: Option<u64>,
+    /// Local filesystem mtime in unix milliseconds. Remote objects leave this unset.
+    #[serde(default)]
+    pub mtime_ms: Option<i64>,
+}
+
+impl FileIdent {
+    /// True when at least one identity field was recorded.
+    pub fn has_identity(&self) -> bool {
+        self.etag.is_some() || self.size.is_some() || self.mtime_ms.is_some()
+    }
+}
+
+/// Token embedded in query errors when a live object no longer matches the index.
+pub const STALE_FILE_IDENTITY: &str = "stale_file_identity";
+
+/// Compare stored vs live identity. Only fields present on **both** sides participate.
+/// Size, ETag, and mtime mismatches are all stale.
+pub fn file_ident_mismatch(stored: &FileIdent, live: &FileIdent) -> bool {
+    let size_mismatch = match (stored.size, live.size) {
+        (Some(want), Some(got)) => want != got,
+        _ => false,
+    };
+    let etag_mismatch = match (&stored.etag, &live.etag) {
+        (Some(want), Some(got)) => want != got,
+        _ => false,
+    };
+    let mtime_mismatch = match (stored.mtime_ms, live.mtime_ms) {
+        (Some(want), Some(got)) => want != got,
+        _ => false,
+    };
+    size_mismatch || etag_mismatch || mtime_mismatch
+}
+
+/// Structured `stale_file_identity` error (JSON object in the message).
+pub fn stale_file_identity_error(stored: &FileIdent, live: Option<&FileIdent>) -> anyhow::Error {
+    let payload = serde_json::json!({
+        "error": STALE_FILE_IDENTITY,
+        "path": stored.path,
+        "stored": {
+            "etag": stored.etag,
+            "size": stored.size,
+            "mtime_ms": stored.mtime_ms,
+        },
+        "live": live.map(|l| serde_json::json!({
+            "etag": l.etag,
+            "size": l.size,
+            "mtime_ms": l.mtime_ms,
+        })),
+    });
+    anyhow!("{payload}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -101,6 +171,9 @@ pub struct IndexFragmentMeta {
     /// Paths removed from the live set (Iceberg overwrite/expire). Applied in registry order.
     #[serde(default)]
     pub dropped_files: Vec<String>,
+    /// Iceberg delete files applied when this fragment was built (`#[serde(default)]` for old manifests).
+    #[serde(default)]
+    pub iceberg_delete_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +270,10 @@ pub struct IndexBuilder {
     store_page_locs: bool,
     key_columns: Vec<String>,
     value_columns: Vec<String>,
+    /// Iceberg position deletes: normalized data-file path → deleted parquet row ids (`pos`).
+    position_deletes: HashMap<String, HashSet<u64>>,
+    /// Iceberg equality-delete records (column → encoded value; `None` = null).
+    equality_deletes: Vec<HashMap<String, Option<String>>>,
 }
 
 impl IndexBuilder {
@@ -208,6 +285,8 @@ impl IndexBuilder {
             store_page_locs: true,
             key_columns: default_key_columns(),
             value_columns: default_value_columns(),
+            position_deletes: HashMap::new(),
+            equality_deletes: Vec::new(),
         }
     }
 
@@ -235,12 +314,25 @@ impl IndexBuilder {
         self
     }
 
+    /// Drop indexed locations whose (data file path, parquet row id) is in a position-delete file.
+    pub fn with_position_deletes(mut self, deletes: HashMap<String, HashSet<u64>>) -> Self {
+        self.position_deletes = deletes;
+        self
+    }
+
+    /// Drop rows whose equality-column values match an Iceberg equality-delete record.
+    pub fn with_equality_deletes(mut self, deletes: Vec<HashMap<String, Option<String>>>) -> Self {
+        self.equality_deletes = deletes;
+        self
+    }
+
     pub fn build_fragment(
         &self,
         parquet_files: &[PathBuf],
         fragment_id: &str,
         note: Option<&str>,
     ) -> Result<PathBuf> {
+        let _lock = try_lock_index(&self.root)?;
         let frag_dir = self.root.join("fragments").join(fragment_id);
         fs::create_dir_all(frag_dir.join("buckets"))?;
 
@@ -261,7 +353,14 @@ impl IndexBuilder {
             file_dict.push(stored.clone());
             path_to_ord.insert(path.clone(), ordinal as u32);
 
-            let key_rows = scan_key_column(path, &self.key_columns, self.covering)?;
+            let pos_deletes = position_deletes_for_file(&self.position_deletes, path);
+            let key_rows = scan_key_column(
+                path,
+                &self.key_columns,
+                self.covering,
+                &pos_deletes,
+                &self.equality_deletes,
+            )?;
             for (key, rows, covering) in key_rows {
                 let page_locs = if self.store_page_locs {
                     capture_page_locs(path, &rows, &self.value_columns).ok()
@@ -287,6 +386,7 @@ impl IndexBuilder {
                     tombstone: false,
                     file_etag: None,
                     file_size: None,
+                    file_mtime_ms: None,
                 });
             }
         }
@@ -317,8 +417,7 @@ impl IndexBuilder {
         for bucket in &mut buckets {
             for e in bucket {
                 if let Some(ident) = file_idents.get(e.file as usize) {
-                    e.file_etag = ident.etag.clone();
-                    e.file_size = ident.size;
+                    apply_file_ident(e, ident);
                 }
             }
         }
@@ -345,6 +444,7 @@ impl IndexBuilder {
             iceberg_snapshot_id,
             file_idents,
             dropped_files: Vec::new(),
+            iceberg_delete_files: Vec::new(),
         };
         serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, &meta)?;
 
@@ -372,13 +472,12 @@ fn merge_prepared_into_buckets(
     for man_path in prepared::find_manifests(data_dir)? {
         let man: PreparedManifest = prepared::load_manifest(&man_path)?;
         let data_abs = data_dir.join(&man.data_file);
-        let prepared_rel = if let Ok(r) =
-            data_abs.strip_prefix(data_dir.parent().unwrap_or(data_dir))
-        {
-            r.to_string_lossy().to_string()
-        } else {
-            data_abs.to_string_lossy().to_string()
-        };
+        let prepared_rel =
+            if let Ok(r) = data_abs.strip_prefix(data_dir.parent().unwrap_or(data_dir)) {
+                r.to_string_lossy().to_string()
+            } else {
+                data_abs.to_string_lossy().to_string()
+            };
 
         // Frames live either inside the Parquet file itself (custom writer) or
         // in a legacy .rapz/.rapi sidecar. Prefer attaching to the parquet ordinal.
@@ -450,6 +549,7 @@ fn merge_prepared_into_buckets(
                     tombstone: false,
                     file_etag: None,
                     file_size: None,
+                    file_mtime_ms: None,
                 });
             }
         }
@@ -569,9 +669,7 @@ pub fn expand_compact_rows(e: &mut RapIndexEntry) {
 }
 
 fn read_bucket_entries(frag_dir: &Path, bi: u32) -> Result<Vec<RapIndexEntry>> {
-    let bin_path = frag_dir
-        .join("buckets")
-        .join(format!("bucket_{bi:03}.bin"));
+    let bin_path = frag_dir.join("buckets").join(format!("bucket_{bi:03}.bin"));
     let jsonl_path = frag_dir
         .join("buckets")
         .join(format!("bucket_{bi:03}.jsonl"));
@@ -602,11 +700,7 @@ pub fn load_index_for_keys(root: impl AsRef<Path>, keys: &[String]) -> Result<Ra
 
 fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapIndex> {
     let root = root.to_path_buf();
-    let registry_path = root.join("registry.json");
-    if !registry_path.exists() {
-        bail!("no RAP index at {} (missing registry.json)", root.display());
-    }
-    let registry: Vec<String> = serde_json::from_reader(File::open(&registry_path)?)?;
+    let registry = read_registry(&root)?;
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut entries_by_key: HashMap<String, Vec<RapIndexEntry>> = HashMap::new();
@@ -625,15 +719,16 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
             let global = files.len() as u32;
             files.push(abs);
             local_to_global.push(global);
-            mark_file_present(&mut dropped, &root, rel);
         }
-        for d in &meta.dropped_files {
-            mark_file_dropped(&mut dropped, &root, d);
-        }
-
-        let wanted: Option<HashSet<u32>> = only_keys.map(|ks| {
-            ks.iter().map(|k| key_bucket(k, meta.num_buckets)).collect()
+        apply_fragment_file_liveness(&mut dropped, &mut entries_by_key, &root, &meta, |ord| {
+            files
+                .get(ord as usize)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
         });
+
+        let wanted: Option<HashSet<u32>> =
+            only_keys.map(|ks| ks.iter().map(|k| key_bucket(k, meta.num_buckets)).collect());
         let keep_keys: Option<HashSet<&str>> =
             only_keys.map(|ks| ks.iter().map(|s| s.as_str()).collect());
 
@@ -680,6 +775,14 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
                 absorb_entry(&mut entries_by_key, e.clone());
             }
         }
+        if is_iceberg_fragment(&meta) {
+            supersede_entries_for_files(&mut entries_by_key, &local_to_global, |ord| {
+                files
+                    .get(ord as usize)
+                    .map(|p| file_compare_id(&root, &p.to_string_lossy()))
+                    .unwrap_or_default()
+            });
+        }
         fragments.push(meta);
     }
     retain_undropped_entries(&mut entries_by_key, &dropped, &root, |ord| {
@@ -701,13 +804,15 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
 }
 
 /// Load file dictionary once (heavy for 300k lakes). Reuse across stress waves.
-pub fn load_index_file_dictionary(root: impl AsRef<Path>) -> Result<(std::sync::Arc<Vec<PathBuf>>, Vec<IndexFragmentMeta>, PathBuf)> {
+pub fn load_index_file_dictionary(
+    root: impl AsRef<Path>,
+) -> Result<(
+    std::sync::Arc<Vec<PathBuf>>,
+    Vec<IndexFragmentMeta>,
+    PathBuf,
+)> {
     let root = root.as_ref().to_path_buf();
-    let registry_path = root.join("registry.json");
-    if !registry_path.exists() {
-        bail!("no RAP index at {} (missing registry.json)", root.display());
-    }
-    let registry: Vec<String> = serde_json::from_reader(File::open(&registry_path)?)?;
+    let registry = read_registry(&root)?;
     let mut files: Vec<PathBuf> = Vec::new();
     let mut fragments = Vec::new();
     for frag_id in registry {
@@ -735,18 +840,18 @@ pub fn load_index_entries_for_keys(
     let mut dropped: HashSet<String> = HashSet::new();
     let mut file_base = 0usize;
     for meta in fragments {
-        for rel in &meta.files {
-            mark_file_present(&mut dropped, root, rel);
-        }
-        for d in &meta.dropped_files {
-            mark_file_dropped(&mut dropped, root, d);
-        }
+        let n_files = meta.files.len();
+        apply_fragment_file_liveness(&mut dropped, &mut entries_by_key, root, meta, |ord| {
+            files
+                .get(ord as usize)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
         let frag_dir = root.join("fragments").join(&meta.fragment_id);
         let wanted: HashSet<u32> = keys
             .iter()
             .map(|k| key_bucket(k, meta.num_buckets))
             .collect();
-        let n_files = meta.files.len();
         for bi in wanted {
             let mut entries = read_bucket_entries(&frag_dir, bi)?;
             for e in &mut entries {
@@ -769,13 +874,21 @@ pub fn load_index_entries_for_keys(
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let rel = meta.files.get(local).map(|s| s.as_str()).unwrap_or("");
-                if file_is_dropped(&dropped, root, rel)
-                    || file_is_dropped(&dropped, root, &stored)
+                if file_is_dropped(&dropped, root, rel) || file_is_dropped(&dropped, root, &stored)
                 {
                     continue;
                 }
                 absorb_entry(&mut entries_by_key, e.clone());
             }
+        }
+        if is_iceberg_fragment(meta) {
+            let new_ords: Vec<u32> = (file_base..file_base + n_files).map(|i| i as u32).collect();
+            supersede_entries_for_files(&mut entries_by_key, &new_ords, |ord| {
+                files
+                    .get(ord as usize)
+                    .map(|p| file_compare_id(root, &p.to_string_lossy()))
+                    .unwrap_or_default()
+            });
         }
         file_base += n_files;
     }
@@ -808,54 +921,248 @@ fn is_remote_uri(s: &str) -> bool {
     S3Client::is_remote_uri(s)
 }
 
-fn probe_remote_ident(uri: &str) -> (Option<String>, Option<u64>) {
+fn probe_remote_ident_s3(uri: &str, s3: Option<&S3Client>) -> (Option<String>, Option<u64>) {
     let Ok((bucket, key)) = S3Client::parse_uri(uri) else {
         return (None, None);
     };
-    match S3Client::from_env().head_object_meta(&bucket, &key) {
+    let owned;
+    let client = match s3 {
+        Some(c) => c,
+        None => {
+            owned = S3Client::from_env();
+            &owned
+        }
+    };
+    match client.head_object_meta(&bucket, &key) {
         Ok(meta) => (meta.etag, Some(meta.size)),
         Err(_) => (None, None),
     }
 }
 
-fn probe_file_ident(stored: &str, open_path: &Path) -> FileIdent {
+fn metadata_mtime_ms(meta: &fs::Metadata) -> Option<i64> {
+    let modified = meta.modified().ok()?;
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).ok(),
+        Err(e) => i64::try_from(e.duration().as_millis()).ok().map(|n| -n),
+    }
+}
+
+fn apply_file_ident(e: &mut RapIndexEntry, ident: &FileIdent) {
+    e.file_etag = ident.etag.clone();
+    e.file_size = ident.size;
+    e.file_mtime_ms = ident.mtime_ms;
+}
+
+/// Probe live size / ETag / mtime. Remote uses `S3Client::head_object_meta`.
+pub fn probe_file_ident(stored: &str, open_path: &Path) -> FileIdent {
+    probe_file_ident_s3(stored, open_path, None)
+}
+
+pub fn probe_file_ident_s3(stored: &str, open_path: &Path, s3: Option<&S3Client>) -> FileIdent {
     if is_remote_uri(stored) {
-        let (etag, size) = probe_remote_ident(stored);
+        let (etag, size) = probe_remote_ident_s3(stored, s3);
         return FileIdent {
             path: stored.to_string(),
             etag,
             size,
+            mtime_ms: None,
         };
     }
-    let size = fs::metadata(open_path)
+    let meta = fs::metadata(open_path)
         .or_else(|_| fs::metadata(stored))
-        .ok()
-        .map(|m| m.len());
+        .ok();
     FileIdent {
         path: stored.to_string(),
         etag: None,
-        size,
+        size: meta.as_ref().map(|m| m.len()),
+        mtime_ms: meta.as_ref().and_then(metadata_mtime_ms),
     }
 }
 
-fn read_registry(root: &Path) -> Result<Vec<String>> {
+/// Stored identity for an index entry (entry fields, else fragment `file_idents`).
+pub fn stored_ident_for_entry(index: &RapIndex, entry: &RapIndexEntry) -> FileIdent {
+    let path = index
+        .file_path(entry.file)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ident = FileIdent {
+        path: path.clone(),
+        etag: entry.file_etag.clone(),
+        size: entry.file_size,
+        mtime_ms: entry.file_mtime_ms,
+    };
+    if ident.has_identity() {
+        return ident;
+    }
+    for frag in &index.fragments {
+        for fi in &frag.file_idents {
+            if ident_path_eq(index, &fi.path, &path) && fi.has_identity() {
+                let mut found = fi.clone();
+                found.path = path;
+                return found;
+            }
+        }
+    }
+    ident
+}
+
+fn ident_path_eq(index: &RapIndex, a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    resolve_data_path(&index.root, a) == resolve_data_path(&index.root, b)
+}
+
+/// HEAD / `fs::metadata` every unique file referenced by `entries`. Fail the whole
+/// key if any stored size/ETag/mtime no longer matches. Skip files with no stored identity.
+pub fn ensure_entries_fresh(
+    index: &RapIndex,
+    entries: &[RapIndexEntry],
+    s3: Option<&S3Client>,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    for e in entries {
+        let open = match index.file_path(e.file) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => continue,
+        };
+        let path_key = open.to_string_lossy().into_owned();
+        if !seen.insert(path_key.clone()) {
+            continue;
+        }
+        let stored = stored_ident_for_entry(index, e);
+        if !stored.has_identity() {
+            continue;
+        }
+        let live = probe_file_ident_s3(&path_key, &open, s3);
+        if !live.has_identity() {
+            return Err(stale_file_identity_error(&stored, None));
+        }
+        if file_ident_mismatch(&stored, &live) {
+            return Err(stale_file_identity_error(&stored, Some(&live)));
+        }
+    }
+    Ok(())
+}
+
+fn lock_path(root: &Path) -> PathBuf {
+    root.join(".needle.lock")
+}
+
+/// Non-blocking exclusive `flock` on `<index>/.needle.lock`.
+/// A second overlapping writer fails with an error containing `index lock`.
+pub fn try_lock_index(root: &Path) -> Result<IndexWriteLock> {
+    fs::create_dir_all(root)?;
+    let path = lock_path(root);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open index lock {}", path.display()))?;
+    // SAFETY: `file` is a live fd we own; flock is released when it is dropped.
+    let mut rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    // Brief retry: sequential writers in one process can see EAGAIN until the
+    // previous fd is fully closed. Overlapping holders still fail.
+    let mut spins = 0;
+    while rc != 0 && spins < 40 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        spins += 1;
+    }
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        bail!(
+            "index lock: exclusive lock on {} is held by another writer ({err})",
+            path.display()
+        );
+    }
+    Ok(IndexWriteLock { _file: file })
+}
+
+fn fragment_ids_from_array(arr: &[serde_json::Value]) -> Result<Vec<String>> {
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("registry fragment id must be a string"))
+        })
+        .collect()
+}
+
+fn parse_registry_json(value: &serde_json::Value) -> Result<Vec<String>> {
+    match value {
+        serde_json::Value::Array(arr) => fragment_ids_from_array(arr),
+        serde_json::Value::Object(map) => {
+            let version = map
+                .get("format_version")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("registry.json missing numeric format_version"))?;
+            if version != u64::from(INDEX_FORMAT_VERSION) {
+                bail!(
+                    "unsupported index format_version {version} (supported: {INDEX_FORMAT_VERSION})"
+                );
+            }
+            let Some(arr) = map.get("fragments").and_then(|v| v.as_array()) else {
+                bail!("registry.json missing fragments array");
+            };
+            fragment_ids_from_array(arr)
+        }
+        _ => bail!("registry.json must be an object or a legacy JSON array of fragment ids"),
+    }
+}
+
+/// Read fragment ids from `registry.json` (v1 object or legacy array).
+pub fn read_registry(root: &Path) -> Result<Vec<String>> {
     let registry_path = root.join("registry.json");
     if !registry_path.exists() {
         bail!("no RAP index at {} (missing registry.json)", root.display());
     }
-    serde_json::from_reader(File::open(&registry_path)?)
-        .with_context(|| format!("read {}", registry_path.display()))
+    let value: serde_json::Value = serde_json::from_reader(File::open(&registry_path)?)
+        .with_context(|| format!("read {}", registry_path.display()))?;
+    parse_registry_json(&value).with_context(|| format!("parse {}", registry_path.display()))
 }
 
-fn write_registry(root: &Path, ids: &[String]) -> Result<()> {
+/// Publish `registry.json` as a v1 object via tmp+rename. Caller must hold the index lock.
+pub fn write_registry(root: &Path, ids: &[String]) -> Result<()> {
+    fs::create_dir_all(root)?;
     let path = root.join("registry.json");
     let tmp = root.join(".registry.json.tmp");
+    let doc = IndexRegistry {
+        format_version: INDEX_FORMAT_VERSION,
+        fragments: ids.to_vec(),
+    };
     {
         let mut f = File::create(&tmp).context("create registry tmp")?;
-        serde_json::to_writer_pretty(&mut f, ids).context("write registry tmp")?;
+        serde_json::to_writer_pretty(&mut f, &doc).context("write registry tmp")?;
         f.sync_all().ok();
     }
     fs::rename(&tmp, &path).context("publish registry.json")
+}
+
+fn gc_unreferenced_fragments(root: &Path, live: &[String]) -> Result<()> {
+    let frag_root = root.join("fragments");
+    if !frag_root.is_dir() {
+        return Ok(());
+    }
+    let live: HashSet<&str> = live.iter().map(String::as_str).collect();
+    for ent in fs::read_dir(&frag_root).with_context(|| format!("read {}", frag_root.display()))? {
+        let ent = ent?;
+        if !ent.file_type()?.is_dir() {
+            continue;
+        }
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if live.contains(name) {
+            continue;
+        }
+        fs::remove_dir_all(ent.path())
+            .with_context(|| format!("remove unreferenced fragment {}", ent.path().display()))?;
+    }
+    Ok(())
 }
 
 fn forgotten_path(root: &Path) -> PathBuf {
@@ -900,6 +1207,119 @@ fn file_is_dropped(dropped: &HashSet<String>, root: &Path, stored: &str) -> bool
     path_identity_keys(root, stored)
         .iter()
         .any(|k| dropped.contains(k))
+}
+
+fn is_iceberg_fragment(meta: &IndexFragmentMeta) -> bool {
+    meta.iceberg_snapshot_id.is_some()
+        || meta
+            .note
+            .as_deref()
+            .is_some_and(|n| n.starts_with("iceberg-snapshot:"))
+}
+
+fn file_compare_id(root: &Path, stored: &str) -> String {
+    if is_remote_uri(stored) {
+        return normalize_stored_key(stored);
+    }
+    let p = resolve_data_path(root, stored);
+    p.canonicalize()
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Iceberg fragments: `dropped_files` first (evict prior entries), then `files` re-add.
+/// Other fragments keep dropped-wins-over-files so existing drop tests stay valid.
+fn apply_fragment_file_liveness(
+    dropped: &mut HashSet<String>,
+    entries_by_key: &mut HashMap<String, Vec<RapIndexEntry>>,
+    root: &Path,
+    meta: &IndexFragmentMeta,
+    file_of: impl Fn(u32) -> String,
+) {
+    if is_iceberg_fragment(meta) {
+        for d in &meta.dropped_files {
+            mark_file_dropped(dropped, root, d);
+        }
+        if !meta.dropped_files.is_empty() {
+            retain_undropped_entries(entries_by_key, dropped, root, &file_of);
+        }
+        for rel in &meta.files {
+            mark_file_present(dropped, root, rel);
+        }
+    } else {
+        for rel in &meta.files {
+            mark_file_present(dropped, root, rel);
+        }
+        for d in &meta.dropped_files {
+            mark_file_dropped(dropped, root, d);
+        }
+    }
+}
+
+/// Later Iceberg fragment entries for a file replace earlier ones (delete re-scan).
+fn supersede_entries_for_files(
+    entries_by_key: &mut HashMap<String, Vec<RapIndexEntry>>,
+    new_ordinals: &[u32],
+    file_id_of: impl Fn(u32) -> String,
+) {
+    if new_ordinals.is_empty() {
+        return;
+    }
+    let new_ord: HashSet<u32> = new_ordinals.iter().copied().collect();
+    let new_ids: HashSet<String> = new_ordinals
+        .iter()
+        .map(|&o| file_id_of(o))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if new_ids.is_empty() {
+        return;
+    }
+    for ents in entries_by_key.values_mut() {
+        ents.retain(|e| new_ord.contains(&e.file) || !new_ids.contains(&file_id_of(e.file)));
+    }
+    entries_by_key.retain(|_, ents| !ents.is_empty());
+}
+
+/// Path aliases used to match Iceberg position-delete `file_path` values to data files.
+pub(crate) fn delete_path_keys(s: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut push = |x: String| {
+        if !x.is_empty() && !keys.contains(&x) {
+            keys.push(x);
+        }
+    };
+    let raw = s.trim();
+    push(raw.to_string());
+    let stripped = if let Some(rest) = raw.strip_prefix("file://") {
+        rest.strip_prefix("localhost").unwrap_or(rest)
+    } else if let Some(rest) = raw.strip_prefix("file:") {
+        rest
+    } else {
+        raw
+    };
+    push(stripped.to_string());
+    push(normalize_stored_key(raw));
+    push(normalize_stored_key(stripped));
+    let p = Path::new(stripped);
+    if let Ok(c) = p.canonicalize() {
+        push(c.to_string_lossy().to_string());
+        push(normalize_stored_key(&c.to_string_lossy()));
+    }
+    keys
+}
+
+fn position_deletes_for_file(map: &HashMap<String, HashSet<u64>>, path: &Path) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    if map.is_empty() {
+        return out;
+    }
+    for k in delete_path_keys(&path.to_string_lossy()) {
+        if let Some(s) = map.get(&k) {
+            out.extend(s.iter().copied());
+        }
+    }
+    out
 }
 
 /// Dropped files on a later fragment must evict entries already absorbed.
@@ -955,11 +1375,10 @@ fn append_forgotten(root: &Path, keys: &[String]) -> Result<()> {
 }
 
 fn last_fragment_meta(root: &Path) -> Result<Option<IndexFragmentMeta>> {
-    let registry_path = root.join("registry.json");
-    if !registry_path.exists() {
+    if !root.join("registry.json").exists() {
         return Ok(None);
     }
-    let registry: Vec<String> = serde_json::from_reader(File::open(&registry_path)?)?;
+    let registry = read_registry(root)?;
     let Some(id) = registry.last() else {
         return Ok(None);
     };
@@ -990,7 +1409,10 @@ fn write_fragment_dir(
     Ok(frag_dir)
 }
 
-fn bucketize_entries(entries: impl IntoIterator<Item = RapIndexEntry>, num_buckets: u32) -> Vec<Vec<RapIndexEntry>> {
+fn bucketize_entries(
+    entries: impl IntoIterator<Item = RapIndexEntry>,
+    num_buckets: u32,
+) -> Vec<Vec<RapIndexEntry>> {
     let n = num_buckets.max(1);
     let mut buckets: Vec<Vec<RapIndexEntry>> = (0..n).map(|_| Vec::new()).collect();
     for e in entries {
@@ -1001,9 +1423,10 @@ fn bucketize_entries(entries: impl IntoIterator<Item = RapIndexEntry>, num_bucke
 }
 
 /// Load all fragments, apply tombstones, last `(key, file)` wins, write one fragment,
-/// rewrite `registry.json` to only that id. Old fragment directories are kept.
+/// rewrite `registry.json` to only that id, and delete unreferenced fragment directories.
 pub fn compact_index(root: impl AsRef<Path>, fragment_id: Option<&str>) -> Result<CompactReport> {
     let root = root.as_ref();
+    let _lock = try_lock_index(root)?;
     let registry = read_registry(root)?;
     let fragment_id = fragment_id
         .map(|s| s.to_string())
@@ -1027,14 +1450,14 @@ pub fn compact_index(root: impl AsRef<Path>, fragment_id: Option<&str>) -> Resul
             local_to_global.push(files.len() as u32);
             files.push(rel.clone());
             resolved.push(resolve_data_path(root, rel));
-            mark_file_present(&mut dropped, root, rel);
         }
-        for d in &meta.dropped_files {
-            mark_file_dropped(&mut dropped, root, d);
-        }
-        if let Some(id) = meta.iceberg_snapshot_id.or_else(|| {
-            meta.note.as_deref().and_then(parse_iceberg_snapshot_note)
-        }) {
+        apply_fragment_file_liveness(&mut dropped, &mut entries_by_key, root, &meta, |ord| {
+            files.get(ord as usize).cloned().unwrap_or_default()
+        });
+        if let Some(id) = meta
+            .iceberg_snapshot_id
+            .or_else(|| meta.note.as_deref().and_then(parse_iceberg_snapshot_note))
+        {
             iceberg_snapshot_id = Some(id);
         }
 
@@ -1062,6 +1485,14 @@ pub fn compact_index(root: impl AsRef<Path>, fragment_id: Option<&str>) -> Resul
                 absorb_entry(&mut entries_by_key, e.clone());
             }
         }
+        if is_iceberg_fragment(&meta) {
+            supersede_entries_for_files(&mut entries_by_key, &local_to_global, |ord| {
+                files
+                    .get(ord as usize)
+                    .map(|s| file_compare_id(root, s))
+                    .unwrap_or_default()
+            });
+        }
         last_meta = Some(meta);
     }
     retain_undropped_entries(&mut entries_by_key, &dropped, root, |ord| {
@@ -1084,15 +1515,12 @@ pub fn compact_index(root: impl AsRef<Path>, fragment_id: Option<&str>) -> Resul
         let mut by_path: HashMap<String, RapIndexEntry> = HashMap::new();
         let mut path_order: Vec<String> = Vec::new();
         for e in ents {
-            let path = files
-                .get(e.file as usize)
-                .cloned()
-                .unwrap_or_else(|| {
-                    resolved
-                        .get(e.file as usize)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                });
+            let path = files.get(e.file as usize).cloned().unwrap_or_else(|| {
+                resolved
+                    .get(e.file as usize)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
             if !by_path.contains_key(&path) {
                 path_order.push(path.clone());
             }
@@ -1121,8 +1549,7 @@ pub fn compact_index(root: impl AsRef<Path>, fragment_id: Option<&str>) -> Resul
         .collect();
     for e in &mut live {
         if let Some(ident) = file_idents.get(e.file as usize) {
-            e.file_etag = ident.etag.clone();
-            e.file_size = ident.size;
+            apply_file_ident(e, ident);
         }
     }
 
@@ -1158,9 +1585,11 @@ pub fn compact_index(root: impl AsRef<Path>, fragment_id: Option<&str>) -> Resul
         iceberg_snapshot_id,
         file_idents,
         dropped_files: Vec::new(),
+        iceberg_delete_files: Vec::new(),
     };
     write_fragment_dir(root, &meta, &buckets)?;
-    write_registry(root, &[fragment_id.clone()])?;
+    write_registry(root, std::slice::from_ref(&fragment_id))?;
+    gc_unreferenced_fragments(root, std::slice::from_ref(&fragment_id))?;
 
     Ok(CompactReport {
         fragment_id,
@@ -1178,6 +1607,7 @@ pub fn forget_keys(
     fragment_id: Option<&str>,
 ) -> Result<PathBuf> {
     let root = root.as_ref();
+    let _lock = try_lock_index(root)?;
     fs::create_dir_all(root)?;
     let prev = last_fragment_meta(root)?;
     let num_buckets = prev.as_ref().map(|m| m.num_buckets.max(1)).unwrap_or(16);
@@ -1189,9 +1619,9 @@ pub fn forget_keys(
         .as_ref()
         .map(|m| m.value_columns.clone())
         .unwrap_or_else(default_value_columns);
-    let fragment_id = fragment_id.map(|s| s.to_string()).unwrap_or_else(|| {
-        format!("forget-{}", chrono::Utc::now().timestamp_millis())
-    });
+    let fragment_id = fragment_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("forget-{}", chrono::Utc::now().timestamp_millis()));
 
     let tombstones: Vec<RapIndexEntry> = keys
         .iter()
@@ -1215,6 +1645,7 @@ pub fn forget_keys(
         iceberg_snapshot_id: None,
         file_idents: Vec::new(),
         dropped_files: Vec::new(),
+        iceberg_delete_files: Vec::new(),
     };
     let frag_dir = write_fragment_dir(root, &meta, &buckets)?;
     append_forgotten(root, keys)?;
@@ -1231,11 +1662,22 @@ pub fn forget_keys(
     Ok(frag_dir)
 }
 
-fn local_file_meta(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|m| m.len())
+fn probe_live_ident(ident: &FileIdent, root: &Path) -> Option<FileIdent> {
+    let open = if is_remote_uri(&ident.path) {
+        PathBuf::from(&ident.path)
+    } else {
+        resolve_data_path(root, &ident.path)
+    };
+    let live = probe_file_ident(&ident.path, &open);
+    if live.has_identity() {
+        Some(live)
+    } else {
+        None
+    }
 }
 
-/// Check stored file identity (size / etag) against the live objects.
+/// Check stored file identity (size / etag / mtime) against the live objects.
+/// Uses the same comparison as the query path (`file_ident_mismatch`).
 pub fn verify_index_files(root: impl AsRef<Path>) -> Result<VerifyReport> {
     let root = root.as_ref();
     let registry = read_registry(root)?;
@@ -1252,8 +1694,7 @@ pub fn verify_index_files(root: impl AsRef<Path>) -> Result<VerifyReport> {
                 .iter()
                 .map(|p| FileIdent {
                     path: p.clone(),
-                    etag: None,
-                    size: None,
+                    ..Default::default()
                 })
                 .collect()
         } else {
@@ -1261,35 +1702,19 @@ pub fn verify_index_files(root: impl AsRef<Path>) -> Result<VerifyReport> {
         };
 
         for ident in idents {
-            let has_ident = ident.etag.is_some() || ident.size.is_some();
-            let live = if is_remote_uri(&ident.path) {
-                let (etag, size) = probe_remote_ident(&ident.path);
-                match size {
-                    Some(sz) => Some((etag, sz)),
-                    None => None,
-                }
-            } else {
-                let resolved = resolve_data_path(root, &ident.path);
-                local_file_meta(&resolved).map(|sz| (None, sz))
-            };
-
+            let live = probe_live_ident(&ident, root);
             match live {
                 None => {
                     checked += 1;
                     stale.push(ident.path);
                 }
-                Some((etag, size)) => {
-                    if !has_ident {
+                Some(live) => {
+                    if !ident.has_identity() {
                         skipped += 1;
                         continue;
                     }
                     checked += 1;
-                    let size_mismatch = ident.size.map(|s| s != size).unwrap_or(false);
-                    let etag_mismatch = match (&ident.etag, &etag) {
-                        (Some(want), Some(got)) => want != got,
-                        _ => false,
-                    };
-                    if size_mismatch || etag_mismatch {
+                    if file_ident_mismatch(&ident, &live) {
                         stale.push(ident.path);
                     }
                 }
@@ -1374,8 +1799,8 @@ fn timestamp_unit_to_ms(raw: i64, unit: arrow::datatypes::TimeUnit) -> i64 {
 
 fn timestamp_raw_at(arr: &dyn arrow::array::Array, i: usize) -> Option<i64> {
     use arrow::array::{
-        Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
     };
     if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
         return Some(a.value(i));
@@ -1412,9 +1837,10 @@ fn timestamp_ms_at(col: &dyn arrow::array::Array, i: usize) -> Option<i64> {
             .as_any()
             .downcast_ref::<Int64Array>()
             .map(|a| a.value(i)),
-        DataType::Date32 => col.as_any().downcast_ref::<Date32Array>().map(|a| {
-            (a.value(i) as i64).saturating_mul(86_400_000)
-        }),
+        DataType::Date32 => col
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .map(|a| (a.value(i) as i64).saturating_mul(86_400_000)),
         DataType::Dictionary(_, _) => {
             macro_rules! dict {
                 ($t:ty) => {
@@ -1438,7 +1864,49 @@ fn timestamp_ms_at(col: &dyn arrow::array::Array, i: usize) -> Option<i64> {
     }
 }
 
-fn encode_array_value(arr: &dyn arrow::array::Array, i: usize) -> Result<String> {
+const UNSUPPORTED_ICEBERG_DELETES: &str =
+    "needle refuses Iceberg tables with unsupported delete files; apply deletes or compact first";
+
+fn equality_row_deleted(
+    batch: &arrow::record_batch::RecordBatch,
+    row: usize,
+    deletes: &[HashMap<String, Option<String>>],
+) -> Result<bool> {
+    if deletes.is_empty() {
+        return Ok(false);
+    }
+    for rec in deletes {
+        if equality_record_matches(batch, row, rec)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn equality_record_matches(
+    batch: &arrow::record_batch::RecordBatch,
+    row: usize,
+    rec: &HashMap<String, Option<String>>,
+) -> Result<bool> {
+    for (col, want) in rec {
+        let arr = batch.column_by_name(col).with_context(|| {
+            format!("{UNSUPPORTED_ICEBERG_DELETES} (missing equality column `{col}`)")
+        })?;
+        let is_null = arr.is_null(row);
+        match (want, is_null) {
+            (None, true) => {}
+            (None, false) | (Some(_), true) => return Ok(false),
+            (Some(w), false) => {
+                if encode_array_value(arr.as_ref(), row)? != *w {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(!rec.is_empty())
+}
+
+pub(crate) fn encode_array_value(arr: &dyn arrow::array::Array, i: usize) -> Result<String> {
     use arrow::array::{
         Date32Array, DictionaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
         UInt32Array, UInt64Array,
@@ -1496,19 +1964,15 @@ fn encode_array_value(arr: &dyn arrow::array::Array, i: usize) -> Result<String>
             Ok(format_date32(days))
         }
         DataType::Timestamp(unit, _) => {
-            let raw = timestamp_raw_at(arr, i)
-                .with_context(|| format!("timestamp array at row {i}"))?;
+            let raw =
+                timestamp_raw_at(arr, i).with_context(|| format!("timestamp array at row {i}"))?;
             Ok(format_timestamp_ms(timestamp_unit_to_ms(raw, *unit)))
         }
         DataType::Dictionary(_, _) => {
             macro_rules! dict {
                 ($t:ty) => {
                     if let Some(d) = arr.as_any().downcast_ref::<DictionaryArray<$t>>() {
-                        let idx = d
-                            .keys()
-                            .value(i)
-                            .to_usize()
-                            .context("dictionary index")?;
+                        let idx = d.keys().value(i).to_usize().context("dictionary index")?;
                         return encode_array_value(d.values().as_ref(), idx);
                     }
                 };
@@ -1622,6 +2086,8 @@ fn scan_key_column(
     path: &Path,
     key_columns: &[String],
     covering: bool,
+    pos_deletes: &HashSet<u64>,
+    equality_deletes: &[HashMap<String, Option<String>>],
 ) -> Result<Vec<(String, Vec<u64>, Option<CoveringValues>)>> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -1632,18 +2098,32 @@ fn scan_key_column(
             .with_context(|| format!("s3 chunk reader {uri}"))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(reader)
             .with_context(|| format!("parquet builder {uri}"))?;
-        return scan_key_column_builder(builder, key_columns, covering);
+        return scan_key_column_builder(
+            builder,
+            key_columns,
+            covering,
+            pos_deletes,
+            equality_deletes,
+        );
     }
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("parquet builder {}", path.display()))?;
-    scan_key_column_builder(builder, key_columns, covering)
+    scan_key_column_builder(
+        builder,
+        key_columns,
+        covering,
+        pos_deletes,
+        equality_deletes,
+    )
 }
 
 fn scan_key_column_builder<T: parquet::file::reader::ChunkReader + 'static>(
     builder: parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder<T>,
     key_columns: &[String],
     covering: bool,
+    pos_deletes: &HashSet<u64>,
+    equality_deletes: &[HashMap<String, Option<String>>],
 ) -> Result<Vec<(String, Vec<u64>, Option<CoveringValues>)>> {
     use arrow::array::{Array, Int64Array, ListArray, StringArray, UInt64Array};
     let schema = builder.schema();
@@ -1706,6 +2186,13 @@ fn scan_key_column_builder<T: parquet::file::reader::ChunkReader + 'static>(
         };
 
         for i in 0..n {
+            let row_id = row_base + i as u64;
+            if pos_deletes.contains(&row_id) {
+                continue;
+            }
+            if equality_row_deleted(&batch, i, equality_deletes)? {
+                continue;
+            }
             let Some(key) = encode_row_key(&batch, key_columns, i)? else {
                 continue;
             };
@@ -1715,8 +2202,7 @@ fn scan_key_column_builder<T: parquet::file::reader::ChunkReader + 'static>(
                 continue;
             }
             if let Some(list) = listens_col {
-                if let Some((count, dur, min_ts, max_ts)) = covering_from_nested_listens(list, i)
-                {
+                if let Some((count, dur, min_ts, max_ts)) = covering_from_nested_listens(list, i) {
                     entry.listen_count = entry.listen_count.saturating_add(count);
                     entry.total_duration_ms = entry.total_duration_ms.saturating_add(dur);
                     if let Some(t) = min_ts {
@@ -1756,8 +2242,9 @@ fn scan_key_column_builder<T: parquet::file::reader::ChunkReader + 'static>(
                 entry.listen_count += 1;
                 if let Some(d) = durations {
                     if !d.is_null(i) {
-                        entry.total_duration_ms =
-                            entry.total_duration_ms.saturating_add(d.value(i).max(0) as u64);
+                        entry.total_duration_ms = entry
+                            .total_duration_ms
+                            .saturating_add(d.value(i).max(0) as u64);
                     }
                 } else if let Some(d) = durations_u64 {
                     if !d.is_null(i) {
@@ -1795,11 +2282,10 @@ fn scan_key_column_builder<T: parquet::file::reader::ChunkReader + 'static>(
     Ok(out)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::{WriteMode, WriterOptions, write_sample_dataset};
+    use crate::writer::{write_sample_dataset, WriteMode, WriterOptions};
     use std::collections::HashSet;
     use std::io::Write;
 
@@ -1856,15 +2342,23 @@ mod tests {
             .build_fragment(&paths, "frag-002", Some("second"))
             .unwrap();
 
-        let registry: Vec<String> =
+        let registry: serde_json::Value =
             serde_json::from_reader(File::open(idx_root.join("registry.json")).unwrap()).unwrap();
-        assert_eq!(registry, vec!["frag-001".to_string(), "frag-002".to_string()]);
+        assert_eq!(registry["format_version"], 1);
+        assert_eq!(
+            registry["fragments"],
+            serde_json::json!(["frag-001", "frag-002"])
+        );
 
         let index = load_index(&idx_root).unwrap();
         assert_eq!(index.fragments.len(), 2);
         // Same key appears in both fragments → multiple entries.
         let entries = index.lookup("user_0000");
-        assert!(entries.len() >= 2, "expected multi-fragment entries, got {}", entries.len());
+        assert!(
+            entries.len() >= 2,
+            "expected multi-fragment entries, got {}",
+            entries.len()
+        );
     }
 
     #[test]
@@ -1911,13 +2405,10 @@ mod tests {
         let index = load_index(&idx_root).unwrap();
 
         // Find a key that landed in >1 file (very likely with 24 users × 6 listens × 4 files).
-        let multi = index
-            .entries_by_key
-            .iter()
-            .find(|(_, ents)| {
-                let files: HashSet<_> = ents.iter().map(|e| e.file).collect();
-                files.len() > 1
-            });
+        let multi = index.entries_by_key.iter().find(|(_, ents)| {
+            let files: HashSet<_> = ents.iter().map(|e| e.file).collect();
+            files.len() > 1
+        });
         assert!(
             multi.is_some(),
             "expected at least one key spanning multiple files"
@@ -2019,12 +2510,12 @@ mod tests {
                 cov_count, 5,
                 "{key}: covering listen_count must be nested list length, not parquet row count"
             );
-            assert!(
-                cov_dur > 0,
-                "{key}: nested duration sum should be hoisted"
-            );
+            assert!(cov_dur > 0, "{key}: nested duration sum should be hoisted");
             assert_eq!(
-                entries.iter().map(|e| e.value_count.unwrap_or(0)).sum::<u64>(),
+                entries
+                    .iter()
+                    .map(|e| e.value_count.unwrap_or(0))
+                    .sum::<u64>(),
                 5
             );
         }
@@ -2119,10 +2610,7 @@ mod tests {
             .unwrap();
         let index = load_index(&idx_root).unwrap();
         let entries = index.lookup(&track);
-        assert!(
-            !entries.is_empty(),
-            "expected hits for track_uri {track}"
-        );
+        assert!(!entries.is_empty(), "expected hits for track_uri {track}");
         let via_encode = index.lookup(&encode_key(&[track.as_str()]));
         assert_eq!(entries.len(), via_encode.len());
     }
@@ -2225,7 +2713,9 @@ mod tests {
         let builder = IndexBuilder::new(&idx_root, 8);
         builder.build_fragment(&paths, "frag-001", None).unwrap();
         forget_keys(&idx_root, &[String::from("user_0000")], Some("forget-001")).unwrap();
-        builder.build_fragment(&paths, "frag-002", Some("later")).unwrap();
+        builder
+            .build_fragment(&paths, "frag-002", Some("later"))
+            .unwrap();
         let index = load_index(&idx_root).unwrap();
         assert!(
             index.lookup("user_0000").is_empty(),
@@ -2241,8 +2731,12 @@ mod tests {
         let idx_root = tmp.path().join("rap-index");
         let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 2)).unwrap();
         let builder = IndexBuilder::new(&idx_root, 8);
-        builder.build_fragment(&paths, "frag-001", Some("first")).unwrap();
-        builder.build_fragment(&paths, "frag-002", Some("second")).unwrap();
+        builder
+            .build_fragment(&paths, "frag-001", Some("first"))
+            .unwrap();
+        builder
+            .build_fragment(&paths, "frag-002", Some("second"))
+            .unwrap();
         forget_keys(&idx_root, &[String::from("user_0000")], Some("forget-001")).unwrap();
 
         let report = compact_index(&idx_root, Some("compact-001")).unwrap();
@@ -2251,12 +2745,14 @@ mod tests {
         assert!(report.keys >= 1);
         assert!(report.entries >= 1);
 
-        let registry: Vec<String> =
+        let registry: serde_json::Value =
             serde_json::from_reader(File::open(idx_root.join("registry.json")).unwrap()).unwrap();
-        assert_eq!(registry.len(), 1);
-        assert_eq!(registry[0], "compact-001");
-        assert!(idx_root.join("fragments").join("frag-001").exists());
-        assert!(idx_root.join("fragments").join("frag-002").exists());
+        assert_eq!(registry["format_version"], 1);
+        assert_eq!(registry["fragments"], serde_json::json!(["compact-001"]));
+        assert!(!idx_root.join("fragments").join("frag-001").exists());
+        assert!(!idx_root.join("fragments").join("frag-002").exists());
+        assert!(!idx_root.join("fragments").join("forget-001").exists());
+        assert!(idx_root.join("fragments").join("compact-001").exists());
 
         let index = load_index(&idx_root).unwrap();
         assert!(index.lookup("user_0000").is_empty());
@@ -2315,9 +2811,11 @@ mod tests {
                 continue;
             }
             let only_here = ents.iter().all(|e| {
-                index.file_path(e.file).ok().map(|p| {
-                    p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == want
-                }).unwrap_or(false)
+                index
+                    .file_path(e.file)
+                    .ok()
+                    .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == want)
+                    .unwrap_or(false)
             });
             if only_here {
                 return k.clone();
@@ -2339,10 +2837,7 @@ mod tests {
         assert!(ok.stale.is_empty(), "fresh index should be clean: {ok:?}");
         assert!(ok.checked >= 1);
 
-        let mut f = fs::OpenOptions::new()
-            .append(true)
-            .open(&paths[0])
-            .unwrap();
+        let mut f = fs::OpenOptions::new().append(true).open(&paths[0]).unwrap();
         f.write_all(b"x").unwrap();
         drop(f);
 
@@ -2351,5 +2846,183 @@ mod tests {
             !bad.stale.is_empty(),
             "resized parquet must be reported stale: {bad:?}"
         );
+
+        let ident = &load_index(&idx_root).unwrap().fragments[0].file_idents[0];
+        let live = probe_file_ident(ident.path.as_str(), &paths[0]);
+        assert!(
+            file_ident_mismatch(ident, &live),
+            "verify uses file_ident_mismatch; stored={ident:?} live={live:?}"
+        );
+    }
+
+    #[test]
+    fn file_ident_mismatch_etag_abc_vs_xyz() {
+        let stored = FileIdent {
+            path: "s3://b/k".into(),
+            etag: Some("abc".into()),
+            size: Some(4),
+            mtime_ms: None,
+        };
+        let live = FileIdent {
+            etag: Some("xyz".into()),
+            ..stored.clone()
+        };
+        assert!(file_ident_mismatch(&stored, &live));
+        assert!(!file_ident_mismatch(&stored, &stored));
+    }
+
+    #[test]
+    fn local_index_persists_size_and_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 1)).unwrap();
+        IndexBuilder::new(&idx_root, 4)
+            .build_fragment(&paths, "frag-mt", None)
+            .unwrap();
+        let man = idx_root
+            .join("fragments")
+            .join("frag-mt")
+            .join("manifest.json");
+        let meta: IndexFragmentMeta = serde_json::from_reader(File::open(&man).unwrap()).unwrap();
+        assert!(
+            !meta.file_idents.is_empty(),
+            "fragment should store file_idents"
+        );
+        assert!(meta.file_idents[0].size.is_some());
+        assert!(
+            meta.file_idents[0].mtime_ms.is_some(),
+            "local ident must persist mtime_ms: {:?}",
+            meta.file_idents[0]
+        );
+        let index = load_index(&idx_root).unwrap();
+        let e = &index.lookup("user_0000")[0];
+        assert!(e.file_size.is_some());
+        assert!(e.file_mtime_ms.is_some());
+    }
+
+    #[test]
+    fn load_legacy_array_registry_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 1)).unwrap();
+        IndexBuilder::new(&idx_root, 4)
+            .build_fragment(&paths, "frag-001", None)
+            .unwrap();
+        serde_json::to_writer_pretty(
+            File::create(idx_root.join("registry.json")).unwrap(),
+            &vec!["frag-001".to_string()],
+        )
+        .unwrap();
+        let index = load_index(&idx_root).unwrap();
+        assert_eq!(index.fragments.len(), 1);
+        assert!(!index.lookup("user_0000").is_empty());
+    }
+
+    #[test]
+    fn load_unsupported_format_version_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 1)).unwrap();
+        IndexBuilder::new(&idx_root, 4)
+            .build_fragment(&paths, "frag-001", None)
+            .unwrap();
+        serde_json::to_writer_pretty(
+            File::create(idx_root.join("registry.json")).unwrap(),
+            &serde_json::json!({"format_version": 99, "fragments": ["frag-001"]}),
+        )
+        .unwrap();
+        let err = load_index(&idx_root).expect_err("format_version 99 must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported index format_version"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn write_registry_is_format_version_1_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 1)).unwrap();
+        IndexBuilder::new(&idx_root, 4)
+            .build_fragment(&paths, "frag-001", None)
+            .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_reader(File::open(idx_root.join("registry.json")).unwrap()).unwrap();
+        assert!(
+            raw.is_object(),
+            "registry.json must be an object, got {raw}"
+        );
+        assert_eq!(raw["format_version"], 1);
+        assert_eq!(raw["fragments"], serde_json::json!(["frag-001"]));
+    }
+
+    #[test]
+    fn try_lock_index_is_exclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("rap-index");
+        let _held = try_lock_index(&root).unwrap();
+        let err = try_lock_index(&root).expect_err("second lock must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("index lock"), "got: {msg}");
+    }
+
+    #[test]
+    fn overlapping_build_fragment_second_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 1)).unwrap();
+        let idx_root = std::sync::Arc::new(idx_root);
+        let paths = std::sync::Arc::new(paths);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder_root = idx_root.clone();
+        let holder = std::thread::spawn(move || {
+            let _lock = try_lock_index(&holder_root).unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let err = IndexBuilder::new(idx_root.as_path(), 4)
+            .build_fragment(&paths, "frag-a", None)
+            .expect_err("overlapping build_fragment must fail");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("index lock"), "got: {msg}");
+    }
+
+    #[test]
+    fn compact_gc_leaves_only_compact_fragment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 2)).unwrap();
+        let builder = IndexBuilder::new(&idx_root, 8);
+        builder
+            .build_fragment(&paths, "frag-001", Some("first"))
+            .unwrap();
+        builder
+            .build_fragment(&paths, "frag-002", Some("second"))
+            .unwrap();
+        forget_keys(&idx_root, &[String::from("user_0000")], Some("forget-001")).unwrap();
+
+        compact_index(&idx_root, Some("compact-only")).unwrap();
+        let mut names: Vec<String> = fs::read_dir(idx_root.join("fragments"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["compact-only".to_string()]);
+        assert!(idx_root.join("forgotten.jsonl").exists());
+        let index = load_index(&idx_root).unwrap();
+        assert!(index.lookup("user_0000").is_empty());
+        assert!(!index.lookup("user_0001").is_empty());
     }
 }

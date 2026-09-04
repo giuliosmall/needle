@@ -9,7 +9,7 @@ use super::thrift::{
     CONV_TIMESTAMP_MILLIS, CONV_UTF8, ENC_PLAIN, ENC_RLE, TYPE_BYTE_ARRAY, TYPE_INT64,
 };
 use super::tiny::TinyRow;
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 const MAGIC: &[u8; 4] = b"PAR1";
 const CREATED_BY: &str = "rap-rust parquet_lowlevel paged-plain 0.1.0";
@@ -177,11 +177,8 @@ where
         let last = (first + page_rows).min(rows.len());
         let slice = &rows[first..last];
         let payload_len: usize = slice.iter().map(|r| 4 + get(r).len()).sum();
-        let header = thrift::data_page_v1_header(
-            payload_len as i32,
-            payload_len as i32,
-            slice.len() as i32,
-        );
+        let header =
+            thrift::data_page_v1_header(payload_len as i32, payload_len as i32, slice.len() as i32);
         let page_offset = buf.len() as u64;
         buf.extend_from_slice(&header);
         for r in slice {
@@ -236,11 +233,8 @@ where
         let last = (first + page_rows).min(rows.len());
         let slice = &rows[first..last];
         let payload_len = slice.len() * 8;
-        let header = thrift::data_page_v1_header(
-            payload_len as i32,
-            payload_len as i32,
-            slice.len() as i32,
-        );
+        let header =
+            thrift::data_page_v1_header(payload_len as i32, payload_len as i32, slice.len() as i32);
         let page_offset = buf.len() as u64;
         buf.extend_from_slice(&header);
         for r in slice {
@@ -325,7 +319,9 @@ mod tests {
     use crate::parquet_lowlevel::tiny::TinyRow;
     use arrow::array::{Int64Array, StringArray};
     use bytes::Bytes;
-    use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+    use parquet::arrow::arrow_reader::{
+        ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+    };
     use parquet::file::metadata::PageIndexPolicy;
 
     struct Row {
@@ -382,7 +378,12 @@ mod tests {
             "expected many pages, got {}",
             meta.pages.len()
         );
-        let max_page = meta.pages.iter().map(|p| p.compressed_size as u64).max().unwrap();
+        let max_page = meta
+            .pages
+            .iter()
+            .map(|p| p.compressed_size as u64)
+            .max()
+            .unwrap();
         assert!(
             (max_page as u64) * 4 < buf.len() as u64 / 4,
             "pages should be ≪ file (max_page={max_page} file={})",
@@ -390,8 +391,8 @@ mod tests {
         );
 
         let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-        let arrow_meta =
-            ArrowReaderMetadata::load(&Bytes::from(buf.clone()), options).expect("load with OffsetIndex");
+        let arrow_meta = ArrowReaderMetadata::load(&Bytes::from(buf.clone()), options)
+            .expect("load with OffsetIndex");
         let oi = arrow_meta
             .metadata()
             .offset_index()

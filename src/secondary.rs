@@ -11,8 +11,8 @@
 //!     hash/buckets/bucket_NNN.bin|.jsonl   - O(1) exact
 //!     sorted/entries.bin|.jsonl            - range scans (keys sorted)
 
-use crate::index::{key_bucket, RapIndexEntry};
-use anyhow::{Context, Result, bail};
+use crate::index::{key_bucket, read_registry, RapIndexEntry};
+use anyhow::{bail, Context, Result};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,15 +57,15 @@ pub struct SecondaryIndex {
 
 impl SecondaryIndex {
     pub fn lookup_exact(&self, key: &str) -> &[SecondaryRef] {
-        self.by_key
-            .get(key)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.by_key.get(key).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Inclusive range over secondary keys (lexicographic).
     pub fn lookup_range(&self, start: &str, end: &str) -> Vec<&SecondaryRef> {
-        let lo = self.sorted_keys.binary_search_by(|k| k.as_str().cmp(start)).unwrap_or_else(|i| i);
+        let lo = self
+            .sorted_keys
+            .binary_search_by(|k| k.as_str().cmp(start))
+            .unwrap_or_else(|i| i);
         let mut out = Vec::new();
         for k in &self.sorted_keys[lo..] {
             if k.as_str() > end {
@@ -83,11 +83,7 @@ impl SecondaryIndex {
     }
 }
 
-pub fn secondary_index_root(
-    index_root: &Path,
-    fragment_id: &str,
-    dimension: &str,
-) -> PathBuf {
+pub fn secondary_index_root(index_root: &Path, fragment_id: &str, dimension: &str) -> PathBuf {
     index_root
         .join("fragments")
         .join(fragment_id)
@@ -111,8 +107,7 @@ pub fn build_secondary(
     fs::create_dir_all(out.join("hash").join("buckets"))?;
     fs::create_dir_all(out.join("sorted"))?;
 
-    let mut buckets: Vec<Vec<SecondaryRef>> =
-        (0..num_buckets.max(1)).map(|_| Vec::new()).collect();
+    let mut buckets: Vec<Vec<SecondaryRef>> = (0..num_buckets.max(1)).map(|_| Vec::new()).collect();
     let mut all_refs: Vec<SecondaryRef> = Vec::new();
 
     for (ordinal, rel) in primary_manifest.files.iter().enumerate() {
@@ -195,8 +190,7 @@ pub fn load_secondary(
             index_root.display()
         );
     }
-    let meta: SecondaryManifest =
-        serde_json::from_reader(File::open(root.join("manifest.json"))?)?;
+    let meta: SecondaryManifest = serde_json::from_reader(File::open(root.join("manifest.json"))?)?;
 
     let mut idx = SecondaryIndex {
         dimension: meta.dimension.clone(),
@@ -218,7 +212,10 @@ pub fn load_secondary(
     let mut sorted_keys = Vec::new();
     for r in refs {
         if sorted_keys.last().map(|k| k != &r.key).unwrap_or(true) {
-            if sorted_keys.last().map(|k: &String| k.as_str() < r.key.as_str()).unwrap_or(true)
+            if sorted_keys
+                .last()
+                .map(|k: &String| k.as_str() < r.key.as_str())
+                .unwrap_or(true)
                 || sorted_keys.is_empty()
             {
                 // keep unique sorted keys
@@ -237,8 +234,7 @@ pub fn load_secondary(
 
 /// Auto-discover fragment ids that have a secondary for `dimension`.
 pub fn load_secondary_any(index_root: &Path, dimension: &str) -> Result<SecondaryIndex> {
-    let registry: Vec<String> =
-        serde_json::from_reader(File::open(index_root.join("registry.json"))?)?;
+    let registry = read_registry(index_root)?;
     for frag in registry.iter().rev() {
         let p = secondary_index_root(index_root, frag, dimension);
         if p.join("manifest.json").exists() {
@@ -299,8 +295,7 @@ fn scan_dimension(
                         {
                             if let Some(arr) = v.get("listens").and_then(|x| x.as_array()) {
                                 for item in arr {
-                                    if let Some(t) =
-                                        item.get("track_uri").and_then(|x| x.as_str())
+                                    if let Some(t) = item.get("track_uri").and_then(|x| x.as_str())
                                     {
                                         map.entry(t.to_string())
                                             .or_default()
@@ -391,12 +386,11 @@ pub fn refs_to_primary_entries(refs: &[SecondaryRef]) -> Vec<RapIndexEntry> {
         .collect()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::IndexBuilder;
-    use crate::writer::{WriteMode, WriterOptions, write_sample_dataset};
+    use crate::writer::{write_sample_dataset, WriteMode, WriterOptions};
 
     fn build_with_secondary() -> (tempfile::TempDir, SecondaryIndex, String) {
         let tmp = tempfile::tempdir().unwrap();

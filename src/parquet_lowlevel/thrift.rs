@@ -438,7 +438,9 @@ pub fn decode_offset_index(bytes: &[u8]) -> Result<(Vec<PageLoc>, usize), String
             continue;
         }
         if ty != LIST {
-            return Err(format!("OffsetIndex.page_locations type {ty}, expected list"));
+            return Err(format!(
+                "OffsetIndex.page_locations type {ty}, expected list"
+            ));
         }
         let header = r.read_u8()?;
         let elem = header & 0x0f;
@@ -679,7 +681,6 @@ fn write_logical(c: &mut Compact, kind: &str) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,7 +688,11 @@ mod tests {
     fn assert_page_header_roundtrip(uncomp: i32, comp: i32, nvals: i32) {
         let bytes = data_page_v1_header(uncomp, comp, nvals);
         let (hdr, consumed) = decode_data_page_v1_header(&bytes).expect("decode");
-        assert_eq!(consumed, bytes.len(), "decoder must consume the whole header");
+        assert_eq!(
+            consumed,
+            bytes.len(),
+            "decoder must consume the whole header"
+        );
         assert_eq!(hdr.page_type, PAGE_DATA);
         assert_eq!(hdr.uncompressed_page_size, uncomp);
         assert_eq!(hdr.compressed_page_size, comp);

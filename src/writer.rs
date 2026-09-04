@@ -284,10 +284,13 @@ fn write_one_page_per_key(path: &Path, listens: &[Listen], opts: &WriterOptions)
     // calling `flush` between keys when available.
     let max_key = listens
         .iter()
-        .fold(std::collections::HashMap::<&str, usize>::new(), |mut m, l| {
-            *m.entry(&l.user_id).or_default() += 1;
-            m
-        })
+        .fold(
+            std::collections::HashMap::<&str, usize>::new(),
+            |mut m, l| {
+                *m.entry(&l.user_id).or_default() += 1;
+                m
+            },
+        )
         .into_values()
         .max()
         .unwrap_or(1);
@@ -482,7 +485,6 @@ fn write_cogrouped(path: &Path, listens: &[Listen], opts: &WriterOptions) -> Res
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,7 +493,10 @@ mod tests {
 
     fn count_rows(path: &Path) -> usize {
         let file = File::open(path).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
         reader.map(|b| b.unwrap().num_rows()).sum()
     }
 
@@ -556,10 +561,7 @@ mod tests {
         let total: usize = paths.iter().map(|p| count_rows(p)).sum();
         assert_eq!(total, 12);
         for p in &paths {
-            assert_eq!(
-                schema_names(p),
-                vec!["user_id", "payload", "payload_bytes"]
-            );
+            assert_eq!(schema_names(p), vec!["user_id", "payload", "payload_bytes"]);
         }
     }
 

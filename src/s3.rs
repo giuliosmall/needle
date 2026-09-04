@@ -4,15 +4,15 @@
 //! `HttpRange` (no reqwest). Supports Range GET, full GET, PUT, HEAD, ListObjectsV2.
 //! Anonymous GET works when the bucket allows download (our lake setup).
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -211,15 +211,26 @@ impl S3Client {
     pub fn put_object(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
         let uri = self.object_path(bucket, key);
         // MinIO accepts UNSIGNED-PAYLOAD; hashing 1M tiny bodies was wasted CPU.
-        let (status, _h, resp) =
-            self.http("PUT", bucket, &uri, "", body, "UNSIGNED-PAYLOAD", None, true)?;
+        let (status, _h, resp) = self.http(
+            "PUT",
+            bucket,
+            &uri,
+            "",
+            body,
+            "UNSIGNED-PAYLOAD",
+            None,
+            true,
+        )?;
         if !(200..300).contains(&status) {
             self.stats.mc_fallbacks.fetch_add(1, Ordering::Relaxed);
             static FIRST: std::sync::Once = std::sync::Once::new();
             FIRST.call_once(|| {
                 eprintln!(
                     "S3 PUT fallback status={status} uri={uri} body_prefix={}",
-                    String::from_utf8_lossy(&resp).chars().take(300).collect::<String>()
+                    String::from_utf8_lossy(&resp)
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
                 );
             });
             // Fallback: mc cp (handles SigV4); keeps lake generate unblocked.
@@ -262,16 +273,12 @@ impl S3Client {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        let tmp = std::env::temp_dir().join(format!(
-            "rap-put-{}-{}.bin",
-            std::process::id(),
-            {
-                use sha2::{Digest, Sha256};
-                let mut h = Sha256::new();
-                h.update(key.as_bytes());
-                hex::encode(&h.finalize()[..8])
-            }
-        ));
+        let tmp = std::env::temp_dir().join(format!("rap-put-{}-{}.bin", std::process::id(), {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(key.as_bytes());
+            hex::encode(&h.finalize()[..8])
+        }));
         std::fs::write(&tmp, body)?;
         let dest = format!("local/{bucket}/{key}");
         let st = Command::new(&mc)
@@ -282,10 +289,7 @@ impl S3Client {
             .context("mc cp")?;
         let _ = std::fs::remove_file(&tmp);
         if !st.status.success() {
-            bail!(
-                "mc cp failed: {}",
-                String::from_utf8_lossy(&st.stderr)
-            );
+            bail!("mc cp failed: {}", String::from_utf8_lossy(&st.stderr));
         }
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -319,8 +323,16 @@ impl S3Client {
         let end_incl = range.end.saturating_sub(1);
         let range_hdr = format!("bytes={}-{}", range.start, end_incl);
         let sign = !self.cfg.anonymous_read;
-        let (status, _h, body) =
-            self.http("GET", bucket, &uri, "", &[], &payload_hash, Some(&range_hdr), sign)?;
+        let (status, _h, body) = self.http(
+            "GET",
+            bucket,
+            &uri,
+            "",
+            &[],
+            &payload_hash,
+            Some(&range_hdr),
+            sign,
+        )?;
         if !(status == 206 || status == 200) {
             bail!(
                 "S3 Range GET {uri} {range_hdr} status {status}: {}",
@@ -466,8 +478,7 @@ impl S3Client {
         };
 
         let auth_header = if sign {
-            let credential_scope =
-                format!("{}/{}/s3/aws4_request", date_stamp, self.cfg.region);
+            let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, self.cfg.region);
             let mut pairs: Vec<(String, String)> = vec![
                 ("host".into(), host.clone()),
                 ("x-amz-content-sha256".into(), payload_hash.to_string()),
@@ -477,10 +488,8 @@ impl S3Client {
                 pairs.push(("range".into(), r.to_string()));
             }
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            let canonical_headers: String = pairs
-                .iter()
-                .map(|(n, v)| format!("{n}:{v}\n"))
-                .collect();
+            let canonical_headers: String =
+                pairs.iter().map(|(n, v)| format!("{n}:{v}\n")).collect();
             let signed_headers = pairs
                 .iter()
                 .map(|(n, _)| n.as_str())
@@ -493,15 +502,9 @@ impl S3Client {
                 "{method}\n{encoded_uri}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
             );
             let canonical_hash = hex_sha256(canonical_request.as_bytes());
-            let string_to_sign = format!(
-                "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_hash}"
-            );
-            let key = signing_key(
-                &self.cfg.secret_key,
-                &date_stamp,
-                &self.cfg.region,
-                "s3",
-            )?;
+            let string_to_sign =
+                format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_hash}");
+            let key = signing_key(&self.cfg.secret_key, &date_stamp, &self.cfg.region, "s3")?;
             let signature = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes())?);
             format!(
                 "Authorization: AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}\r\n",
@@ -607,15 +610,13 @@ thread_local! {
 }
 
 fn take_pooled(addr: &str) -> Option<S3Stream> {
-    POOLED.with(|slot| {
-        match slot.borrow_mut().take() {
-            Some((h, s)) if h == addr => Some(s),
-            Some((_, s)) => {
-                drop(s);
-                None
-            }
-            None => None,
+    POOLED.with(|slot| match slot.borrow_mut().take() {
+        Some((h, s)) if h == addr => Some(s),
+        Some((_, s)) => {
+            drop(s);
+            None
         }
+        None => None,
     })
 }
 
@@ -762,9 +763,12 @@ fn parse_head_headers(headers: &str) -> Result<HeadObject> {
             continue;
         };
         if name.trim().eq_ignore_ascii_case("content-length") {
-            size = Some(value.trim().parse::<u64>().with_context(|| {
-                format!("S3 HEAD Content-Length {}", value.trim())
-            })?);
+            size = Some(
+                value
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| format!("S3 HEAD Content-Length {}", value.trim()))?,
+            );
         } else if name.trim().eq_ignore_ascii_case("etag") {
             let v = value.trim().trim_matches('"');
             if !v.is_empty() {
@@ -858,7 +862,9 @@ fn is_s3_service_host(lower: &str) -> bool {
         return true;
     }
     if let Some(rest) = lower.strip_prefix("s3.") {
-        return rest == "amazonaws.com" || rest.ends_with(".amazonaws.com") || rest.ends_with("amazonaws.com");
+        return rest == "amazonaws.com"
+            || rest.ends_with(".amazonaws.com")
+            || rest.ends_with("amazonaws.com");
     }
     if let Some(rest) = lower.strip_prefix("s3-") {
         return rest.ends_with(".amazonaws.com") || rest.ends_with("amazonaws.com");
@@ -938,7 +944,6 @@ impl crate::storage::RangeReader for S3RangeReader {
     }
 }
 
-
 /// Parquet `ChunkReader` over MinIO Range GETs (fat-file RAP decode).
 ///
 /// Footer parse uses `get_read` near EOF (a few bytes). With OffsetIndex +
@@ -952,7 +957,11 @@ pub struct S3ChunkReader {
 }
 
 impl S3ChunkReader {
-    pub fn open(client: S3Client, bucket: impl Into<String>, key: impl Into<String>) -> Result<Self> {
+    pub fn open(
+        client: S3Client,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<Self> {
         let bucket = bucket.into();
         let key = key.into();
         let len = match client.head_object_meta(&bucket, &key) {
@@ -1085,14 +1094,12 @@ mod tests {
         let (b, k) = S3Client::parse_uri("https://bucket.s3.amazonaws.com/key").unwrap();
         assert_eq!(b, "bucket");
         assert_eq!(k, "key");
-        let (b, k) = S3Client::parse_uri(
-            "https://my-bucket.s3.us-east-1.amazonaws.com/path/to/obj.parquet",
-        )
-        .unwrap();
+        let (b, k) =
+            S3Client::parse_uri("https://my-bucket.s3.us-east-1.amazonaws.com/path/to/obj.parquet")
+                .unwrap();
         assert_eq!(b, "my-bucket");
         assert_eq!(k, "path/to/obj.parquet");
-        let (b, k) =
-            S3Client::parse_uri("https://bucket.s3.amazonaws.com:443/dir/file").unwrap();
+        let (b, k) = S3Client::parse_uri("https://bucket.s3.amazonaws.com:443/dir/file").unwrap();
         assert_eq!(b, "bucket");
         assert_eq!(k, "dir/file");
     }
@@ -1115,7 +1122,9 @@ mod tests {
 
     #[test]
     fn is_remote_uri_https() {
-        assert!(S3Client::is_remote_uri("https://bucket.s3.amazonaws.com/key"));
+        assert!(S3Client::is_remote_uri(
+            "https://bucket.s3.amazonaws.com/key"
+        ));
         assert!(S3Client::is_remote_uri("https://host/bucket/key"));
         assert!(S3Client::is_remote_uri("s3://bucket/key"));
         assert!(S3Client::is_remote_uri("s3a://bucket/key"));
@@ -1188,14 +1197,12 @@ mod tests {
 
     #[test]
     fn parse_etag_header_any_case() {
-        let m = parse_head_headers(
-            "HTTP/1.1 200 OK\r\nContent-Length: 42\r\nETag: \"abcDEF\"\r\n",
-        )
-        .unwrap();
+        let m = parse_head_headers("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nETag: \"abcDEF\"\r\n")
+            .unwrap();
         assert_eq!(m.size, 42);
         assert_eq!(m.etag.as_deref(), Some("abcDEF"));
-        let m2 = parse_head_headers("HTTP/1.1 200 OK\r\ncontent-length: 1\r\netag: xyz\r\n")
-            .unwrap();
+        let m2 =
+            parse_head_headers("HTTP/1.1 200 OK\r\ncontent-length: 1\r\netag: xyz\r\n").unwrap();
         assert_eq!(m2.size, 1);
         assert_eq!(m2.etag.as_deref(), Some("xyz"));
     }
@@ -1216,7 +1223,10 @@ mod tests {
         let meta = client.head_object_meta("rap-lake", key).unwrap();
         assert_eq!(meta.size, body.len() as u64);
         if let Some(etag) = meta.etag {
-            assert!(!etag.contains('"'), "etag quotes should be stripped: {etag}");
+            assert!(
+                !etag.contains('"'),
+                "etag quotes should be stripped: {etag}"
+            );
         }
     }
 
@@ -1256,7 +1266,11 @@ mod tests {
             snap.mc_fallbacks
         );
         assert!(snap.mc_fallbacks == 0, "PUT used mc fallback");
-        assert!(n2 as f64 / par > 500.0, "parallel PUT too slow: {:.0}/s", n2 as f64 / par);
+        assert!(
+            n2 as f64 / par > 500.0,
+            "parallel PUT too slow: {:.0}/s",
+            n2 as f64 / par
+        );
 
         // Lake keys contain `=` (`date=YYYY-MM-DD/...`); signature must encode them.
         client

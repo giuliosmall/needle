@@ -6,19 +6,19 @@
 
 pub mod iceberg;
 pub mod index;
+pub mod lake;
 pub mod metadata;
 pub mod parquet_lowlevel;
 pub mod prepared;
 pub mod query;
+pub mod s3;
+pub mod secondary;
 pub mod server;
 pub mod sql;
-pub mod secondary;
-pub mod s3;
 pub mod storage;
-pub mod lake;
 pub mod writer;
 
 pub use index::{IndexBuilder, RapIndex, RapIndexEntry};
 pub use metadata::{CachedFileMeta, MetaCache};
-pub use query::{ExplainResult, QueryOptions, QueryResult, RapQuerier, batch_to_json_rows};
-pub use writer::{WriteMode, WriterOptions, write_sample_dataset};
+pub use query::{batch_to_json_rows, ExplainResult, QueryOptions, QueryResult, RapQuerier};
+pub use writer::{write_sample_dataset, WriteMode, WriterOptions};

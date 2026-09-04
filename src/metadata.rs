@@ -3,11 +3,11 @@
 //! Article reader path step 2: "use cached file metadata (footer + page/column
 //! indexes) to map row numbers → byte ranges for needed columns".
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::page_index::offset_index::PageLocation;
-use parquet::file::metadata::PageIndexPolicy;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use std::collections::HashMap;
 use std::fs::File;
 use std::ops::Range;
@@ -42,7 +42,10 @@ impl CachedFileMeta {
     pub fn locate_row(&self, global_row: u64) -> Result<(usize, i64)> {
         let r = global_row as i64;
         if r < 0 || r >= self.num_rows {
-            bail!("row {global_row} out of range (file has {} rows)", self.num_rows);
+            bail!(
+                "row {global_row} out of range (file has {} rows)",
+                self.num_rows
+            );
         }
         for (rg, &start) in self.row_group_starts.iter().enumerate() {
             let count = self.row_group_row_counts[rg];
@@ -268,11 +271,10 @@ pub fn ranged_read(path: &Path, range: &Range<u64>) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::{WriteMode, WriterOptions, write_sample_dataset};
+    use crate::writer::{write_sample_dataset, WriteMode, WriterOptions};
     use parquet::file::page_index::offset_index::PageLocation;
     use std::sync::Arc;
 
@@ -367,7 +369,10 @@ mod tests {
             let (rg0, r0) = &w[0];
             let (rg1, r1) = &w[1];
             if rg0 == rg1 {
-                assert!(r0.end < r1.start, "ranges should not overlap after coalesce");
+                assert!(
+                    r0.end < r1.start,
+                    "ranges should not overlap after coalesce"
+                );
             } else {
                 assert!(rg0 < rg1);
             }

@@ -124,13 +124,18 @@ fragments/<id>/secondary/<dim>/
 `needle query … --http http://127.0.0.1:PORT` issues ranged reads over HTTP and can
 prove bytes match local (`prove_http_matches_local`).
 
-## Gaps vs production RAP
+## Gaps vs production RAP (still out of scope for 0.2 beta)
 
 - Index loaded fully into memory (production would memory-map / cache hot buckets)
 - Interleaving stays spec-valid by duplicating sibling columns in official
   chunks; RAP's one-read span is the skippable-bridged bundle in the host page
 - No Bloom / partition pruning layer (out of scope - RAP replaces within-file scan)
 - Cogrouped nested decode expands lists; page-range demo focuses on flat / blob / prepared
+- Covering aggregates are still listen-shaped (`listen_count` / `total_duration_ms`), not generic
+- Iceberg Hadoop metadata only (no REST / Glue / Nessie catalog)
+- S3 client is hand-rolled SigV4 (no STS session tokens, limited retries)
+- `forget` hides keys in Needle only; it does not delete lake Parquet
+- SQL is over one key's `hits` batch, not the whole lake
 
 ## Demo expectations
 

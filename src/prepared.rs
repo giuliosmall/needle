@@ -4,7 +4,7 @@
 //! This module keeps FrameLoc / manifest / PLAIN encode-decode, plus a
 //! **legacy** `.rapz` / `.rapi` sidecar writer (no longer the generate path).
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -386,7 +386,6 @@ pub fn find_manifests(dir: &Path) -> Result<Vec<PathBuf>> {
     out.sort();
     Ok(out)
 }
-
 
 #[cfg(test)]
 mod tests {

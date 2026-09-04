@@ -145,10 +145,10 @@ maintain it without rewriting lake Parquet:
 | Command | What it does |
 |---------|----------------|
 | `needle forget --key K` | Hide `K` from lookups. Sticky across later data fragments (`forgotten.jsonl`). Does **not** rewrite Parquet. |
-| `needle compact` | Rewrite to one fragment: last `(key, file)` wins, apply forget + Iceberg drops. Old fragment dirs are kept; `registry.json` points at the new id (`compact-<unix-ms>` unless `--fragment` is set). |
-| `needle verify` | Compare stored size / ETag (`file_idents`) to live local files or S3 HEAD. Missing or resized objects are `stale`. |
+| `needle compact` | Rewrite to one fragment: last `(key, file)` wins, apply forget + Iceberg drops. Unreferenced fragment dirs are deleted. `registry.json` (`format_version` 1) points at the new id (`compact-<unix-ms>` unless `--fragment` is set). |
+| `needle verify` | Compare stored size / ETag / mtime (`file_idents`) to live local files or S3 HEAD. Exits non-zero if any file is `stale`. |
 
-`registry.json` is published with tmp+rename. `needled` reloads when that file’s mtime changes, so forget/compact show up without a restart.
+Queries **fail closed** on identity mismatch (`stale_file_identity`) unless you pass `--no-verify` (unsafe). `registry.json` is published with tmp+rename under an exclusive `.needle.lock`. `needled` reloads when that file’s mtime changes, so forget/compact show up without a restart. See [`FORMAT.md`](./FORMAT.md).
 
 ### HTTP daemon
 
@@ -156,18 +156,22 @@ Serve point queries over HTTP (optional `--lazy-buckets`):
 
 ```bash
 needled --index data/rap-index --bind 127.0.0.1:7780
+# production-ish: TLS + bearer (required on non-loopback unless --insecure)
+needled --bind 0.0.0.0:7780 --tls-cert cert.pem --tls-key key.pem --token "$NEEDLED_TOKEN"
 # or
 needle daemon --index data/rap-index
 ```
 
+Loopback (`127.0.0.1`) may stay plaintext with no token for demos. Non-loopback binds require `--tls-cert`/`--tls-key` and `--token` (or `--insecure`, which prints an `INSECURE` warning).
+
 | Method | Path | Notes |
 |--------|------|--------|
-| GET | `/health` | `{"ok": true}` |
-| GET | `/v1/query?key=user_0042` | Same JSON as `needle query --format json` (`rows`, `covering_values`). Optional: `offset`, `limit`, `columns`, `since_ms`, `until_ms`, `covering_only`, `min_listens`. |
-| GET | `/v1/explain?key=user_0042` | Plan: files, pages, estimated Range GETs. |
-| GET | `/v1/stats` | Fragment summary (no bucket load). |
+| GET | `/health` | `{"ok": true}` — unauthenticated |
+| GET | `/v1/query?key=user_0042` | Same JSON as `needle query --format json`. Requires `Authorization: Bearer` when a token is set. Optional: `offset`, `limit`, `columns`, `since_ms`, `until_ms`, `covering_only`, `min_listens`, `verify=0` (unsafe). |
+| GET | `/v1/explain?key=user_0042` | Plan: files, pages, estimated Range GETs. Auth like query. |
+| GET | `/v1/stats` | Fragment summary (no bucket load). Auth like query. |
 
-Env: `NEEDLE_INDEX`, `NEEDLE_BIND`.
+Env: `NEEDLE_INDEX`, `NEEDLE_BIND`, `NEEDLED_TOKEN`.
 
 ### Iceberg
 
@@ -181,9 +185,15 @@ needle iceberg-index --table s3://bucket/warehouse/db/tbl --index data/rap-index
 
 Each run indexes the **current snapshot** incrementally: only newly added data files
 are scanned; files dropped by overwrite/expire are recorded on the fragment
-(`dropped_files`) and evicted on load/compact. Position/equality delete files
-(`content` 1/2) are skipped. Re-running the same snapshot is a no-op. A later
-snapshot that re-adds a previously expired file reindexes it.
+(`dropped_files`) and evicted on load/compact. Iceberg v2 **position** and
+**equality** delete files are applied (deleted rows never appear in lookups).
+Unsupported delete encodings fail closed:
+
+`needle refuses Iceberg tables with unsupported delete files; apply deletes or compact first`
+
+Re-running the same snapshot is a no-op. New delete files that hit already-indexed
+data files re-scan those files. A later snapshot that re-adds a previously expired
+file reindexes it.
 
 ### SQL
 
@@ -264,7 +274,7 @@ sequenceDiagram
 src/
   main.rs              CLI (`needle`)
   needled.rs           HTTP query daemon binary
-  index.rs             External Needle / RAP index (fragments, compact, forget, verify)
+  index.rs             External Needle / RAP index (fragments, compact, forget, verify, format v1)
   iceberg.rs           Incremental Iceberg snapshot → Needle fragments
   query.rs             Point query + Arrow/JSON rows + covering
   server.rs            needled JSON HTTP (`/v1/query`, reload on registry mtime)
@@ -277,6 +287,7 @@ src/
   secondary.rs         Hash + sorted secondary indexes
   parquet_lowlevel/    Custom page writer (frames, align, interleaved, paged)
 tests/                 Unit-adjacent E2E + MinIO smoke
+FORMAT.md              On-disk index format (`format_version`, lock, compact GC)
 NOTES.md               Article mapping & fidelity notes
 ```
 
@@ -284,9 +295,11 @@ NOTES.md               Article mapping & fidelity notes
 
 ## Status / honesty
 
-- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host, MinIO and AWS), Iceberg incremental index (add/drop live-set, remote metadata), compact/forget/verify + file identity, `needled` + SQL over key hits, MinIO lake harness, broad unit/E2E suite.
+**0.2 preview / beta — not production.** This is not Spotify’s RAP.
+
+- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host, MinIO and AWS), Iceberg incremental index (add/drop live-set, v2 position/equality deletes, fail-closed on unsupported deletes), compact/forget/verify, **strict** file identity on query (`--no-verify` unsafe), `needled` TLS + bearer token, versioned `registry.json` + writer lock + compact GC, CI, MinIO lake harness, broad unit/E2E suite.
+- **Still out of scope:** mmap’d huge indexes, generic covering aggregates, REST/Glue/Nessie catalogs, a full AWS SDK S3 client, `forget` as a lake delete, SQL over the whole lake.
 - **Custom Parquet prep** (ZSTD multi-frame pages, skippable alignment, interleaving) uses a low-level writer so layouts live **inside** `.parquet` files readable by Arrow.
-- This is an R&D recreation, not Spotify’s production RAP.
 
 Apache-2.0.
 

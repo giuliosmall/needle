@@ -9,16 +9,45 @@ use crate::index::{
     load_index, load_index_entries_for_keys, load_index_file_dictionary, IndexFragmentMeta,
 };
 use crate::query::{ExplainResult, QueryOptions, QueryResult, RapQuerier};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use clap::Parser;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
+
+/// Clap flags shared by `needled` and `needle daemon`.
+#[derive(Parser, Debug)]
+pub struct DaemonCli {
+    /// RAP index root (registry.json + fragments/).
+    #[arg(long, default_value = "data/rap-index", env = "NEEDLE_INDEX")]
+    pub index: PathBuf,
+    /// Listen address. Default 127.0.0.1:7780 is plaintext HTTP for local demos.
+    /// Port 0 lets the OS pick an ephemeral port. Non-loopback binds require
+    /// `--tls-cert`/`--tls-key` (or `--insecure`).
+    #[arg(long, default_value = "127.0.0.1:7780", env = "NEEDLE_BIND")]
+    pub bind: String,
+    /// Load hash buckets per key instead of the full index at startup.
+    #[arg(long, default_value_t = false)]
+    pub lazy_buckets: bool,
+    /// PEM certificate for TLS (pair with `--tls-key`).
+    #[arg(long, value_name = "PATH")]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key for TLS (PKCS#8, or RSA PKCS#1 which is converted).
+    #[arg(long, value_name = "PATH")]
+    pub tls_key: Option<PathBuf>,
+    /// Bearer token for `/v1/query`, `/v1/explain`, `/v1/stats`. Optional on loopback.
+    #[arg(long, env = "NEEDLED_TOKEN", hide_env_values = true)]
+    pub token: Option<String>,
+    /// Allow plaintext and/or no token on a non-loopback bind (prints an INSECURE warning).
+    #[arg(long, default_value_t = false)]
+    pub insecure: bool,
+}
 
 /// Bind / load options for [`start`] and [`serve_forever`].
 pub struct DaemonOptions {
@@ -27,18 +56,149 @@ pub struct DaemonOptions {
     pub bind: String,
     /// If true, keep the file dictionary and load buckets per key; else `load_index` once.
     pub lazy_buckets: bool,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub token: Option<String>,
+    pub insecure: bool,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        Self {
+            index: PathBuf::from("data/rap-index"),
+            bind: "127.0.0.1:7780".into(),
+            lazy_buckets: false,
+            tls_cert: None,
+            tls_key: None,
+            token: None,
+            insecure: false,
+        }
+    }
+}
+
+impl From<DaemonCli> for DaemonOptions {
+    fn from(c: DaemonCli) -> Self {
+        Self {
+            index: c.index,
+            bind: c.bind,
+            lazy_buckets: c.lazy_buckets,
+            tls_cert: c.tls_cert,
+            tls_key: c.tls_key,
+            token: c.token.filter(|s| !s.is_empty()),
+            insecure: c.insecure,
+        }
+    }
+}
+
+/// Loopback listen targets: `127.0.0.1`, `::1`, `localhost` (any case), and other
+/// [`IpAddr::is_loopback`] addresses. Empty bind uses the loopback default.
+pub fn bind_is_loopback(bind: &str) -> bool {
+    let bind = bind.trim();
+    if bind.is_empty() {
+        return true;
+    }
+    let host = bind_host(bind);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Host part of `host:port`, `[::1]:port`, or a bare host.
+fn bind_host(bind: &str) -> &str {
+    let bind = bind.trim();
+    if let Some(rest) = bind.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    if let Some((host, port)) = bind.rsplit_once(':') {
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return host;
+        }
+    }
+    bind
+}
+
+/// Ok if this bind may listen given TLS certs / `--insecure`. Non-loopback
+/// without certs requires `insecure`.
+pub fn requires_tls(bind: &str, insecure: bool, has_certs: bool) -> Result<()> {
+    if has_certs || bind_is_loopback(bind) || insecure {
+        Ok(())
+    } else {
+        bail!(
+            "refusing to listen on {bind} without TLS; pass --tls-cert and --tls-key, or --insecure"
+        )
+    }
+}
+
+/// Warning text when `--insecure` actually relaxes TLS or auth on a non-loopback bind.
+pub fn warn_insecure(
+    bind: &str,
+    insecure: bool,
+    has_certs: bool,
+    has_token: bool,
+) -> Option<String> {
+    if !insecure || bind_is_loopback(bind) {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if !has_certs {
+        reasons.push("plaintext HTTP (no --tls-cert/--tls-key)");
+    }
+    if !has_token {
+        reasons.push("no bearer token");
+    }
+    if reasons.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "INSECURE: listening on {bind} with {} because --insecure was set. Do not expose this to the network.",
+        reasons.join(" and ")
+    ))
+}
+
+fn has_configured_token(token: Option<&str>) -> bool {
+    token.map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+fn validate_listen_policy(opts: &DaemonOptions) -> Result<()> {
+    let bind = if opts.bind.trim().is_empty() {
+        "127.0.0.1:7780"
+    } else {
+        opts.bind.trim()
+    };
+    let has_certs = match (&opts.tls_cert, &opts.tls_key) {
+        (Some(_), Some(_)) => true,
+        (None, None) => false,
+        (Some(_), None) => bail!("--tls-cert requires --tls-key"),
+        (None, Some(_)) => bail!("--tls-key requires --tls-cert"),
+    };
+    requires_tls(bind, opts.insecure, has_certs)?;
+    let has_token = has_configured_token(opts.token.as_deref());
+    if !has_token && !bind_is_loopback(bind) && !opts.insecure {
+        bail!(
+            "refusing to listen on {bind} without a bearer token; set --token / NEEDLED_TOKEN, or pass --insecure"
+        );
+    }
+    if let Some(msg) = warn_insecure(bind, opts.insecure, has_certs, has_token) {
+        eprintln!("{msg}");
+    }
+    Ok(())
 }
 
 pub struct DaemonHandle {
     addr: SocketAddr,
+    tls: bool,
     handle: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
 }
 
 impl DaemonHandle {
-    /// `http://127.0.0.1:PORT` (actual bound address, including ephemeral ports).
+    /// `http(s)://127.0.0.1:PORT` (actual bound address, including ephemeral ports).
     pub fn base_url(&self) -> String {
-        format!("http://{}", self.addr)
+        let scheme = if self.tls { "https" } else { "http" };
+        format!("{}://{}", scheme, self.addr)
     }
 
     pub fn stop(mut self) {
@@ -68,7 +228,7 @@ impl Drop for DaemonHandle {
 ///
 /// If `host:0` is rejected, falls back to `127.0.0.1:(18780 + pid % 1000)`.
 pub fn start(opts: DaemonOptions) -> Result<DaemonHandle> {
-    let (server, state, addr) = bind_and_load(opts)?;
+    let (server, state, addr, tls) = bind_and_load(opts)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_c = Arc::clone(&stop);
     let handle = thread::spawn(move || {
@@ -76,6 +236,7 @@ pub fn start(opts: DaemonOptions) -> Result<DaemonHandle> {
     });
     Ok(DaemonHandle {
         addr,
+        tls,
         handle: Some(handle),
         stop,
     })
@@ -84,12 +245,11 @@ pub fn start(opts: DaemonOptions) -> Result<DaemonHandle> {
 /// Bind, print the listen URL, and block until the accept loop ends (Ctrl-C).
 pub fn serve_forever(opts: DaemonOptions) -> Result<()> {
     let index_display = opts.index.display().to_string();
-    let (server, state, addr) = bind_and_load(opts)?;
+    let (server, state, addr, tls) = bind_and_load(opts)?;
+    let scheme = if tls { "https" } else { "http" };
     eprintln!(
-        "needled listening on http://{}  index={}  lazy_buckets={}",
-        addr,
-        index_display,
-        state.lazy_buckets
+        "needled listening on {scheme}://{}  index={}  lazy_buckets={}",
+        addr, index_display, state.lazy_buckets
     );
     let stop = Arc::new(AtomicBool::new(false));
     serve_loop(server, state, stop);
@@ -106,6 +266,7 @@ struct LoadedInner {
 struct DaemonState {
     index_dir: PathBuf,
     lazy_buckets: bool,
+    token: Option<String>,
     inner: Mutex<LoadedInner>,
 }
 
@@ -144,30 +305,44 @@ fn refresh_if_changed(state: &DaemonState) -> Result<()> {
     }
     *inner = load_inner(&DaemonOptions {
         index: state.index_dir.clone(),
-        bind: String::new(),
         lazy_buckets: state.lazy_buckets,
+        ..Default::default()
     })?;
     Ok(())
 }
 
-fn bind_and_load(opts: DaemonOptions) -> Result<(tiny_http::Server, Arc<DaemonState>, SocketAddr)> {
+fn bind_and_load(
+    opts: DaemonOptions,
+) -> Result<(tiny_http::Server, Arc<DaemonState>, SocketAddr, bool)> {
+    validate_listen_policy(&opts)?;
     let inner = load_inner(&opts)?;
+    let token = opts
+        .token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let ssl = match (&opts.tls_cert, &opts.tls_key) {
+        (Some(cert), Some(key)) => Some(load_tls_config(cert, key)?),
+        _ => None,
+    };
+    let tls = ssl.is_some();
     let state = Arc::new(DaemonState {
         index_dir: opts.index.clone(),
         lazy_buckets: opts.lazy_buckets,
+        token,
         inner: Mutex::new(inner),
     });
     let bind = if opts.bind.trim().is_empty() {
         "127.0.0.1:7780".to_string()
     } else {
-        opts.bind
+        opts.bind.trim().to_string()
     };
-    let server = match open_http(&bind) {
+    let server = match open_server(&bind, ssl.as_ref()) {
         Ok(s) => s,
         Err(e) if bind_requests_ephemeral(&bind) => {
             let port = 18780 + (std::process::id() % 1000);
             let fallback = format!("127.0.0.1:{port}");
-            open_http(&fallback).with_context(|| {
+            open_server(&fallback, ssl.as_ref()).with_context(|| {
                 format!("fallback bind {fallback} after ephemeral bind {bind} failed: {e:#}")
             })?
         }
@@ -177,7 +352,7 @@ fn bind_and_load(opts: DaemonOptions) -> Result<(tiny_http::Server, Arc<DaemonSt
         .server_addr()
         .to_ip()
         .ok_or_else(|| anyhow::anyhow!("needled requires an IP bind address"))?;
-    Ok((server, state, addr))
+    Ok((server, state, addr, tls))
 }
 
 fn bind_requests_ephemeral(bind: &str) -> bool {
@@ -186,8 +361,207 @@ fn bind_requests_ephemeral(bind: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn open_http(bind: &str) -> Result<tiny_http::Server> {
-    tiny_http::Server::http(bind).map_err(|e| anyhow::anyhow!("bind {bind}: {e}"))
+fn open_server(bind: &str, ssl: Option<&tiny_http::SslConfig>) -> Result<tiny_http::Server> {
+    match ssl {
+        None => tiny_http::Server::http(bind).map_err(|e| anyhow::anyhow!("bind {bind}: {e}")),
+        Some(cfg) => tiny_http::Server::https(
+            bind,
+            tiny_http::SslConfig {
+                certificate: cfg.certificate.clone(),
+                private_key: cfg.private_key.clone(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("bind {bind} tls: {e}")),
+    }
+}
+
+fn load_tls_config(cert: &Path, key: &Path) -> Result<tiny_http::SslConfig> {
+    let certificate =
+        fs::read(cert).with_context(|| format!("read tls cert {}", cert.display()))?;
+    let key_raw = fs::read(key).with_context(|| format!("read tls key {}", key.display()))?;
+    let private_key = pem_key_to_pkcs8(&key_raw)?;
+    native_tls::Identity::from_pkcs8(&certificate, &private_key)
+        .map_err(|e| anyhow::anyhow!("tls identity (PKCS#8 PEM): {e}"))?;
+    Ok(tiny_http::SslConfig {
+        certificate,
+        private_key,
+    })
+}
+
+fn pem_key_to_pkcs8(key_pem: &[u8]) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(key_pem).context("tls key is not UTF-8 PEM")?;
+    if pem_has_label(text, "ENCRYPTED PRIVATE KEY") {
+        bail!("encrypted TLS keys are not supported; use an unencrypted PKCS#8 PEM");
+    }
+    if pem_has_label(text, "PRIVATE KEY") {
+        let block = extract_pem(text, "PRIVATE KEY")?;
+        let mut out = block.as_bytes().to_vec();
+        if !out.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+        return Ok(out);
+    }
+    if pem_has_label(text, "RSA PRIVATE KEY") {
+        let der = pem_body_der(text, "RSA PRIVATE KEY")?;
+        let pkcs8 = wrap_rsa_pkcs1_in_pkcs8(&der);
+        return Ok(pem_encode("PRIVATE KEY", &pkcs8));
+    }
+    bail!("tls key must be PKCS#8 PEM (BEGIN PRIVATE KEY) or RSA PKCS#1 PEM")
+}
+
+fn pem_has_label(text: &str, label: &str) -> bool {
+    text.contains(&format!("BEGIN {label}"))
+}
+
+fn extract_pem<'a>(text: &'a str, label: &str) -> Result<&'a str> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let start = text
+        .find(&begin)
+        .with_context(|| format!("PEM missing {begin}"))?;
+    let after = &text[start..];
+    let end_at = after
+        .find(&end)
+        .with_context(|| format!("PEM missing {end}"))?;
+    Ok(&after[..end_at + end.len()])
+}
+
+fn pem_body_der(text: &str, label: &str) -> Result<Vec<u8>> {
+    let block = extract_pem(text, label)?;
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let inner = block
+        .strip_prefix(&begin)
+        .and_then(|s| s.strip_suffix(&end))
+        .unwrap_or(block);
+    let b64: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
+    b64_decode(&b64)
+}
+
+fn pem_encode(label: &str, der: &[u8]) -> Vec<u8> {
+    let b64 = b64_encode(der);
+    let mut s = format!("-----BEGIN {label}-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        s.push_str(std::str::from_utf8(chunk).unwrap());
+        s.push('\n');
+    }
+    s.push_str("-----END ");
+    s.push_str(label);
+    s.push_str("-----\n");
+    s.into_bytes()
+}
+
+fn wrap_rsa_pkcs1_in_pkcs8(pkcs1: &[u8]) -> Vec<u8> {
+    // AlgorithmIdentifier rsaEncryption: 1.2.840.113549.1.1.1
+    const ALG: &[u8] = &[
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    let mut inner = Vec::with_capacity(3 + ALG.len() + 4 + pkcs1.len());
+    inner.extend_from_slice(&[0x02, 0x01, 0x00]);
+    inner.extend_from_slice(ALG);
+    inner.push(0x04);
+    extend_der_len(&mut inner, pkcs1.len());
+    inner.extend_from_slice(pkcs1);
+    let mut out = Vec::with_capacity(4 + inner.len());
+    out.push(0x30);
+    extend_der_len(&mut out, inner.len());
+    out.extend_from_slice(&inner);
+    out
+}
+
+fn extend_der_len(out: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len <= 0xff {
+        out.push(0x81);
+        out.push(len as u8);
+    } else if len <= 0xffff {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xff) as u8);
+    } else {
+        out.push(0x83);
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xff) as u8);
+    }
+}
+
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(T[((n >> 6) & 63) as usize] as char);
+        out.push(T[(n & 63) as usize] as char);
+        i += 3;
+    }
+    match data.len() - i {
+        1 => {
+            let n = (data[i] as u32) << 16;
+            out.push(T[((n >> 18) & 63) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+            out.push(T[((n >> 18) & 63) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push(T[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>> {
+    fn val(c: u8) -> Result<u8> {
+        Ok(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => bail!("invalid base64 in PEM"),
+        })
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|c| *c != b'=').collect();
+    if bytes.len() % 4 == 1 {
+        bail!("invalid base64 length in PEM");
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        let n = ((val(bytes[i])? as u32) << 18)
+            | ((val(bytes[i + 1])? as u32) << 12)
+            | ((val(bytes[i + 2])? as u32) << 6)
+            | (val(bytes[i + 3])? as u32);
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+        out.push(n as u8);
+        i += 4;
+    }
+    match bytes.len() - i {
+        0 => {}
+        2 => {
+            let n = ((val(bytes[i])? as u32) << 18) | ((val(bytes[i + 1])? as u32) << 12);
+            out.push((n >> 16) as u8);
+        }
+        3 => {
+            let n = ((val(bytes[i])? as u32) << 18)
+                | ((val(bytes[i + 1])? as u32) << 12)
+                | ((val(bytes[i + 2])? as u32) << 6);
+            out.push((n >> 16) as u8);
+            out.push((n >> 8) as u8);
+        }
+        _ => bail!("invalid base64 length in PEM"),
+    }
+    Ok(out)
 }
 
 fn serve_loop(server: tiny_http::Server, state: Arc<DaemonState>, stop: Arc<AtomicBool>) {
@@ -216,6 +590,10 @@ fn handle_one(request: tiny_http::Request, state: &DaemonState) {
     }
     let url = request.url().to_string();
     let (path, params) = parse_url(&url);
+    if let Some(err) = authorize(&request, &path, state.token.as_deref()) {
+        respond_json(request, 401, json!({"error": err}));
+        return;
+    }
     let outcome = match path.as_str() {
         "/health" => Ok((200, json!({"ok": true}))),
         "/v1/query" => handle_query(&params, state),
@@ -227,6 +605,51 @@ fn handle_one(request: tiny_http::Request, state: &DaemonState) {
         Ok((code, body)) => respond_json(request, code, body),
         Err(e) => respond_json(request, 500, json!({"error": format!("{e:#}")})),
     }
+}
+
+fn is_data_path(path: &str) -> bool {
+    matches!(path, "/v1/query" | "/v1/explain" | "/v1/stats")
+}
+
+/// Returns an error message (no index paths, keys, or fragment ids) when auth fails.
+fn authorize(
+    request: &tiny_http::Request,
+    path: &str,
+    token: Option<&str>,
+) -> Option<&'static str> {
+    let Some(expected) = token.filter(|s| !s.is_empty()) else {
+        return None;
+    };
+    if !is_data_path(path) {
+        return None;
+    }
+    match bearer_token(request) {
+        Some(got) if token_eq(expected, &got) => None,
+        Some(_) => Some("invalid token"),
+        None => Some("unauthorized"),
+    }
+}
+
+fn bearer_token(request: &tiny_http::Request) -> Option<String> {
+    for h in request.headers() {
+        if !h.field.equiv("Authorization") {
+            continue;
+        }
+        let v = h.value.as_str().trim();
+        if v.len() >= 7 && v[..7].eq_ignore_ascii_case("Bearer ") {
+            return Some(v[7..].trim().to_string());
+        }
+    }
+    None
+}
+
+fn token_eq(expected: &str, got: &str) -> bool {
+    let a = expected.as_bytes();
+    let b = got.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn handle_query(params: &HashMap<String, String>, state: &DaemonState) -> Result<(u16, Value)> {
@@ -372,6 +795,7 @@ fn query_options_from_params(params: &HashMap<String, String>) -> Result<QueryOp
             .map(|s| parse_bool(s))
             .unwrap_or(false),
         min_listen_count: parse_opt(params, "min_listens")?,
+        verify: params.get("verify").map(|s| parse_bool(s)).unwrap_or(true),
         ..Default::default()
     })
 }
@@ -483,7 +907,8 @@ fn json_header(name: &[u8], value: &[u8]) -> tiny_http::Header {
 }
 
 fn respond_json(request: tiny_http::Request, status: u16, body: Value) {
-    let payload = serde_json::to_string(&body).unwrap_or_else(|_| "{\"error\":\"serialize\"}".into());
+    let payload =
+        serde_json::to_string(&body).unwrap_or_else(|_| "{\"error\":\"serialize\"}".into());
     let response = tiny_http::Response::from_string(payload)
         .with_status_code(status)
         .with_header(json_header(b"Content-Type", b"application/json"))
@@ -494,11 +919,13 @@ fn respond_json(request: tiny_http::Request, status: u16, body: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{IndexBuilder, forget_keys};
-    use crate::writer::{WriteMode, WriterOptions, write_sample_dataset};
+    use crate::index::{forget_keys, IndexBuilder};
+    use crate::writer::{write_sample_dataset, WriteMode, WriterOptions};
+    use clap::Parser;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::path::Path;
+    use std::process::Command;
 
     fn tiny_dataset(tmp: &Path) -> PathBuf {
         let data = tmp.join("parquet");
@@ -524,19 +951,30 @@ mod tests {
 
     /// Raw HTTP/1.1 GET over `TcpStream` (no reqwest), same style as `storage::HttpRange`.
     fn http_get(url: &str) -> Result<(u16, String)> {
-        let bare = url
-            .strip_prefix("http://")
-            .context("only http:// supported")?;
+        http_get_auth(url, None)
+    }
+
+    fn http_get_auth(url: &str, bearer: Option<&str>) -> Result<(u16, String)> {
+        let (tls, bare) = if let Some(b) = url.strip_prefix("https://") {
+            (true, b)
+        } else if let Some(b) = url.strip_prefix("http://") {
+            (false, b)
+        } else {
+            bail!("url must be http:// or https://");
+        };
         let (hostport, path) = match bare.split_once('/') {
             Some((h, p)) => (h, format!("/{p}")),
             None => (bare, "/".to_string()),
         };
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n"
-        );
+        let auth = match bearer {
+            Some(t) => format!("Authorization: Bearer {t}\r\n"),
+            None => String::new(),
+        };
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: {hostport}\r\n{auth}Connection: close\r\n\r\n");
         let mut last_err = None;
         for _ in 0..25 {
-            match http_get_once(hostport, &req) {
+            match http_get_once(hostport, &req, tls) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     last_err = Some(e);
@@ -547,11 +985,26 @@ mod tests {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("http get {url} failed")))
     }
 
-    fn http_get_once(hostport: &str, req: &str) -> Result<(u16, String)> {
-        let mut stream =
-            TcpStream::connect(hostport).with_context(|| format!("connect {hostport}"))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    fn http_get_once(hostport: &str, req: &str, tls: bool) -> Result<(u16, String)> {
+        let tcp = TcpStream::connect(hostport).with_context(|| format!("connect {hostport}"))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
+        if tls {
+            let connector = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
+                .build()
+                .context("tls connector")?;
+            let stream = connector
+                .connect("localhost", tcp)
+                .map_err(|e| anyhow::anyhow!("tls handshake: {e}"))?;
+            read_http_exchange(stream, req)
+        } else {
+            read_http_exchange(tcp, req)
+        }
+    }
+
+    fn read_http_exchange(mut stream: impl Read + Write, req: &str) -> Result<(u16, String)> {
         stream.write_all(req.as_bytes())?;
 
         let mut resp = Vec::new();
@@ -598,6 +1051,19 @@ mod tests {
         Ok((status, body))
     }
 
+    fn assert_401_no_secrets(body: &str, idx: &Path, token: &str) {
+        let v: Value = serde_json::from_str(body).expect("401 json");
+        assert!(v["error"].as_str().is_some(), "401 body={body}");
+        if let Some(p) = idx.to_str() {
+            assert!(!body.contains(p), "401 must not leak index path: {body}");
+        }
+        assert!(!body.contains(token), "401 must not leak token: {body}");
+        assert!(
+            !body.to_ascii_lowercase().contains("fragment"),
+            "401 must not leak fragment ids: {body}"
+        );
+    }
+
     #[test]
     fn health_query_and_stop() {
         let tmp = tempfile::tempdir().unwrap();
@@ -606,6 +1072,7 @@ mod tests {
             index: idx,
             bind: "127.0.0.1:0".into(),
             lazy_buckets: false,
+            ..Default::default()
         })
         .expect("start needled");
         let base = handle.base_url();
@@ -645,6 +1112,7 @@ mod tests {
             index: idx.clone(),
             bind: "127.0.0.1:0".into(),
             lazy_buckets: false,
+            ..Default::default()
         })
         .expect("start needled");
         let base = handle.base_url();
@@ -661,6 +1129,197 @@ mod tests {
             q["rows"].as_array().unwrap().is_empty(),
             "needled must reload after forget, body={body}"
         );
+
+        handle.stop();
+    }
+
+    #[test]
+    fn bind_is_loopback_examples() {
+        assert!(bind_is_loopback("127.0.0.1:0"));
+        assert!(bind_is_loopback("127.0.0.1:7780"));
+        assert!(bind_is_loopback("localhost:7780"));
+        assert!(bind_is_loopback("LOCALHOST:1"));
+        assert!(bind_is_loopback("[::1]:7780"));
+        assert!(bind_is_loopback("::1:7780"));
+        assert!(bind_is_loopback(""));
+        assert!(!bind_is_loopback("0.0.0.0:7780"));
+        assert!(!bind_is_loopback("192.0.2.1:7780"));
+        assert!(!bind_is_loopback("[::]:7780"));
+    }
+
+    #[test]
+    fn requires_tls_policy() {
+        assert!(requires_tls("127.0.0.1:0", false, false).is_ok());
+        assert!(requires_tls("localhost:7780", false, false).is_ok());
+        assert!(requires_tls("0.0.0.0:7780", false, false).is_err());
+        assert!(requires_tls("0.0.0.0:7780", true, false).is_ok());
+        assert!(requires_tls("0.0.0.0:7780", false, true).is_ok());
+        assert!(requires_tls("192.0.2.10:7780", false, false).is_err());
+        assert!(requires_tls("192.0.2.10:7780", true, false).is_ok());
+    }
+
+    #[test]
+    fn warn_insecure_contains_insecure() {
+        let msg = warn_insecure("0.0.0.0:7780", true, false, true).expect("warn");
+        assert!(msg.contains("INSECURE"), "{msg}");
+        let msg = warn_insecure("0.0.0.0:7780", true, true, false).expect("warn");
+        assert!(msg.contains("INSECURE"), "{msg}");
+        assert!(warn_insecure("127.0.0.1:7780", true, false, false).is_none());
+        assert!(warn_insecure("0.0.0.0:7780", false, false, false).is_none());
+        assert!(warn_insecure("0.0.0.0:7780", true, true, true).is_none());
+    }
+
+    #[test]
+    fn start_refuses_non_loopback_without_tls_or_token() {
+        let err = match start(DaemonOptions {
+            index: PathBuf::from("/nonexistent-needle-index"),
+            bind: "0.0.0.0:7780".into(),
+            ..Default::default()
+        }) {
+            Ok(_) => panic!("expected non-loopback bind without TLS to fail"),
+            Err(e) => e,
+        };
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("TLS") || s.contains("tls") || s.contains("insecure"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn daemon_cli_parses_tls_token_insecure() {
+        let c = DaemonCli::try_parse_from([
+            "needled",
+            "--index",
+            "/tmp/idx",
+            "--bind",
+            "0.0.0.0:7780",
+            "--tls-cert",
+            "/tmp/c.pem",
+            "--tls-key",
+            "/tmp/k.pem",
+            "--token",
+            "s3cret",
+            "--insecure",
+            "--lazy-buckets",
+        ])
+        .unwrap();
+        assert_eq!(c.bind, "0.0.0.0:7780");
+        assert_eq!(c.tls_cert.as_deref(), Some(Path::new("/tmp/c.pem")));
+        assert_eq!(c.tls_key.as_deref(), Some(Path::new("/tmp/k.pem")));
+        assert_eq!(c.token.as_deref(), Some("s3cret"));
+        assert!(c.insecure);
+        assert!(c.lazy_buckets);
+        let opts = DaemonOptions::from(c);
+        assert_eq!(opts.token.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn bearer_required_when_token_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = tiny_dataset(tmp.path());
+        let token = "test-token-ws3";
+        let handle = start(DaemonOptions {
+            index: idx.clone(),
+            bind: "127.0.0.1:0".into(),
+            token: Some(token.into()),
+            ..Default::default()
+        })
+        .expect("start needled");
+        let base = handle.base_url();
+        assert!(base.starts_with("http://127.0.0.1:"));
+
+        let (st, body) = http_get(&format!("{base}/v1/query?key=user_0000")).expect("no auth");
+        assert_eq!(st, 401, "query without Authorization, body={body}");
+        assert_401_no_secrets(&body, &idx, token);
+
+        let (st, body) = http_get(&format!("{base}/v1/stats")).expect("stats no auth");
+        assert_eq!(st, 401, "stats without Authorization, body={body}");
+        assert_401_no_secrets(&body, &idx, token);
+
+        let (st, body) = http_get(&format!("{base}/health")).expect("health");
+        assert_eq!(st, 200, "health status, body={body}");
+
+        let (st, body) =
+            http_get_auth(&format!("{base}/v1/query?key=user_0000"), Some(token)).expect("auth");
+        assert_eq!(st, 200, "query with bearer, body={body}");
+        let q: Value = serde_json::from_str(&body).expect("query json");
+        assert_eq!(q["key"], json!("user_0000"));
+        assert!(!q["rows"].as_array().expect("rows").is_empty());
+
+        let (st, body) =
+            http_get_auth(&format!("{base}/v1/query?key=user_0000"), Some("wrong")).expect("wrong");
+        assert_eq!(st, 401, "wrong token, body={body}");
+        assert_401_no_secrets(&body, &idx, token);
+
+        handle.stop();
+    }
+
+    fn openssl_ok() -> bool {
+        Command::new("openssl")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn gen_self_signed(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let st = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .args(["-days", "1", "-subj", "/CN=localhost"])
+            .status()
+            .context("openssl req")?;
+        if !st.success() {
+            bail!("openssl req failed");
+        }
+        Ok((cert, key))
+    }
+
+    #[test]
+    fn tls_query_with_bearer() {
+        if !openssl_ok() {
+            eprintln!("skip: openssl CLI missing");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = tiny_dataset(tmp.path());
+        let (cert, key) = match gen_self_signed(tmp.path()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skip: openssl cert gen failed: {e:#}");
+                return;
+            }
+        };
+        let token = "tls-token-ws3";
+        let handle = start(DaemonOptions {
+            index: idx,
+            bind: "127.0.0.1:0".into(),
+            tls_cert: Some(cert),
+            tls_key: Some(key),
+            token: Some(token.into()),
+            ..Default::default()
+        })
+        .expect("start needled tls");
+        let base = handle.base_url();
+        assert!(
+            base.starts_with("https://127.0.0.1:"),
+            "tls base url: {base}"
+        );
+        assert_ne!(base, "https://127.0.0.1:0");
+
+        let (st, body) = http_get_auth(&format!("{base}/v1/query?key=user_0000"), Some(token))
+            .expect("tls query");
+        assert_eq!(st, 200, "tls query status, body={body}");
+        let q: Value = serde_json::from_str(&body).expect("query json");
+        assert!(!q["rows"].as_array().expect("rows").is_empty());
+
+        let (st, body) = http_get(&format!("{base}/health")).expect("tls health");
+        assert_eq!(st, 200, "tls health, body={body}");
 
         handle.stop();
     }

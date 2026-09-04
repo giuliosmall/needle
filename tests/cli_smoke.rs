@@ -33,7 +33,10 @@ fn cli_new_subcommand_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("bind"))
-        .stdout(predicate::str::contains("lazy-buckets"));
+        .stdout(predicate::str::contains("lazy-buckets"))
+        .stdout(predicate::str::contains("tls-cert"))
+        .stdout(predicate::str::contains("token"))
+        .stdout(predicate::str::contains("insecure"));
 
     Command::cargo_bin("needle")
         .unwrap()
@@ -41,7 +44,8 @@ fn cli_new_subcommand_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--sql"))
-        .stdout(predicate::str::contains("--index"));
+        .stdout(predicate::str::contains("--index"))
+        .stdout(predicate::str::contains("no-verify"));
 
     Command::cargo_bin("needle")
         .unwrap()

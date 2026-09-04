@@ -12,7 +12,7 @@ use super::thrift::{
     self, ColumnChunkInfo, Kv, RowGroupInfo, SchemaField, CODEC_UNCOMPRESSED,
     CONV_TIMESTAMP_MILLIS, CONV_UTF8, ENC_PLAIN, ENC_RLE, TYPE_BYTE_ARRAY, TYPE_INT64,
 };
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 const MAGIC: &[u8; 4] = b"PAR1";
 const CREATED_BY: &str = "rap-rust parquet_lowlevel tiny-plain 0.1.0";
@@ -128,10 +128,7 @@ fn write_byte_array_page<'a>(
     num_values: i32,
     values: impl Iterator<Item = &'a str> + Clone,
 ) -> ColumnChunkInfo {
-    let payload_len: usize = values
-        .clone()
-        .map(|s| 4 + s.len())
-        .sum();
+    let payload_len: usize = values.clone().map(|s| 4 + s.len()).sum();
     write_page(
         buf,
         path,
@@ -181,11 +178,7 @@ fn write_page(
     payload_len: usize,
     write_payload: impl FnOnce(&mut Vec<u8>),
 ) -> ColumnChunkInfo {
-    let header = thrift::data_page_v1_header(
-        payload_len as i32,
-        payload_len as i32,
-        num_values,
-    );
+    let header = thrift::data_page_v1_header(payload_len as i32, payload_len as i32, num_values);
     let page_offset = buf.len() as i64;
     buf.extend_from_slice(&header);
     let payload_start = buf.len();
@@ -210,9 +203,9 @@ fn write_page(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use bytes::Bytes;
     use arrow::array::{Int64Array, StringArray};
+    use bytes::Bytes;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
     struct Row {
         user_id: String,

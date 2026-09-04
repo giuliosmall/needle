@@ -133,7 +133,9 @@ fn cli_demo_full_tiny_all_mode_sections() {
         .stdout(predicate::str::contains("PAR1 ok"))
         .stdout(predicate::str::contains("--- HTTP Range proof ---"))
         .stdout(predicate::str::contains("HTTP"))
-        .stdout(predicate::str::contains("--- Secondary index (track_uri) ---"))
+        .stdout(predicate::str::contains(
+            "--- Secondary index (track_uri) ---",
+        ))
         .stdout(predicate::str::contains("=== demo-full done ==="));
 }
 

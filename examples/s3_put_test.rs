@@ -14,8 +14,16 @@ fn main() -> anyhow::Result<()> {
     let part2 = c.get_range("rap-lake", "debug/sigv4-test.bin", &(5..11))?;
     println!("range2 ok {:?}", std::str::from_utf8(&part2));
     // key with =
-    c.put_object("rap-lake", "date=2024-01-01/bucket=000/part-test.parquet", body)?;
-    let r = c.get_range("rap-lake", "date=2024-01-01/bucket=000/part-test.parquet", &(0..4))?;
+    c.put_object(
+        "rap-lake",
+        "date=2024-01-01/bucket=000/part-test.parquet",
+        body,
+    )?;
+    let r = c.get_range(
+        "rap-lake",
+        "date=2024-01-01/bucket=000/part-test.parquet",
+        &(0..4),
+    )?;
     println!("equals-key range ok {:?}", r);
     Ok(())
 }

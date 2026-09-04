@@ -44,7 +44,6 @@ fn minio_lake_scale_1k() {
     assert!(report.range_requests_demo > 0);
 }
 
-
 #[test]
 fn minio_lake_fat_e2e_small() {
     if !tools_ok() {
