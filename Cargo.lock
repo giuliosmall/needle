@@ -831,6 +831,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "needle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "assert_cmd",
+ "bincode",
+ "bytes",
+ "chrono",
+ "clap",
+ "hex",
+ "hmac",
+ "parquet",
+ "predicates",
+ "rand",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tiny_http",
+ "zstd",
+]
+
+[[package]]
 name = "normalize-line-endings"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1022,33 +1049,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 dependencies = [
  "getrandom 0.2.17",
-]
-
-[[package]]
-name = "rap"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "arrow-array",
- "arrow-schema",
- "assert_cmd",
- "bincode",
- "bytes",
- "chrono",
- "clap",
- "hex",
- "hmac",
- "parquet",
- "predicates",
- "rand",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tiny_http",
- "zstd",
 ]
 
 [[package]]

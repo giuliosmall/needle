@@ -8,10 +8,8 @@ Inspired by Spotify’s [Random Access Parquet (RAP)](https://engineering.atspot
 
 ```bash
 cargo build --release
-./target/release/rap demo --key user_0042
+./target/release/needle demo --key user_0042
 ```
-
-(CLI binary is still named `rap` - Needle is the project name.)
 
 ---
 
@@ -106,16 +104,16 @@ stats without loading every bucket (which OOMs large lakes). Compound keys can b
 passed as an encoded string (U+001F-joined) or as `part||part`.
 
 ```bash
-rap index --data data/parquet --index data/rap-index --key-column user_id --covering
-rap query user_0042 --columns timestamp,track_uri --since 2024-01-01 --until 2024-12-31
-rap query user_0042 --covering-only --format json
-rap explain user_0042
-rap query --dimension track_uri --range-start spotify:track:000 --range-end spotify:track:fff
-rap stats --index data/rap-index
+needle index --data data/parquet --index data/rap-index --key-column user_id --covering
+needle query user_0042 --columns timestamp,track_uri --since 2024-01-01 --until 2024-12-31
+needle query user_0042 --covering-only --format json
+needle explain user_0042
+needle query --dimension track_uri --range-start spotify:track:000 --range-end spotify:track:fff
+needle stats --index data/rap-index
 ```
 
 `--format json` (or `--json`) prints one JSON object to stdout. Point queries load
-only the index buckets for that key. `rap query --help` / `rap index --help` list
+only the index buckets for that key. `needle query --help` / `needle index --help` list
 the filter and column flags.
 
 ### MinIO lake (optional stress)

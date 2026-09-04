@@ -67,11 +67,11 @@ We write both **JSONL** (inspectable) and **bincode** (compact) per bucket.
 | Blobs / Variants | Single column read | **Implemented** (`--mode blob`, JSON + binary payload) |
 | Interleaving columns | Single contiguous multi-col read | **Implemented inside Parquet** (`--mode interleaved`) |
 | Covering index | Zero storage reads for hoisted fields | **Implemented** (`--covering`; cogrouped hoists nested list aggregates) |
-| Secondary indexes | Multi-dimension access paths | **Implemented** (`rap index --secondary track_uri`; hash + sorted) |
-| HTTP Range | Object-store ranged reads | **Implemented** (`LocalFile` + `HttpRange`, `rap serve`, prove path) |
-| MinIO / S3 Range | Path-style GetObject Range | **Implemented** (`s3.rs` SigV4 + anon GET, `lake.rs`, `rap lake-*`) |
+| Secondary indexes | Multi-dimension access paths | **Implemented** (`needle index --secondary track_uri`; hash + sorted) |
+| HTTP Range | Object-store ranged reads | **Implemented** (`LocalFile` + `HttpRange`, `needle serve`, prove path) |
+| MinIO / S3 Range | Path-style GetObject Range | **Implemented** (`s3.rs` SigV4 + anon GET, `lake.rs`, `needle lake-*`) |
 | Fat multi-page lake | Range-GET pages ≪ fat object | **Implemented** (`paged.rs`, `lake-generate-fat`, `S3ChunkReader`) |
-| Pagination | value_count + offset/limit | **Implemented** (`rap query --offset --limit`) |
+| Pagination | value_count + offset/limit | **Implemented** (`needle query --offset --limit`) |
 
 ## One page per key
 
@@ -113,15 +113,15 @@ fragments/<id>/secondary/<dim>/
   sorted/entries.bin|.jsonl            # range scans
 ```
 
-`rap index --secondary track_uri` scans existing Parquet (no rewrite).
-`rap query <track> --dimension track_uri` does exact lookup; sorted tree supports
+`needle index --secondary track_uri` scans existing Parquet (no rewrite).
+`needle query <track> --dimension track_uri` does exact lookup; sorted tree supports
 `lookup_range`.
 
 ## HTTP Range
 
 `storage::RangeReader` trait with `LocalFile` and `HttpRange` (raw TCP `Range:`).
-`rap serve --root data/parquet` - tiny_http with 206 + Content-Range.
-`rap query … --http http://127.0.0.1:PORT` issues ranged reads over HTTP and can
+`needle serve --root data/parquet` - tiny_http with 206 + Content-Range.
+`needle query … --http http://127.0.0.1:PORT` issues ranged reads over HTTP and can
 prove bytes match local (`prove_http_matches_local`).
 
 ## Gaps vs production RAP

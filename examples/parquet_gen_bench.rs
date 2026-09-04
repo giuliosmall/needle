@@ -1,4 +1,4 @@
-use rap::lake::LakeGenerateOpts;
+use needle::lake::LakeGenerateOpts;
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
@@ -14,9 +14,9 @@ fn main() -> anyhow::Result<()> {
             rows_per_file: 2,
             ..Default::default()
         };
-        rap::lake::minio_up()?;
+        needle::lake::minio_up()?;
         let t0 = Instant::now();
-        let man = rap::lake::lake_generate(&opts)?;
+        let man = needle::lake::lake_generate(&opts)?;
         println!(
             "n={n} par={par} → {} objs in {:?} ({:.1}/s) bytes={}",
             man.objects,

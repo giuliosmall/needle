@@ -1,11 +1,11 @@
 //! Library-level end-to-end tests: generate → index → query for each write mode,
 //! plus secondary index, HTTP Range, pagination, and covering aggregates.
 
-use rap::index::{IndexBuilder, load_index};
-use rap::query::{QueryOptions, RapQuerier, naive_scan};
-use rap::secondary::{self, build_secondary, load_secondary};
-use rap::storage::{RangeHttpServer, prove_http_matches_local};
-use rap::writer::{WriteMode, WriterOptions, write_sample_dataset};
+use needle::index::{IndexBuilder, load_index};
+use needle::query::{QueryOptions, RapQuerier, naive_scan};
+use needle::secondary::{self, build_secondary, load_secondary};
+use needle::storage::{RangeHttpServer, prove_http_matches_local};
+use needle::writer::{WriteMode, WriterOptions, write_sample_dataset};
 use std::path::{Path, PathBuf};
 
 fn opts(out: &Path, mode: WriteMode) -> WriterOptions {
@@ -22,7 +22,7 @@ fn opts(out: &Path, mode: WriteMode) -> WriterOptions {
     }
 }
 
-fn row_sig(rows: &[rap::query::ListenRow]) -> Vec<(i64, String, i64)> {
+fn row_sig(rows: &[needle::query::ListenRow]) -> Vec<(i64, String, i64)> {
     let mut v: Vec<_> = rows
         .iter()
         .map(|r| (r.timestamp_ms, r.track_uri.clone(), r.duration_ms))
@@ -267,7 +267,7 @@ fn e2e_cogrouped_covering_matches_nested_sums() {
     let (_t, q, paths) = generate_index_query(WriteMode::Cogrouped);
     for key in edge_keys(24) {
         let res = q.query(key).unwrap();
-        let (naive, _) = rap::query::naive_scan(&paths, key).unwrap();
+        let (naive, _) = needle::query::naive_scan(&paths, key).unwrap();
         assert_eq!(row_sig(&res.rows), row_sig(&naive));
         assert_eq!(res.rows.len(), 6, "{key} nested listen rows");
 
@@ -297,7 +297,7 @@ fn e2e_cogrouped_covering_matches_nested_sums() {
 
 #[test]
 fn e2e_demo_library_path_sorted_covering() {
-    // Exercises the same library path as `rap demo` without shelling out.
+    // Exercises the same library path as `needle demo` without shelling out.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let data = root.join("parquet");
@@ -481,7 +481,7 @@ fn e2e_secondary_key_column_index() {
         .build_fragment(&paths, "frag-track", Some("track_uri key"))
         .unwrap();
     let index = load_index(&idx).unwrap();
-    let key = rap::index::encode_key(&[track.as_str()]);
+    let key = needle::index::encode_key(&[track.as_str()]);
     let entries = index.lookup(&key);
     assert!(
         !entries.is_empty(),

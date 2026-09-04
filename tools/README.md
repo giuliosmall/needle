@@ -6,5 +6,5 @@ curl -fsSL -o mc    https://dl.min.io/client/mc/release/linux-amd64/mc
 chmod +x minio mc
 ```
 
-Then: `rap minio-up` (data dir `/workspace/rap-minio-data`, API `127.0.0.1:9000`).
+Then: `needle minio-up` (data dir `/workspace/rap-minio-data`, API `127.0.0.1:9000`).
 Credentials: `minioadmin` / `minioadmin` (local-only).

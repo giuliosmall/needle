@@ -1,4 +1,4 @@
-use rap::s3::S3Client;
+use needle::s3::S3Client;
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {

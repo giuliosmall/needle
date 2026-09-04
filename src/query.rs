@@ -1013,7 +1013,7 @@ fn extract_listens(batch: &RecordBatch, path: &PathBuf, fallback_user: &str) -> 
     Ok(out)
 }
 
-/// Naive full scan of all Parquet files - baseline for `rap bench`.
+/// Naive full scan of all Parquet files - baseline for `needle bench`.
 pub fn naive_scan(files: &[PathBuf], key: &str) -> Result<(Vec<ListenRow>, Duration)> {
     let t0 = Instant::now();
     let mut rows = Vec::new();

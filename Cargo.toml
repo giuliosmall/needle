@@ -1,12 +1,12 @@
 [package]
-name = "rap"
+name = "needle"
 version = "0.1.0"
 edition = "2021"
 description = "Needle - external key→page index for point queries over lake Parquet (Spotify RAP-inspired)"
 license = "Apache-2.0"
 
 [[bin]]
-name = "rap"
+name = "needle"
 path = "src/main.rs"
 
 [dependencies]

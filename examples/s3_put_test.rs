@@ -1,4 +1,4 @@
-use rap::s3::S3Client;
+use needle::s3::S3Client;
 
 fn main() -> anyhow::Result<()> {
     let c = S3Client::from_env();

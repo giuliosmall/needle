@@ -1,32 +1,32 @@
 //! CLI for Needle / Random Access Parquet (RAP).
 //!
 //! Commands map to the article workflow:
-//!   rap generate  - write prepared Parquet / sidecars
-//!   rap index     - build external append-only index (+ optional secondary)
-//!   rap query     - point lookup via index + ranged reads (+ filters / JSON)
-//!   rap explain   - plan a lookup (files, pages, estimated Range GETs)
-//!   rap stats     - fragment / manifest summary without loading buckets
-//!   rap bench     - compare naive scan vs RAP
-//!   rap serve     - tiny HTTP Range server for object-store demo
-//!   rap demo / demo-full - end-to-end demos
+//!   needle generate  - write prepared Parquet / sidecars
+//!   needle index     - build external append-only index (+ optional secondary)
+//!   needle query     - point lookup via index + ranged reads (+ filters / JSON)
+//!   needle explain   - plan a lookup (files, pages, estimated Range GETs)
+//!   needle stats     - fragment / manifest summary without loading buckets
+//!   needle bench     - compare naive scan vs RAP
+//!   needle serve     - tiny HTTP Range server for object-store demo
+//!   needle demo / demo-full - end-to-end demos
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate};
 use clap::{Parser, Subcommand, ValueEnum};
-use rap::index::{IndexBuilder, load_index, load_index_for_keys};
-use rap::query::{QueryOptions, RapQuerier, collect_demo_ranges, naive_scan};
-use rap::secondary::{self, refs_to_primary_entries};
-use rap::lake::{self, LakeGenerateOpts};
-use rap::storage::{RangeHttpServer, prove_http_matches_local};
-use rap::parquet_lowlevel;
-use rap::writer::{WriteMode, WriterOptions, write_sample_dataset};
+use needle::index::{IndexBuilder, load_index, load_index_for_keys};
+use needle::query::{QueryOptions, RapQuerier, collect_demo_ranges, naive_scan};
+use needle::secondary::{self, refs_to_primary_entries};
+use needle::lake::{self, LakeGenerateOpts};
+use needle::storage::{RangeHttpServer, prove_http_matches_local};
+use needle::parquet_lowlevel;
+use needle::writer::{WriteMode, WriterOptions, write_sample_dataset};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rap",
+    name = "needle",
     about = "Needle - point queries on a Parquet data lake (Random Access Parquet)",
     version
 )]
@@ -115,7 +115,7 @@ enum Cmd {
         /// Inclusive secondary range end (requires `--dimension` and `--range-start`).
         #[arg(long, value_name = "E")]
         range_end: Option<String>,
-        /// Optional HTTP base URL for ranged reads (start with `rap serve`).
+        /// Optional HTTP base URL for ranged reads (start with `needle serve`).
         #[arg(long)]
         http: Option<String>,
         /// Data dir for HTTP proof / secondary file resolution.
@@ -1409,7 +1409,7 @@ fn run_demo_full(
 }
 
 fn print_query_result(
-    result: &rap::query::QueryResult,
+    result: &needle::query::QueryResult,
     limit: usize,
     verbose: bool,
     index_load: std::time::Duration,
@@ -1506,7 +1506,7 @@ fn resolve_format(format: OutputFormat, json: bool) -> OutputFormat {
 fn encode_cli_key(raw: &str) -> String {
     if raw.contains("||") {
         let parts: Vec<&str> = raw.split("||").collect();
-        rap::index::encode_key(&parts)
+        needle::index::encode_key(&parts)
     } else {
         raw.to_string()
     }
@@ -1578,7 +1578,7 @@ fn build_query_options(
 }
 
 fn query_result_json(
-    result: &rap::query::QueryResult,
+    result: &needle::query::QueryResult,
     index_load: std::time::Duration,
 ) -> serde_json::Value {
     let t = &result.timings;
@@ -1621,7 +1621,7 @@ fn query_result_json(
     })
 }
 
-fn print_explain(expl: &rap::query::ExplainResult, out: OutputFormat) -> Result<()> {
+fn print_explain(expl: &needle::query::ExplainResult, out: OutputFormat) -> Result<()> {
     match out {
         OutputFormat::Json => {
             let v = serde_json::json!({

@@ -6,7 +6,7 @@ use std::process::Command as StdCommand;
 
 #[test]
 fn cli_help_lists_commands() {
-    Command::cargo_bin("rap")
+    Command::cargo_bin("needle")
         .unwrap()
         .arg("--help")
         .assert()
@@ -25,7 +25,7 @@ fn cli_generate_index_query_tiny() {
     let data = tmp.path().join("parquet");
     let idx = tmp.path().join("rap-index");
 
-    Command::cargo_bin("rap")
+    Command::cargo_bin("needle")
         .unwrap()
         .args([
             "generate",
@@ -45,7 +45,7 @@ fn cli_generate_index_query_tiny() {
         .assert()
         .success();
 
-    Command::cargo_bin("rap")
+    Command::cargo_bin("needle")
         .unwrap()
         .args([
             "index",
@@ -62,7 +62,7 @@ fn cli_generate_index_query_tiny() {
         .assert()
         .success();
 
-    Command::cargo_bin("rap")
+    Command::cargo_bin("needle")
         .unwrap()
         .args([
             "query",
@@ -80,7 +80,7 @@ fn cli_generate_index_query_tiny() {
 #[test]
 fn cli_demo_full_flag_exists() {
     // --help on demo-full should work (don't run the heavy demo).
-    let out = StdCommand::new(env!("CARGO_BIN_EXE_rap"))
+    let out = StdCommand::new(env!("CARGO_BIN_EXE_needle"))
         .args(["demo-full", "--help"])
         .output()
         .unwrap();

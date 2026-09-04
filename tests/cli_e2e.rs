@@ -1,12 +1,12 @@
-//! Deep CLI E2E: actually run the `rap` binary (demo + demo-full) on tiny
+//! Deep CLI E2E: actually run the `needle` binary (demo + demo-full) on tiny
 //! deterministic datasets in a tempdir so we never clobber `data/`.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::time::Duration;
 
-fn rap() -> Command {
-    Command::cargo_bin("rap").unwrap()
+fn needle() -> Command {
+    Command::cargo_bin("needle").unwrap()
 }
 
 #[test]
@@ -14,7 +14,7 @@ fn cli_demo_tiny_dataset_exit_zero_and_markers() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
-    rap()
+    needle()
         .args([
             "demo",
             "--key",
@@ -47,7 +47,7 @@ fn cli_demo_data_dir_alias_and_env() {
     let root = tmp.path();
 
     // --data-dir is a visible alias for --root.
-    rap()
+    needle()
         .args([
             "demo",
             "--key",
@@ -69,7 +69,7 @@ fn cli_demo_data_dir_alias_and_env() {
 
     // RAP_DATA_DIR env is honored when --root/--data-dir is omitted.
     let tmp2 = tempfile::tempdir().unwrap();
-    rap()
+    needle()
         .env("RAP_DATA_DIR", tmp2.path())
         .args([
             "demo",
@@ -93,7 +93,7 @@ fn cli_demo_full_tiny_all_mode_sections() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
 
-    rap()
+    needle()
         .args([
             "demo-full",
             "--key",
@@ -129,7 +129,7 @@ fn cli_demo_full_tiny_all_mode_sections() {
 fn generate_and_index(root: &std::path::Path, covering: bool) -> std::path::PathBuf {
     let data = root.join("parquet");
     let idx = root.join("rap-index");
-    rap()
+    needle()
         .args([
             "generate",
             "--out",
@@ -149,7 +149,7 @@ fn generate_and_index(root: &std::path::Path, covering: bool) -> std::path::Path
         .assert()
         .success();
 
-    let mut cmd = rap();
+    let mut cmd = needle();
     cmd.args([
         "index",
         "--data",
@@ -188,7 +188,7 @@ fn cli_query_json_format() {
     let tmp = tempfile::tempdir().unwrap();
     let idx = generate_and_index(tmp.path(), false);
 
-    let out = rap()
+    let out = needle()
         .args([
             "query",
             "user_0003",
@@ -217,7 +217,7 @@ fn cli_covering_only() {
     let tmp = tempfile::tempdir().unwrap();
     let idx = generate_and_index(tmp.path(), true);
 
-    let out = rap()
+    let out = needle()
         .args([
             "query",
             "user_0003",
@@ -259,7 +259,7 @@ fn cli_explain_command() {
     let tmp = tempfile::tempdir().unwrap();
     let idx = generate_and_index(tmp.path(), false);
 
-    rap()
+    needle()
         .args(["explain", "user_0003", "--index", idx.to_str().unwrap()])
         .timeout(Duration::from_secs(120))
         .assert()
@@ -276,7 +276,7 @@ fn cli_stats_command() {
     let tmp = tempfile::tempdir().unwrap();
     let idx = generate_and_index(tmp.path(), false);
 
-    rap()
+    needle()
         .args(["stats", "--index", idx.to_str().unwrap()])
         .timeout(Duration::from_secs(120))
         .assert()
@@ -290,7 +290,7 @@ fn cli_stats_command() {
 
 #[test]
 fn cli_query_help_lists_new_flags() {
-    rap()
+    needle()
         .args(["query", "--help"])
         .timeout(Duration::from_secs(120))
         .assert()
@@ -302,7 +302,7 @@ fn cli_query_help_lists_new_flags() {
 
 #[test]
 fn cli_index_key_column_flag() {
-    rap()
+    needle()
         .args(["index", "--help"])
         .timeout(Duration::from_secs(120))
         .assert()
