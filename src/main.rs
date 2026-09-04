@@ -449,7 +449,6 @@ fn main() -> Result<()> {
             } else {
                 key_column
             };
-            // provided by query/index slice
             let builder = IndexBuilder::new(&index, buckets)
                 .with_covering(covering)
                 .with_key_columns(key_column.clone())
@@ -550,7 +549,6 @@ fn main() -> Result<()> {
                 covering_only,
                 min_listens,
             )?;
-            // provided by query/index slice
             let expl = querier.explain(&key, &qopts)?;
             print_explain(&expl, out)?;
         }
@@ -1442,7 +1440,6 @@ fn print_query_result(
     if t.used_prepared_layout {
         println!("  used prepared ZSTD/interleaved layout: yes");
     }
-    // provided by query/index slice
     if result.skipped_by_predicate > 0 {
         println!("  skipped_by_predicate: {}", result.skipped_by_predicate);
     }
@@ -1508,8 +1505,8 @@ fn resolve_format(format: OutputFormat, json: bool) -> OutputFormat {
 /// Compound keys: `a||b` is encoded with U+001F via `encode_key`.
 fn encode_cli_key(raw: &str) -> String {
     if raw.contains("||") {
-        let parts: Vec<String> = raw.split("||").map(str::to_string).collect();
-        rap::index::encode_key(&parts) // provided by query/index slice
+        let parts: Vec<&str> = raw.split("||").collect();
+        rap::index::encode_key(&parts)
     } else {
         raw.to_string()
     }
@@ -1565,7 +1562,6 @@ fn build_query_options(
         offset,
         limit,
         http_base,
-        // provided by query/index slice
         columns: if cols.is_empty() { None } else { Some(cols) },
         since_ms: match since {
             Some(s) => Some(parse_time_ms(s, false)?),
@@ -1618,7 +1614,6 @@ fn query_result_json(
             "bytes_ranged": t.bytes_ranged,
             "pages_touched": t.pages_touched,
             "files_touched": t.files_touched,
-            // provided by query/index slice
             "skipped_by_predicate": result.skipped_by_predicate,
             "offset": result.offset,
             "limit": result.limit,
@@ -1648,7 +1643,13 @@ fn print_explain(expl: &rap::query::ExplainResult, out: OutputFormat) -> Result<
             println!("{}", serde_json::to_string(&v)?);
         }
         OutputFormat::Table => {
-            println!("explain key={} bucket={}", expl.key, expl.bucket);
+            println!(
+                "explain key={} bucket={}",
+                expl.key,
+                expl.bucket
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
             println!(
                 "  entries={} after_predicates={} skipped={}",
                 expl.num_entries,

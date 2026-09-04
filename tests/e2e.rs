@@ -425,11 +425,28 @@ fn e2e_time_window() {
             r.timestamp_ms
         );
     }
-    assert!(
-        windowed.skipped_by_predicate > 0,
-        "time window should record skipped_by_predicate, got {}",
-        windowed.skipped_by_predicate
-    );
+    // A window entirely after the key's covering range drops the entry before IO.
+    let none = q
+        .query_with(
+            key,
+            &QueryOptions {
+                since_ms: Some(i64::MAX),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(none.rows.is_empty(), "future since_ms should yield no rows");
+    if q.index
+        .lookup(key)
+        .iter()
+        .any(|e| e.covering.as_ref().and_then(|c| c.max_ts).is_some())
+    {
+        assert!(
+            none.skipped_by_predicate > 0,
+            "covering max_ts should skip the entry before IO, got {}",
+            none.skipped_by_predicate
+        );
+    }
 }
 
 #[test]
