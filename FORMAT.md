@@ -38,6 +38,10 @@ Readers reject any other major with `unsupported index format_version`.
 
 Writers take a non-blocking exclusive `flock` on `.needle.lock` for the whole fragment publish plus `registry.json` tmp+rename. A second overlapping writer fails with `index lock`.
 
+When the index root is `s3://`, `registry.json` is published with a conditional PUT: `If-None-Match: *` on create and `If-Match: <etag>` on update. A lost race is `s3_precondition_failed` (the object is left as valid v1 JSON).
+
+Point lookup mmaps `bucket_{NNN}.bin` (or scans `bucket_{NNN}.jsonl`) for the hashed bucket only. `--full-index` deserializes every bucket into RAM. The file dictionary stays in RAM.
+
 ## Fragment directory
 
 `fragments/<id>/manifest.json` describes one append-only fragment:

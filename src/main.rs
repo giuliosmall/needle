@@ -21,8 +21,8 @@ use chrono::{DateTime, NaiveDate};
 use clap::{Parser, Subcommand, ValueEnum};
 use needle::iceberg::{self, IcebergCatalog, IcebergIndexOpts};
 use needle::index::{
-    compact_index, forget_keys, load_index, load_index_for_keys, read_registry, verify_index_files,
-    IndexBuilder,
+    compact_index, forget_keys, load_index, load_index_file_dictionary, load_index_for_keys,
+    read_registry, verify_index_files, IndexBuilder,
 };
 use needle::lake::{self, LakeGenerateOpts};
 use needle::parquet_lowlevel;
@@ -62,6 +62,10 @@ enum IcebergCatalogArg {
     Hadoop,
     /// Iceberg REST catalog (`--rest-uri`, `--namespace`, `--table-name`). Production.
     Rest,
+    /// AWS Glue Data Catalog (not implemented; errors, does not fall back to Hadoop).
+    Glue,
+    /// Project Nessie (not implemented; errors, does not fall back to Hadoop).
+    Nessie,
 }
 
 impl From<IcebergCatalogArg> for IcebergCatalog {
@@ -69,6 +73,8 @@ impl From<IcebergCatalogArg> for IcebergCatalog {
         match v {
             IcebergCatalogArg::Hadoop => IcebergCatalog::Hadoop,
             IcebergCatalogArg::Rest => IcebergCatalog::Rest,
+            IcebergCatalogArg::Glue => IcebergCatalog::Glue,
+            IcebergCatalogArg::Nessie => IcebergCatalog::Nessie,
         }
     }
 }
@@ -124,7 +130,7 @@ enum Cmd {
     /// REST is the production catalog path; Hadoop is a warehouse-path fallback.
     #[command(name = "iceberg-index")]
     IcebergIndex {
-        /// Catalog: `rest` (production) or `hadoop` (fallback). REST is the production catalog path; Hadoop is fallback.
+        /// Catalog: `rest` (production) or `hadoop` (fallback). `glue` and `nessie` error (unsupported; no silent Hadoop fallback).
         #[arg(long, value_enum, default_value_t = IcebergCatalogArg::Hadoop)]
         catalog: IcebergCatalogArg,
         /// Hadoop table root (directory with `metadata/`, or `s3://…`). Required for `--catalog hadoop`.
@@ -639,12 +645,11 @@ fn main() -> Result<()> {
                     t1.elapsed()
                 );
             }
-            let loaded = load_index(&index)?;
+            let (files, fragments, _) = load_index_file_dictionary(&index)?;
             println!(
-                "Index now: {} keys, {} entries, {} files",
-                loaded.num_keys(),
-                loaded.num_entries(),
-                loaded.files.len()
+                "Index now: {} fragment(s), {} files (buckets mmapped on lookup; not fully loaded)",
+                fragments.len(),
+                files.len()
             );
         }
         Cmd::IcebergIndex {

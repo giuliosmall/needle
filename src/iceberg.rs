@@ -39,6 +39,21 @@ pub enum IcebergCatalog {
     #[default]
     Hadoop,
     Rest,
+    /// AWS Glue Data Catalog — not implemented (hard error, no Hadoop fallback).
+    Glue,
+    /// Project Nessie — not implemented (hard error, no Hadoop fallback).
+    Nessie,
+}
+
+impl IcebergCatalog {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hadoop => "hadoop",
+            Self::Rest => "rest",
+            Self::Glue => "glue",
+            Self::Nessie => "nessie",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +361,10 @@ fn load_table_for_index(opts: &IcebergIndexOpts) -> Result<LoadedTable> {
             load_table(&opts.table)
         }
         IcebergCatalog::Rest => load_table_from_rest(opts),
+        IcebergCatalog::Glue | IcebergCatalog::Nessie => Err(catalog_error(format!(
+            "unsupported catalog: {}; supported: rest, hadoop",
+            opts.catalog.as_str()
+        ))),
     }
 }
 
@@ -2552,6 +2571,40 @@ mod tests {
         let rap = load_index(&index).unwrap();
         assert!(!rap.lookup("user_0000").is_empty());
         assert!(!rap.lookup("user_0001").is_empty());
+    }
+
+    #[test]
+    fn glue_and_nessie_are_unsupported_no_hadoop_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = tmp.path().join("rap-index");
+        for cat in [IcebergCatalog::Glue, IcebergCatalog::Nessie] {
+            let opts = IcebergIndexOpts {
+                table: tmp.path().join("would-be-hadoop"),
+                index: index.clone(),
+                key_columns: vec!["user_id".to_string()],
+                value_columns: Vec::new(),
+                covering: false,
+                buckets: 8,
+                fragment_prefix: "iceberg".to_string(),
+                catalog: cat,
+                rest_uri: None,
+                namespace: None,
+                table_name: None,
+                rest_token: None,
+            };
+            let err = index_iceberg_table(&opts).expect_err("unsupported catalog must error");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("unsupported catalog"), "got {msg}");
+            assert!(
+                msg.contains(cat.as_str()),
+                "error must name {}: {msg}",
+                cat.as_str()
+            );
+            assert!(
+                !index.join("registry.json").exists(),
+                "must not publish an index for unsupported catalog"
+            );
+        }
     }
 
     struct IntegratorS3Mock {

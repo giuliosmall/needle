@@ -126,11 +126,11 @@ prove bytes match local (`prove_http_matches_local`).
 
 ## Remaining non-goals (not a general lake query engine)
 
-- mmap / multi-TB lakes: file dictionary + working set stay in RAM; lazy buckets are the default (`--full-index` is opt-in)
-- Glue / Nessie catalogs (Iceberg REST is the production path; Hadoop `metadata/*.json` is fallback)
-- Multi-writer index beyond exclusive `flock`
+- File dictionary still lives in RAM; only hash buckets are mmapped. Multi-TB lakes are not 1.0
+- Glue / Nessie catalogs: `--catalog glue|nessie` is a hard error (no silent Hadoop fallback). REST is supported; Hadoop is fallback
+- Multi-writer: local exclusive `flock`; S3 registry publish is conditional (`If-None-Match` / `If-Match`). Not a distributed lock service
 - Lake-wide SQL (SQL is over rows for one lookup key)
-- Physical Parquet / Iceberg deletes (`forget` only hides keys in Needle)
+- Physical Parquet / Iceberg deletes (`forget` only hides keys in Needle; no `needle delete`)
 - Covering aggregates remain listen-shaped; `--covering` is refused on generic schemas
 - Interleaving stays spec-valid by duplicating sibling columns in official
   chunks; RAP's one-read span is the skippable-bridged bundle in the host page

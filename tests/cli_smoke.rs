@@ -64,7 +64,39 @@ fn cli_new_subcommand_help() {
         .stdout(predicate::str::contains("--rest-token"))
         .stdout(predicate::str::contains("NEEDLE_ICEBERG_TOKEN"))
         .stdout(predicate::str::contains("production catalog path"))
-        .stdout(predicate::str::contains("fallback"));
+        .stdout(predicate::str::contains("fallback"))
+        .stdout(predicate::str::contains("glue"))
+        .stdout(predicate::str::contains("nessie"));
+
+    Command::cargo_bin("needle")
+        .unwrap()
+        .args([
+            "iceberg-index",
+            "--catalog",
+            "glue",
+            "--index",
+            "/tmp/needle-no-such-index",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("unsupported catalog").and(predicate::str::contains("glue")),
+        );
+
+    Command::cargo_bin("needle")
+        .unwrap()
+        .args([
+            "iceberg-index",
+            "--catalog",
+            "nessie",
+            "--index",
+            "/tmp/needle-no-such-index",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("unsupported catalog").and(predicate::str::contains("nessie")),
+        );
 
     Command::cargo_bin("needle")
         .unwrap()

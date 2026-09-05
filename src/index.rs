@@ -14,11 +14,44 @@ use crate::s3::{S3ChunkReader, S3Client};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+
+thread_local! {
+    static BUCKET_LOADS: Cell<u64> = const { Cell::new(0) };
+    static BUCKET_CAP: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+/// Test hook: fail if this thread deserializes more hash buckets than `cap`.
+pub fn test_set_bucket_load_cap(cap: u64) {
+    BUCKET_LOADS.with(|c| c.set(0));
+    BUCKET_CAP.with(|c| c.set(cap));
+}
+
+/// Restore the unlimited bucket-load cap for this thread.
+pub fn test_clear_bucket_load_cap() {
+    test_set_bucket_load_cap(u64::MAX);
+}
+
+fn account_bucket_load() -> Result<()> {
+    let n = BUCKET_LOADS.with(|c| {
+        let n = c.get().saturating_add(1);
+        c.set(n);
+        n
+    });
+    let max = BUCKET_CAP.with(|c| c.get());
+    if n > max {
+        bail!(
+            "index working set exceeded bucket cap ({n} > {max}); \
+             point lookup deserializes one mmapped hash bucket"
+        );
+    }
+    Ok(())
+}
 
 /// On-disk `registry.json` major version written by this crate.
 /// Format v1 is frozen; see `FORMAT.md`.
@@ -702,23 +735,76 @@ pub fn expand_compact_rows(e: &mut RapIndexEntry) {
 }
 
 fn read_bucket_entries(frag_dir: &Path, bi: u32) -> Result<Vec<RapIndexEntry>> {
+    read_bucket_entries_filtered(frag_dir, bi, None)
+}
+
+fn read_bucket_entries_filtered(
+    frag_dir: &Path,
+    bi: u32,
+    keep: Option<&HashSet<&str>>,
+) -> Result<Vec<RapIndexEntry>> {
     let bin_path = frag_dir.join("buckets").join(format!("bucket_{bi:03}.bin"));
     let jsonl_path = frag_dir
         .join("buckets")
         .join(format!("bucket_{bi:03}.jsonl"));
+    if let Some(keep) = keep {
+        if jsonl_path.exists() {
+            account_bucket_load()?;
+            return read_jsonl_matching(&jsonl_path, keep);
+        }
+    }
     if bin_path.exists() {
-        let bytes = fs::read(&bin_path)?;
-        match bincode::deserialize(&bytes) {
-            Ok(v) => return Ok(v),
+        account_bucket_load()?;
+        match mmap_deserialize_bin(&bin_path) {
+            Ok(v) => {
+                return Ok(filter_kept(v, keep));
+            }
             Err(_) if jsonl_path.exists() => {}
             Err(e) => return Err(e).context("bincode deserialize"),
         }
     }
     if jsonl_path.exists() {
-        read_jsonl(&jsonl_path)
+        account_bucket_load()?;
+        let v = read_jsonl(&jsonl_path)?;
+        Ok(filter_kept(v, keep))
     } else {
         Ok(Vec::new())
     }
+}
+
+fn filter_kept(mut v: Vec<RapIndexEntry>, keep: Option<&HashSet<&str>>) -> Vec<RapIndexEntry> {
+    if let Some(keep) = keep {
+        v.retain(|e| keep.contains(e.key.as_str()));
+    }
+    v
+}
+
+fn read_jsonl_matching(path: &Path, keep: &HashSet<&str>) -> Result<Vec<RapIndexEntry>> {
+    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut out = Vec::new();
+    for line in BufReader::new(f).lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        let e: RapIndexEntry = serde_json::from_str(&line)?;
+        if keep.contains(e.key.as_str()) {
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+fn mmap_deserialize_bin(path: &Path) -> Result<Vec<RapIndexEntry>> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: bucket files are append-only and never rewritten in place.
+    let mmap =
+        unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+    Ok(bincode::deserialize(mmap.as_ref())?)
 }
 
 pub fn load_index(root: impl AsRef<Path>) -> Result<RapIndex> {
@@ -771,7 +857,7 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
                     continue;
                 }
             }
-            let mut entries = read_bucket_entries(&frag_dir, bi)?;
+            let mut entries = read_bucket_entries_filtered(&frag_dir, bi, keep_keys.as_ref())?;
             if entries.is_empty() {
                 continue;
             }
@@ -886,7 +972,7 @@ pub fn load_index_entries_for_keys(
             .map(|k| key_bucket(k, meta.num_buckets))
             .collect();
         for bi in wanted {
-            let mut entries = read_bucket_entries(&frag_dir, bi)?;
+            let mut entries = read_bucket_entries_filtered(&frag_dir, bi, Some(&keep_keys))?;
             for e in &mut entries {
                 if !keep_keys.contains(e.key.as_str()) {
                     continue;
@@ -1158,7 +1244,16 @@ pub fn read_registry(root: &Path) -> Result<Vec<String>> {
 }
 
 /// Publish `registry.json` as a v1 object via tmp+rename. Caller must hold the index lock.
+///
+/// When `root` is an `s3://` URI, uses a conditional PUT (`If-None-Match: *` on create,
+/// `If-Match` on update) so two writers cannot clobber a valid v1 object.
 pub fn write_registry(root: &Path, ids: &[String]) -> Result<()> {
+    let uri = root.to_string_lossy();
+    if S3Client::is_remote_uri(uri.trim()) {
+        let (bucket, prefix) = S3Client::parse_uri(uri.trim())?;
+        let key = registry_s3_key(&prefix);
+        return publish_registry_s3(&S3Client::from_env(), &bucket, &key, ids);
+    }
     fs::create_dir_all(root)?;
     let path = root.join("registry.json");
     let tmp = root.join(".registry.json.tmp");
@@ -1172,6 +1267,62 @@ pub fn write_registry(root: &Path, ids: &[String]) -> Result<()> {
         f.sync_all().ok();
     }
     fs::rename(&tmp, &path).context("publish registry.json")
+}
+
+fn registry_s3_key(prefix: &str) -> String {
+    let p = prefix.trim().trim_end_matches('/');
+    if p.is_empty() || p.ends_with("registry.json") {
+        if p.is_empty() {
+            "registry.json".into()
+        } else {
+            p.to_string()
+        }
+    } else {
+        format!("{p}/registry.json")
+    }
+}
+
+fn registry_v1_bytes(ids: &[String]) -> Result<Vec<u8>> {
+    let doc = IndexRegistry {
+        format_version: INDEX_FORMAT_VERSION,
+        fragments: ids.to_vec(),
+    };
+    serde_json::to_vec_pretty(&doc).context("serialize registry")
+}
+
+/// Conditional S3 publish of a v1 `registry.json`. Create uses `If-None-Match: *`;
+/// update uses `If-Match` on the live ETag. A lost race is `s3_precondition_failed`.
+pub fn publish_registry_s3(
+    client: &S3Client,
+    bucket: &str,
+    key: &str,
+    ids: &[String],
+) -> Result<()> {
+    let body = registry_v1_bytes(ids)?;
+    match client.head_object_meta(bucket, key) {
+        Ok(meta) => {
+            let etag = meta
+                .etag
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow!("s3_precondition_failed: HEAD {bucket}/{key} missing ETag")
+                })?;
+            client
+                .put_object_if_match(bucket, key, &body, etag)
+                .with_context(|| format!("CAS PUT s3://{bucket}/{key}"))
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("404") {
+                client
+                    .put_object_if_none_match(bucket, key, &body)
+                    .with_context(|| format!("exclusive PUT s3://{bucket}/{key}"))
+            } else {
+                Err(e).context(format!("HEAD s3://{bucket}/{key}"))
+            }
+        }
+    }
 }
 
 fn gc_unreferenced_fragments(root: &Path, live: &[String]) -> Result<()> {
@@ -3096,6 +3247,36 @@ mod tests {
         let q = crate::query::RapQuerier::new(index);
         let res = q.query("a").unwrap();
         assert!(res.batch.num_rows() >= 1);
+    }
+
+    #[test]
+    fn lazy_lookup_stays_under_bucket_cap() {
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                test_clear_bucket_load_cap();
+            }
+        }
+        let _g = Guard;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 1)).unwrap();
+        IndexBuilder::new(&idx_root, 8)
+            .build_fragment(&paths, "frag-mmap", None)
+            .unwrap();
+
+        test_set_bucket_load_cap(1);
+        let keyed = load_index_for_keys(&idx_root, &[String::from("user_0000")]).unwrap();
+        assert!(
+            !keyed.lookup("user_0000").is_empty(),
+            "point lookup must succeed with one-bucket cap"
+        );
+
+        test_set_bucket_load_cap(1);
+        let err = load_index(&idx_root).expect_err("full load exceeds one-bucket cap");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("working set exceeded bucket cap"), "got {msg}");
     }
 
     #[test]

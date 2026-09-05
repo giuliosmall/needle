@@ -355,6 +355,7 @@ impl S3Client {
             body,
             "UNSIGNED-PAYLOAD",
             None,
+            None,
             true,
         )?;
         if !(200..300).contains(&status) {
@@ -377,6 +378,58 @@ impl S3Client {
                 )
             })?;
             return Ok(());
+        }
+        self.stats.puts.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .bytes_written
+            .fetch_add(body.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Create-only PUT (`If-None-Match: *`). 412 means another writer already created the object.
+    /// Does not fall back to `mc` (that would clobber).
+    pub fn put_object_if_none_match(&self, bucket: &str, key: &str, body: &[u8]) -> Result<()> {
+        self.put_object_conditional(bucket, key, body, ("if-none-match", "*"))
+    }
+
+    /// Compare-and-swap PUT (`If-Match: <etag>`). 412 means the generation changed.
+    pub fn put_object_if_match(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        etag: &str,
+    ) -> Result<()> {
+        self.put_object_conditional(bucket, key, body, ("if-match", etag))
+    }
+
+    fn put_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        cond: (&str, &str),
+    ) -> Result<()> {
+        let uri = self.object_path(bucket, key);
+        let (status, _h, resp) = self.http(
+            "PUT",
+            bucket,
+            &uri,
+            "",
+            body,
+            "UNSIGNED-PAYLOAD",
+            None,
+            Some(cond),
+            true,
+        )?;
+        if status == 412 {
+            bail!("s3_precondition_failed: concurrent writer lost the race for {uri}");
+        }
+        if !(200..300).contains(&status) {
+            bail!(
+                "S3 conditional PUT {uri} status {status}: {}",
+                String::from_utf8_lossy(&resp)
+            );
         }
         self.stats.puts.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -438,8 +491,17 @@ impl S3Client {
         let uri = self.object_path(bucket, key);
         let payload_hash = hex_sha256(b"");
         let sign = !self.cfg.anonymous_read;
-        let (status, headers, body) =
-            self.http("GET", bucket, &uri, "", &[], &payload_hash, None, sign)?;
+        let (status, headers, body) = self.http(
+            "GET",
+            bucket,
+            &uri,
+            "",
+            &[],
+            &payload_hash,
+            None,
+            None,
+            sign,
+        )?;
         if status != 200 {
             bail!(
                 "S3 GET {uri} status {status}: {}",
@@ -468,6 +530,7 @@ impl S3Client {
             &[],
             &payload_hash,
             Some(&range_hdr),
+            None,
             sign,
         )?;
         if !(status == 206 || status == 200) {
@@ -492,8 +555,17 @@ impl S3Client {
         let uri = self.object_path(bucket, key);
         let payload_hash = hex_sha256(b"");
         let sign = !self.cfg.anonymous_read;
-        let (status, headers, body) =
-            self.http("HEAD", bucket, &uri, "", &[], &payload_hash, None, sign)?;
+        let (status, headers, body) = self.http(
+            "HEAD",
+            bucket,
+            &uri,
+            "",
+            &[],
+            &payload_hash,
+            None,
+            None,
+            sign,
+        )?;
         if status != 200 {
             bail!(
                 "S3 HEAD {uri} status {status}: {}",
@@ -522,8 +594,17 @@ impl S3Client {
                 .join("&");
             let uri = self.object_path(bucket, "");
             let payload_hash = hex_sha256(b"");
-            let (status, _h, body) =
-                self.http("GET", bucket, &uri, &query, &[], &payload_hash, None, true)?;
+            let (status, _h, body) = self.http(
+                "GET",
+                bucket,
+                &uri,
+                &query,
+                &[],
+                &payload_hash,
+                None,
+                None,
+                true,
+            )?;
             if status != 200 {
                 bail!(
                     "S3 ListObjects {bucket} status {status}: {}",
@@ -561,6 +642,7 @@ impl S3Client {
         body: &[u8],
         payload_hash: &str,
         range: Option<&str>,
+        extra_signed: Option<(&str, &str)>,
         sign: bool,
     ) -> Result<(u16, String, Vec<u8>)> {
         // Initial attempt + up to 4 retries on connect failure and 429/5xx.
@@ -579,6 +661,7 @@ impl S3Client {
                 body,
                 payload_hash,
                 range,
+                extra_signed,
                 sign,
                 try_reuse,
             ) {
@@ -613,6 +696,7 @@ impl S3Client {
         body: &[u8],
         payload_hash: &str,
         range: Option<&str>,
+        extra_signed: Option<(&str, &str)>,
         sign: bool,
         try_reuse: bool,
     ) -> Result<(u16, String, Vec<u8>)> {
@@ -657,6 +741,9 @@ impl S3Client {
             if let Some(md5) = content_md5.as_deref() {
                 pairs.push(("content-md5".into(), md5.to_string()));
             }
+            if let Some((n, v)) = extra_signed {
+                pairs.push((n.to_ascii_lowercase(), v.to_string()));
+            }
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             let canonical_headers: String =
                 pairs.iter().map(|(n, v)| format!("{n}:{v}\n")).collect();
@@ -695,6 +782,9 @@ impl S3Client {
         }
         if let Some(md5) = content_md5.as_deref() {
             extra.push_str(&format!("Content-MD5: {md5}\r\n"));
+        }
+        if let Some((n, v)) = extra_signed {
+            extra.push_str(&format!("{n}: {v}\r\n"));
         }
         let content_len = if matches!(method, "PUT" | "POST") {
             format!("Content-Length: {}\r\n", body.len())
@@ -2019,5 +2109,221 @@ mod tests {
         let err = client.get_object("bkt", "missing").unwrap_err();
         assert!(format!("{err:#}").contains("404"));
         assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
+    }
+
+    fn start_exclusive_put_mock() -> MockS3 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind exclusive mock");
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let hits = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let store = Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let hits_c = hits.clone();
+        let stop_c = stop.clone();
+        let join = std::thread::spawn(move || {
+            exclusive_put_loop(listener, store, hits_c, stop_c);
+        });
+        MockS3 {
+            endpoint,
+            hits,
+            stop,
+            join: Some(join),
+        }
+    }
+
+    fn exclusive_put_loop(
+        listener: TcpListener,
+        store: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+        hits: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+    ) {
+        for incoming in listener.incoming() {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let mut stream = match incoming {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break None,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(s) = find_header_end(&buf) {
+                            break Some(s);
+                        }
+                        if buf.len() > 1024 * 1024 {
+                            break None;
+                        }
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(sep) = header_end else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..sep]).into_owned();
+            let cl = content_length(&headers).unwrap_or(0);
+            let mut body = buf[sep + 4..].to_vec();
+            while body.len() < cl {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => body.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+            }
+            body.truncate(cl);
+            hits.fetch_add(1, Ordering::SeqCst);
+            let method = headers
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().next())
+                .unwrap_or("");
+            let if_none = headers.lines().any(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("if-none-match:") && l.contains('*')
+            });
+            let (status, extra, resp_body): (u16, Vec<(String, String)>, Vec<u8>) = {
+                let mut g = store.lock().expect("store");
+                if method.eq_ignore_ascii_case("HEAD") {
+                    match g.as_ref() {
+                        Some(b) => (
+                            200,
+                            vec![
+                                ("Content-Length".to_string(), b.len().to_string()),
+                                ("ETag".to_string(), "\"gen1\"".to_string()),
+                            ],
+                            Vec::new(),
+                        ),
+                        None => (404, vec![], b"missing".to_vec()),
+                    }
+                } else if method.eq_ignore_ascii_case("GET") {
+                    match g.as_ref() {
+                        Some(b) => (200, vec![], b.clone()),
+                        None => (404, vec![], b"missing".to_vec()),
+                    }
+                } else if method.eq_ignore_ascii_case("PUT") && if_none {
+                    if g.is_some() {
+                        (412, vec![], b"precondition".to_vec())
+                    } else {
+                        *g = Some(body);
+                        (
+                            200,
+                            vec![("ETag".to_string(), "\"gen1\"".to_string())],
+                            Vec::new(),
+                        )
+                    }
+                } else {
+                    (400, vec![], b"bad".to_vec())
+                }
+            };
+            let reason = match status {
+                200 => "OK",
+                412 => "Precondition Failed",
+                404 => "Not Found",
+                _ => "Error",
+            };
+            let mut resp = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                resp_body.len()
+            );
+            for (k, v) in extra {
+                resp.push_str(&format!("{k}: {v}\r\n"));
+            }
+            resp.push_str("\r\n");
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(&resp_body);
+            let _ = stream.flush();
+        }
+    }
+
+    #[test]
+    fn mock_put_if_none_match_second_writer_fails() {
+        let mock = start_exclusive_put_mock();
+        let client = test_client(&mock.endpoint, None);
+        let body_a = br#"{"format_version":1,"fragments":["frag-a"]}"#;
+        let body_b = br#"{"format_version":1,"fragments":["frag-b"]}"#;
+        client
+            .put_object_if_none_match("bkt", "idx/registry.json", body_a)
+            .expect("first exclusive put");
+        let err = client
+            .put_object_if_none_match("bkt", "idx/registry.json", body_b)
+            .expect_err("second exclusive put must 412");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("s3_precondition_failed") || msg.contains("412"),
+            "got {msg}"
+        );
+        let got = client
+            .get_object("bkt", "idx/registry.json")
+            .expect("get winner");
+        let v: serde_json::Value = serde_json::from_slice(&got).expect("v1 json");
+        assert_eq!(v["format_version"], 1);
+        assert_eq!(v["fragments"], serde_json::json!(["frag-a"]));
+        assert_eq!(&got, body_a);
+    }
+
+    #[test]
+    fn mock_put_if_none_match_two_threads_one_wins() {
+        let mock = start_exclusive_put_mock();
+        let ep = mock.endpoint.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+        let ep1 = ep.clone();
+        let ep2 = ep;
+        let h1 = std::thread::spawn(move || {
+            let c = test_client(&ep1, None);
+            let body = br#"{"format_version":1,"fragments":["frag-a"]}"#;
+            b1.wait();
+            c.put_object_if_none_match("bkt", "idx/registry.json", body)
+        });
+        let h2 = std::thread::spawn(move || {
+            let c = test_client(&ep2, None);
+            let body = br#"{"format_version":1,"fragments":["frag-b"]}"#;
+            b2.wait();
+            c.put_object_if_none_match("bkt", "idx/registry.json", body)
+        });
+        let r1 = h1.join().expect("t1");
+        let r2 = h2.join().expect("t2");
+        let wins = [r1.is_ok(), r2.is_ok()].into_iter().filter(|w| *w).count();
+        let losses = [r1.is_err(), r2.is_err()]
+            .into_iter()
+            .filter(|w| *w)
+            .count();
+        assert_eq!(wins, 1, "exactly one publisher must win");
+        assert_eq!(losses, 1, "exactly one publisher must error");
+        let client = test_client(&mock.endpoint, None);
+        let got = client.get_object("bkt", "idx/registry.json").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&got).unwrap();
+        assert_eq!(v["format_version"], 1);
+        let frags = v["fragments"].as_array().expect("fragments");
+        assert_eq!(frags.len(), 1);
+        let id = frags[0].as_str().unwrap();
+        assert!(id == "frag-a" || id == "frag-b", "got {id}");
+    }
+
+    #[test]
+    fn publish_registry_s3_writes_valid_v1_json() {
+        let mock = start_exclusive_put_mock();
+        let client = test_client(&mock.endpoint, None);
+        crate::index::publish_registry_s3(
+            &client,
+            "bkt",
+            "idx/registry.json",
+            &[String::from("frag-v1")],
+        )
+        .expect("publish");
+        let got = client.get_object("bkt", "idx/registry.json").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&got).unwrap();
+        assert_eq!(v["format_version"], 1);
+        assert_eq!(v["fragments"], serde_json::json!(["frag-v1"]));
     }
 }
