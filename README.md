@@ -144,11 +144,11 @@ maintain it without rewriting lake Parquet:
 
 | Command | What it does |
 |---------|----------------|
-| `needle forget --key K` | Hide `K` from Needle lookups only (sticky `forgotten.jsonl`). **Not a GDPR delete** — Parquet is unchanged. `--check` warns if the key still has source files. |
-| `needle compact` | Rewrite to one fragment: last `(key, file)` wins, apply forget + Iceberg drops. Unreferenced fragment dirs are deleted. `registry.json` (`format_version` 1) points at the new id (`compact-<unix-ms>` unless `--fragment` is set). |
+| `needle forget --key K` | Hide `K` from Needle lookups only (sticky `forgotten.jsonl`). Hide-only — lake Parquet is unchanged. `--check` warns if the key still has source files. There is no `needle delete`. |
+| `needle compact` | Rewrite to one fragment: last `(key, file)` wins, apply forget + Iceberg drops. Unreferenced fragment dirs are removed. `registry.json` (`format_version` 1) points at the new id (`compact-<unix-ms>` unless `--fragment` is set). |
 | `needle verify` | Compare stored size / ETag / mtime (`file_idents`) to live local files or S3 HEAD. Exits non-zero if any file is `stale`. |
 
-Queries **fail closed** on identity mismatch (`stale_file_identity`) unless you pass `--no-verify` (unsafe). `registry.json` is published with tmp+rename under an exclusive `.needle.lock` locally, or a conditional S3 PUT (`If-None-Match` / `If-Match`) when the index root is `s3://`. `needled` reloads when that file’s mtime changes, so forget/compact show up without a restart. Default is lazy buckets: only the hashed bucket is mmapped and deserialized (`--full-index` loads every bucket into RAM). File dictionary stays in RAM. See [`FORMAT.md`](./FORMAT.md).
+Queries **fail closed** on identity mismatch (`stale_file_identity`) unless you pass `--no-verify` (unsafe). `registry.json` is published with tmp+rename under an exclusive `.needle.lock` locally, or a conditional S3 PUT (`If-None-Match` / `If-Match`) when the index root is `s3://`. `needled` reloads when that file’s mtime changes, so forget/compact show up without a restart. Default is lazy buckets: only the hashed bucket is mmapped and deserialized (`--full-index` loads every bucket into RAM). The file dictionary is mmapped `files.bin`; a point lookup decodes only the files that key names. See [`FORMAT.md`](./FORMAT.md).
 
 ### HTTP daemon
 
@@ -300,12 +300,13 @@ NOTES.md               Article mapping & fidelity notes
 
 ## Status / honesty
 
-**0.4 — usable beyond a laptop RAM budget (mmapped buckets, S3-conditional registry publish); still not 1.0.** This is not Spotify’s RAP.
+**1.0 — point lookups on Iceberg REST + AWS S3 with mmapped buckets and on-demand file dictionary, frozen v1 index and HTTP; retention is hide-only (Needle never rewrites lake Parquet). Not Spotify RAP. Not lake SQL.**
 
 **Stability policy.** Index `format_version` 1 and needled HTTP JSON v1 are **frozen**: current fields stay, additive optional keys are allowed, breaking changes require a new major (`format_version` 2 or `/v2/`). See [`FORMAT.md`](./FORMAT.md) and [`HTTP.md`](./HTTP.md).
 
-- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host, MinIO and AWS, STS session tokens, retries, checksums), Iceberg REST catalog + Hadoop fallback (`--catalog glue|nessie` hard-error), incremental index (add/drop live-set, v2 position/equality deletes, fail-closed on unsupported deletes), compact/forget/verify, **strict** file identity on query (`--no-verify` unsafe), `needled` TLS + bearer token, frozen `registry.json` v1 + writer lock + compact GC, mmapped hash buckets (point lookup does not load the full index), S3-conditional registry publish, CI, MinIO lake harness, broad unit/E2E suite.
-- **Still out of scope:** mmap of the file dictionary / multi-TB working sets, Glue/Nessie (explicit unsupported), multi-writer beyond flock + S3 If-Match, lake-wide SQL, physical Parquet/Iceberg deletes. `--covering` is listen-shaped only (refused on generic schemas). `forget` only hides keys in Needle. There is no `needle delete`.
+- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host, MinIO and AWS, STS session tokens, retries, checksums), Iceberg REST catalog + Hadoop fallback (`--catalog glue|nessie` hard-error), incremental index (add/drop live-set, v2 position/equality deletes applied on read, fail-closed on unsupported encodings), compact/forget/verify, **strict** file identity on query (`--no-verify` unsafe), `needled` TLS + bearer token, frozen `registry.json` v1 + writer lock + compact GC, mmapped hash buckets and on-demand `files.bin` dictionary, S3-conditional registry publish, CI, MinIO lake harness, broad unit/E2E suite.
+- **Still out of scope:** Glue/Nessie (explicit unsupported), multi-writer beyond flock + S3 If-Match, lake-wide SQL, catalog-committed Iceberg position files from Needle. `--covering` is listen-shaped only (refused on generic schemas). `forget` only hides keys in Needle. There is no `needle delete`.
+- **Residual RAM on point lookup:** registry fragment-id list, fragment manifests (without `files[]` when `files.bin` exists), mmap handles for `files.bin` + one bucket, decoded dict records for files that key names, forgotten-key set, that key’s postings. Not the whole file dictionary.
 - **Custom Parquet prep** (ZSTD multi-frame pages, skippable alignment, interleaving) uses a low-level writer so layouts live **inside** `.parquet` files readable by Arrow.
 
 Apache-2.0.

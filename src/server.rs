@@ -6,8 +6,8 @@
 //! Distinct from `needle serve`, which is a Range file server.
 
 use crate::index::{
-    load_index, load_index_entries_for_keys, load_index_file_dictionary, IndexFragmentMeta,
-    STALE_FILE_IDENTITY,
+    load_index, load_index_entries_for_keys, load_index_file_dictionary, FileDict,
+    IndexFragmentMeta, STALE_FILE_IDENTITY,
 };
 use crate::query::{ExplainResult, QueryOptions, QueryResult, RapQuerier};
 use crate::s3::S3Client;
@@ -264,7 +264,7 @@ pub fn serve_forever(opts: DaemonOptions) -> Result<()> {
 }
 
 struct LoadedInner {
-    files: Arc<Vec<PathBuf>>,
+    files: FileDict,
     fragments: Vec<IndexFragmentMeta>,
     querier: Option<RapQuerier>,
     registry_mtime: Option<SystemTime>,
@@ -296,7 +296,7 @@ fn load_inner(opts: &DaemonOptions) -> Result<LoadedInner> {
     } else {
         let index = load_index(&opts.index)?;
         Ok(LoadedInner {
-            files: Arc::clone(&index.files),
+            files: index.files.clone(),
             fragments: index.fragments.clone(),
             querier: Some(RapQuerier::new(index)),
             registry_mtime: mt,
@@ -889,7 +889,7 @@ fn with_querier<T>(
     } else {
         let index = load_index_entries_for_keys(
             &state.index_dir,
-            Arc::clone(&inner.files),
+            inner.files.clone(),
             &inner.fragments,
             &[key.to_string()],
         )?;
@@ -908,7 +908,7 @@ fn stats_json(state: &DaemonState) -> Value {
             json!({
                 "fragment_id": m.fragment_id,
                 "num_buckets": m.num_buckets,
-                "num_files": m.files.len(),
+                "num_files": m.file_count.unwrap_or(m.files.len() as u32),
                 "created_at": m.created_at,
                 "key_columns": m.key_columns,
                 "value_columns": m.value_columns,

@@ -12,6 +12,7 @@
 use crate::prepared::{self, ByteSpan, FrameLoc, PreparedManifest};
 use crate::s3::{S3ChunkReader, S3Client};
 use anyhow::{anyhow, bail, Context, Result};
+use serde::de::{Deserializer, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -20,6 +21,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 thread_local! {
     static BUCKET_LOADS: Cell<u64> = const { Cell::new(0) };
@@ -48,6 +50,38 @@ fn account_bucket_load() -> Result<()> {
         bail!(
             "index working set exceeded bucket cap ({n} > {max}); \
              point lookup deserializes one mmapped hash bucket"
+        );
+    }
+    Ok(())
+}
+
+thread_local! {
+    static DICT_LOADS: Cell<u64> = const { Cell::new(0) };
+    static DICT_CAP: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+/// Test hook: fail if this thread decodes more file-dictionary records than `cap`.
+pub fn test_set_dict_load_cap(cap: u64) {
+    DICT_LOADS.with(|c| c.set(0));
+    DICT_CAP.with(|c| c.set(cap));
+}
+
+/// Restore the unlimited file-dictionary decode cap for this thread.
+pub fn test_clear_dict_load_cap() {
+    test_set_dict_load_cap(u64::MAX);
+}
+
+fn account_dict_load() -> Result<()> {
+    let n = DICT_LOADS.with(|c| {
+        let n = c.get().saturating_add(1);
+        c.set(n);
+        n
+    });
+    let max = DICT_CAP.with(|c| c.get());
+    if n > max {
+        bail!(
+            "index working set exceeded file-dictionary cap ({n} > {max}); \
+             point lookup decodes only files named by the key's postings"
         );
     }
     Ok(())
@@ -208,6 +242,9 @@ pub struct IndexFragmentMeta {
     /// Iceberg delete files applied when this fragment was built (`#[serde(default)]` for old manifests).
     #[serde(default)]
     pub iceberg_delete_files: Vec<String>,
+    /// Count of dictionary entries. Additive v1; used when `files.bin` is the source of truth.
+    #[serde(default)]
+    pub file_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,10 +270,174 @@ fn parse_iceberg_snapshot_note(note: &str) -> Option<i64> {
         .and_then(|id| id.parse().ok())
 }
 
+const FILES_BIN_MAGIC: &[u8; 4] = b"NDFD";
+const FILES_BIN_VERSION: u32 = 1;
+
+/// On-demand file dictionary: mmapped `files.bin` shards, or a resident v1 fallback.
+#[derive(Clone, Default)]
+pub struct FileDict {
+    shards: Vec<DictShard>,
+}
+
+#[derive(Clone)]
+struct DictShard {
+    base: u32,
+    count: u32,
+    inner: DictInner,
+}
+
+#[derive(Clone)]
+enum DictInner {
+    Resident(Arc<Vec<PathBuf>>),
+    Mapped(Arc<MappedDict>),
+}
+
+struct MappedDict {
+    mmap: memmap2::Mmap,
+    root: PathBuf,
+    count: u32,
+    cache: std::sync::Mutex<HashMap<u32, PathBuf>>,
+}
+
+impl std::fmt::Debug for FileDict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileDict")
+            .field("len", &self.len())
+            .field("shards", &self.shards.len())
+            .finish()
+    }
+}
+
+impl FileDict {
+    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
+        let count = paths.len() as u32;
+        Self {
+            shards: vec![DictShard {
+                base: 0,
+                count,
+                inner: DictInner::Resident(Arc::new(paths)),
+            }],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards
+            .last()
+            .map(|s| s.base as usize + s.count as usize)
+            .unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn push_shard(&mut self, inner: DictInner, count: u32) {
+        let base = self.len() as u32;
+        self.shards.push(DictShard { base, count, inner });
+    }
+
+    /// Decode every dictionary record (used by tests to prove a cap).
+    pub fn materialize_all(&self) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::with_capacity(self.len());
+        for i in 0..self.len() as u32 {
+            out.push(self.get(i)?);
+        }
+        Ok(out)
+    }
+
+    pub fn get(&self, ordinal: u32) -> Result<PathBuf> {
+        let shard = self
+            .shards
+            .iter()
+            .find(|s| ordinal >= s.base && ordinal < s.base + s.count)
+            .with_context(|| format!("file ordinal {ordinal} out of range"))?;
+        let local = ordinal - shard.base;
+        match &shard.inner {
+            DictInner::Resident(v) => v
+                .get(local as usize)
+                .cloned()
+                .with_context(|| format!("file ordinal {ordinal} out of range")),
+            DictInner::Mapped(m) => {
+                if let Some(p) = m.cache.lock().unwrap().get(&local) {
+                    return Ok(p.clone());
+                }
+                account_dict_load()?;
+                let rel = m.path_at(local)?;
+                let path = resolve_data_path(&m.root, &rel);
+                m.cache.lock().unwrap().insert(local, path.clone());
+                Ok(path)
+            }
+        }
+    }
+}
+
+impl MappedDict {
+    fn path_at(&self, local: u32) -> Result<String> {
+        if local >= self.count {
+            bail!(
+                "files.bin ordinal {local} out of range (count={})",
+                self.count
+            );
+        }
+        let table = 12usize;
+        let off_pos = table + (local as usize) * 8;
+        let end_pos = table + (local as usize + 1) * 8;
+        if end_pos + 8 > self.mmap.len() {
+            bail!("files.bin truncated at offset table");
+        }
+        let start = u64::from_le_bytes(self.mmap[off_pos..off_pos + 8].try_into()?);
+        let rec_end = u64::from_le_bytes(self.mmap[end_pos..end_pos + 8].try_into()?);
+        let start = start as usize;
+        let rec_end = rec_end as usize;
+        if rec_end > self.mmap.len() || start + 4 > rec_end {
+            bail!("files.bin record {local} out of bounds");
+        }
+        let rec = &self.mmap[start..rec_end];
+        let plen = u32::from_le_bytes(rec[0..4].try_into()?) as usize;
+        if 4 + plen > rec.len() {
+            bail!("files.bin record {local} path truncated");
+        }
+        let path = std::str::from_utf8(&rec[4..4 + plen]).context("files.bin path is not utf-8")?;
+        Ok(path.to_string())
+    }
+}
+
+fn ignore_any<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    IgnoredAny::deserialize(deserializer)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ManifestSkipFiles {
+    fragment_id: String,
+    created_at: String,
+    #[serde(default, deserialize_with = "ignore_any")]
+    #[allow(dead_code)]
+    files: (),
+    num_buckets: u32,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    key_columns: Vec<String>,
+    #[serde(default)]
+    value_columns: Vec<String>,
+    #[serde(default)]
+    iceberg_snapshot_id: Option<i64>,
+    #[serde(default, deserialize_with = "ignore_any")]
+    #[allow(dead_code)]
+    file_idents: (),
+    #[serde(default)]
+    dropped_files: Vec<String>,
+    #[serde(default)]
+    iceberg_delete_files: Vec<String>,
+    #[serde(default)]
+    file_count: Option<u32>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct RapIndex {
-    /// Shared so stress waves can reuse the file dictionary without cloning 300k paths.
-    pub files: std::sync::Arc<Vec<PathBuf>>,
+    /// File dictionary: mmapped `files.bin` (on-demand) or resident v1 fallback.
+    pub files: FileDict,
     pub entries_by_key: HashMap<String, Vec<RapIndexEntry>>,
     pub fragments: Vec<IndexFragmentMeta>,
     pub root: PathBuf,
@@ -250,11 +451,8 @@ impl RapIndex {
             .unwrap_or(&[])
     }
 
-    pub fn file_path(&self, ordinal: u32) -> Result<&Path> {
-        self.files
-            .get(ordinal as usize)
-            .map(|p| p.as_path())
-            .with_context(|| format!("file ordinal {ordinal} out of range"))
+    pub fn file_path(&self, ordinal: u32) -> Result<PathBuf> {
+        self.files.get(ordinal)
     }
 
     pub fn num_keys(&self) -> usize {
@@ -470,6 +668,7 @@ impl IndexBuilder {
 
         let note_str = note.map(|s| s.to_string());
         let iceberg_snapshot_id = note_str.as_deref().and_then(parse_iceberg_snapshot_note);
+        let n_files = file_dict.len() as u32;
         let meta = IndexFragmentMeta {
             fragment_id: fragment_id.to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -482,8 +681,10 @@ impl IndexBuilder {
             file_idents,
             dropped_files: Vec::new(),
             iceberg_delete_files: Vec::new(),
+            file_count: Some(n_files),
         };
         serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, &meta)?;
+        write_files_bin(&frag_dir, &meta.files, &meta.file_idents)?;
 
         let mut registry: Vec<String> = if self.root.join("registry.json").exists() {
             read_registry(&self.root)?
@@ -807,6 +1008,77 @@ fn mmap_deserialize_bin(path: &Path) -> Result<Vec<RapIndexEntry>> {
     Ok(bincode::deserialize(mmap.as_ref())?)
 }
 
+pub(crate) fn write_files_bin(
+    frag_dir: &Path,
+    files: &[String],
+    idents: &[FileIdent],
+) -> Result<()> {
+    let mut payload = Vec::new();
+    let mut rel_off: Vec<u64> = Vec::with_capacity(files.len() + 1);
+    for (i, path) in files.iter().enumerate() {
+        rel_off.push(payload.len() as u64);
+        let pb = path.as_bytes();
+        payload.extend_from_slice(&(pb.len() as u32).to_le_bytes());
+        payload.extend_from_slice(pb);
+        let etag = idents
+            .get(i)
+            .and_then(|id| id.etag.as_deref())
+            .unwrap_or("");
+        payload.extend_from_slice(&(etag.len() as u32).to_le_bytes());
+        payload.extend_from_slice(etag.as_bytes());
+        let size = idents.get(i).and_then(|id| id.size).unwrap_or(u64::MAX);
+        payload.extend_from_slice(&size.to_le_bytes());
+        let mtime = idents.get(i).and_then(|id| id.mtime_ms).unwrap_or(i64::MIN);
+        payload.extend_from_slice(&mtime.to_le_bytes());
+    }
+    rel_off.push(payload.len() as u64);
+    let table_bytes = 8 * (files.len() + 1);
+    let payload_off = 12 + table_bytes;
+    let mut out = Vec::with_capacity(payload_off + payload.len());
+    out.extend_from_slice(FILES_BIN_MAGIC);
+    out.extend_from_slice(&FILES_BIN_VERSION.to_le_bytes());
+    out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for o in rel_off {
+        out.extend_from_slice(&(payload_off as u64 + o).to_le_bytes());
+    }
+    out.extend_from_slice(&payload);
+    fs::write(frag_dir.join("files.bin"), out)
+        .with_context(|| format!("write {}/files.bin", frag_dir.display()))
+}
+
+fn open_mapped_dict(frag_dir: &Path, root: &Path) -> Result<Option<MappedDict>> {
+    let path = frag_dir.join("files.bin");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let len = file.metadata()?.len();
+    if len < 12 {
+        return Ok(None);
+    }
+    // SAFETY: files.bin is written once and never rewritten in place.
+    let mmap =
+        unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+    if mmap.len() < 12 || &mmap[0..4] != FILES_BIN_MAGIC {
+        bail!("files.bin missing NDFD magic in {}", path.display());
+    }
+    let version = u32::from_le_bytes(mmap[4..8].try_into()?);
+    if version != FILES_BIN_VERSION {
+        bail!("unsupported files.bin version {version} (supported: {FILES_BIN_VERSION})");
+    }
+    let count = u32::from_le_bytes(mmap[8..12].try_into()?);
+    let need = 12usize + 8 * (count as usize + 1);
+    if mmap.len() < need {
+        bail!("files.bin truncated header in {}", path.display());
+    }
+    Ok(Some(MappedDict {
+        mmap,
+        root: root.to_path_buf(),
+        count,
+        cache: std::sync::Mutex::new(HashMap::new()),
+    }))
+}
+
 pub fn load_index(root: impl AsRef<Path>) -> Result<RapIndex> {
     load_index_inner(root.as_ref(), None)
 }
@@ -821,7 +1093,7 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
     let root = root.to_path_buf();
     let registry = read_registry(&root)?;
 
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut files = FileDict::default();
     let mut entries_by_key: HashMap<String, Vec<RapIndexEntry>> = HashMap::new();
     let mut fragments: Vec<IndexFragmentMeta> = Vec::new();
     let mut dropped: HashSet<String> = HashSet::new();
@@ -829,28 +1101,34 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
 
     for frag_id in registry {
         let frag_dir = root.join("fragments").join(&frag_id);
-        let meta: IndexFragmentMeta =
-            serde_json::from_reader(File::open(frag_dir.join("manifest.json"))?)?;
+        let (meta, shard_inner, n_files) = load_fragment_dict(&root, &frag_dir)?;
+        let base = files.len() as u32;
+        files.push_shard(shard_inner, n_files);
 
-        let mut local_to_global: Vec<u32> = Vec::with_capacity(meta.files.len());
-        for rel in &meta.files {
-            let abs = resolve_data_path(&root, rel);
-            let global = files.len() as u32;
-            files.push(abs);
-            local_to_global.push(global);
+        if is_iceberg_fragment(&meta) {
+            for d in &meta.dropped_files {
+                mark_file_dropped(&mut dropped, &root, d);
+            }
+            if !meta.dropped_files.is_empty() {
+                retain_undropped_entries(&mut entries_by_key, &dropped, &root, |ord| {
+                    files
+                        .get(ord)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+            }
+        } else {
+            for d in &meta.dropped_files {
+                mark_file_dropped(&mut dropped, &root, d);
+            }
         }
-        apply_fragment_file_liveness(&mut dropped, &mut entries_by_key, &root, &meta, |ord| {
-            files
-                .get(ord as usize)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
 
         let wanted: Option<HashSet<u32>> =
             only_keys.map(|ks| ks.iter().map(|k| key_bucket(k, meta.num_buckets)).collect());
         let keep_keys: Option<HashSet<&str>> =
             only_keys.map(|ks| ks.iter().map(|s| s.as_str()).collect());
 
+        let mut iceberg_new_ords: Vec<u32> = Vec::new();
         for bi in 0..meta.num_buckets {
             if let Some(ref w) = wanted {
                 if !w.contains(&bi) {
@@ -868,12 +1146,10 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
                         continue;
                     }
                 }
-                let local = e.file as usize;
-                if local < local_to_global.len() {
-                    e.file = local_to_global[local];
+                let local = e.file;
+                if local < n_files {
+                    e.file = base + local;
                 }
-                // IndexBuilder stores full row lists and records key_columns.
-                // Compact `[first]+value_count` encoding is lake-only (empty key_columns).
                 if meta.key_columns.is_empty() {
                     expand_compact_rows(e);
                 }
@@ -882,22 +1158,25 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
                     continue;
                 }
                 let stored = files
-                    .get(e.file as usize)
+                    .get(e.file)
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let rel = meta.files.get(local).map(|s| s.as_str()).unwrap_or("");
-                if file_is_dropped(&dropped, &root, rel)
-                    || file_is_dropped(&dropped, &root, &stored)
-                {
+                if is_iceberg_fragment(&meta) {
+                    mark_file_present(&mut dropped, &root, &stored);
+                    iceberg_new_ords.push(e.file);
+                }
+                if file_is_dropped(&dropped, &root, &stored) {
                     continue;
                 }
                 absorb_entry(&mut entries_by_key, e.clone());
             }
         }
         if is_iceberg_fragment(&meta) {
-            supersede_entries_for_files(&mut entries_by_key, &local_to_global, |ord| {
+            iceberg_new_ords.sort_unstable();
+            iceberg_new_ords.dedup();
+            supersede_entries_for_files(&mut entries_by_key, &iceberg_new_ords, |ord| {
                 files
-                    .get(ord as usize)
+                    .get(ord)
                     .map(|p| file_compare_id(&root, &p.to_string_lossy()))
                     .unwrap_or_default()
             });
@@ -906,7 +1185,7 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
     }
     retain_undropped_entries(&mut entries_by_key, &dropped, &root, |ord| {
         files
-            .get(ord as usize)
+            .get(ord)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
@@ -916,40 +1195,68 @@ fn load_index_inner(root: &Path, only_keys: Option<&[String]>) -> Result<RapInde
 
     Ok(RapIndex {
         root,
-        files: std::sync::Arc::new(files),
+        files,
         entries_by_key,
         fragments,
     })
 }
 
-/// Load file dictionary once (heavy for 300k lakes). Reuse across stress waves.
+fn load_fragment_dict(root: &Path, frag_dir: &Path) -> Result<(IndexFragmentMeta, DictInner, u32)> {
+    if let Some(mapped) = open_mapped_dict(frag_dir, root)? {
+        let count = mapped.count;
+        let man = frag_dir.join("manifest.json");
+        let skip: ManifestSkipFiles = serde_json::from_reader(File::open(&man)?)
+            .with_context(|| format!("parse {}", man.display()))?;
+        let meta = IndexFragmentMeta {
+            fragment_id: skip.fragment_id,
+            created_at: skip.created_at,
+            files: Vec::new(),
+            num_buckets: skip.num_buckets,
+            note: skip.note,
+            key_columns: skip.key_columns,
+            value_columns: skip.value_columns,
+            iceberg_snapshot_id: skip.iceberg_snapshot_id,
+            file_idents: Vec::new(),
+            dropped_files: skip.dropped_files,
+            iceberg_delete_files: skip.iceberg_delete_files,
+            file_count: skip.file_count.or(Some(count)),
+        };
+        Ok((meta, DictInner::Mapped(Arc::new(mapped)), count))
+    } else {
+        let man = frag_dir.join("manifest.json");
+        let meta: IndexFragmentMeta = serde_json::from_reader(File::open(&man)?)
+            .with_context(|| format!("parse {}", man.display()))?;
+        let paths: Vec<PathBuf> = meta
+            .files
+            .iter()
+            .map(|rel| resolve_data_path(root, rel))
+            .collect();
+        let n = paths.len() as u32;
+        Ok((meta, DictInner::Resident(Arc::new(paths)), n))
+    }
+}
+
+/// Load file dictionary (mmapped `files.bin` when present) without bucket bodies.
 pub fn load_index_file_dictionary(
     root: impl AsRef<Path>,
-) -> Result<(
-    std::sync::Arc<Vec<PathBuf>>,
-    Vec<IndexFragmentMeta>,
-    PathBuf,
-)> {
+) -> Result<(FileDict, Vec<IndexFragmentMeta>, PathBuf)> {
     let root = root.as_ref().to_path_buf();
     let registry = read_registry(&root)?;
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut files = FileDict::default();
     let mut fragments = Vec::new();
     for frag_id in registry {
         let frag_dir = root.join("fragments").join(&frag_id);
-        let meta: IndexFragmentMeta =
-            serde_json::from_reader(File::open(frag_dir.join("manifest.json"))?)?;
-        for rel in &meta.files {
-            files.push(resolve_data_path(&root, rel));
-        }
+        let (meta, inner, n) = load_fragment_dict(&root, &frag_dir)?;
+        files.push_shard(inner, n);
         fragments.push(meta);
     }
-    Ok((std::sync::Arc::new(files), fragments, root))
+    Ok((files, fragments, root))
 }
 
 /// Build a RapIndex for `keys` using a preloaded file dictionary (no manifest re-read).
 pub fn load_index_entries_for_keys(
     root: &Path,
-    files: std::sync::Arc<Vec<PathBuf>>,
+    files: FileDict,
     fragments: &[IndexFragmentMeta],
     keys: &[String],
 ) -> Result<RapIndex> {
@@ -957,29 +1264,48 @@ pub fn load_index_entries_for_keys(
     let keep_keys: HashSet<&str> = keys.iter().map(|s| s.as_str()).collect();
     let forgotten = load_forgotten(root);
     let mut dropped: HashSet<String> = HashSet::new();
-    let mut file_base = 0usize;
+    let mut file_base = 0u32;
     for meta in fragments {
-        let n_files = meta.files.len();
-        apply_fragment_file_liveness(&mut dropped, &mut entries_by_key, root, meta, |ord| {
+        let n_files = meta.file_count.unwrap_or(meta.files.len() as u32).max(
             files
-                .get(ord as usize)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
+                .shards
+                .iter()
+                .find(|s| s.base == file_base)
+                .map(|s| s.count)
+                .unwrap_or(0),
+        );
+        if is_iceberg_fragment(meta) {
+            for d in &meta.dropped_files {
+                mark_file_dropped(&mut dropped, root, d);
+            }
+            if !meta.dropped_files.is_empty() {
+                retain_undropped_entries(&mut entries_by_key, &dropped, root, |ord| {
+                    files
+                        .get(ord)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                });
+            }
+        } else {
+            for d in &meta.dropped_files {
+                mark_file_dropped(&mut dropped, root, d);
+            }
+        }
         let frag_dir = root.join("fragments").join(&meta.fragment_id);
         let wanted: HashSet<u32> = keys
             .iter()
             .map(|k| key_bucket(k, meta.num_buckets))
             .collect();
+        let mut iceberg_new_ords: Vec<u32> = Vec::new();
         for bi in wanted {
             let mut entries = read_bucket_entries_filtered(&frag_dir, bi, Some(&keep_keys))?;
             for e in &mut entries {
                 if !keep_keys.contains(e.key.as_str()) {
                     continue;
                 }
-                let local = e.file as usize;
+                let local = e.file;
                 if local < n_files {
-                    e.file = (file_base + local) as u32;
+                    e.file = file_base + local;
                 }
                 if meta.key_columns.is_empty() {
                     expand_compact_rows(e);
@@ -989,22 +1315,25 @@ pub fn load_index_entries_for_keys(
                     continue;
                 }
                 let stored = files
-                    .get(e.file as usize)
+                    .get(e.file)
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let rel = meta.files.get(local).map(|s| s.as_str()).unwrap_or("");
-                if file_is_dropped(&dropped, root, rel) || file_is_dropped(&dropped, root, &stored)
-                {
+                if is_iceberg_fragment(meta) {
+                    mark_file_present(&mut dropped, root, &stored);
+                    iceberg_new_ords.push(e.file);
+                }
+                if file_is_dropped(&dropped, root, &stored) {
                     continue;
                 }
                 absorb_entry(&mut entries_by_key, e.clone());
             }
         }
         if is_iceberg_fragment(meta) {
-            let new_ords: Vec<u32> = (file_base..file_base + n_files).map(|i| i as u32).collect();
-            supersede_entries_for_files(&mut entries_by_key, &new_ords, |ord| {
+            iceberg_new_ords.sort_unstable();
+            iceberg_new_ords.dedup();
+            supersede_entries_for_files(&mut entries_by_key, &iceberg_new_ords, |ord| {
                 files
-                    .get(ord as usize)
+                    .get(ord)
                     .map(|p| file_compare_id(root, &p.to_string_lossy()))
                     .unwrap_or_default()
             });
@@ -1013,7 +1342,7 @@ pub fn load_index_entries_for_keys(
     }
     retain_undropped_entries(&mut entries_by_key, &dropped, root, |ord| {
         files
-            .get(ord as usize)
+            .get(ord)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
@@ -1142,7 +1471,7 @@ pub fn ensure_entries_fresh(
     let mut seen = HashSet::new();
     for e in entries {
         let open = match index.file_path(e.file) {
-            Ok(p) => p.to_path_buf(),
+            Ok(p) => p,
             Err(_) => continue,
         };
         let path_key = open.to_string_lossy().into_owned();
@@ -1590,6 +1919,7 @@ fn write_fragment_dir(
         write_bincode(&bin_path, entries)?;
     }
     serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, meta)?;
+    write_files_bin(&frag_dir, &meta.files, &meta.file_idents)?;
     Ok(frag_dir)
 }
 
@@ -1770,6 +2100,7 @@ pub fn compact_index(root: impl AsRef<Path>, fragment_id: Option<&str>) -> Resul
         file_idents,
         dropped_files: Vec::new(),
         iceberg_delete_files: Vec::new(),
+        file_count: Some(n_files as u32),
     };
     write_fragment_dir(root, &meta, &buckets)?;
     write_registry(root, std::slice::from_ref(&fragment_id))?;
@@ -1830,6 +2161,7 @@ pub fn forget_keys(
         file_idents: Vec::new(),
         dropped_files: Vec::new(),
         iceberg_delete_files: Vec::new(),
+        file_count: Some(0),
     };
     let frag_dir = write_fragment_dir(root, &meta, &buckets)?;
     append_forgotten(root, keys)?;
@@ -2979,11 +3311,11 @@ mod tests {
         let after = load_index(&idx_root).unwrap();
         assert!(after.lookup(&gone).is_empty());
         assert!(!after.lookup(&kept).is_empty());
+        let dict_paths = after.files.materialize_all().unwrap();
         assert!(
-            after.fragments[0]
-                .files
-                .iter()
-                .all(|f| normalize_stored_key(f) != normalize_stored_key(&drop_path)),
+            dict_paths.iter().all(|f| {
+                normalize_stored_key(&f.to_string_lossy()) != normalize_stored_key(&drop_path)
+            }),
             "compacted dict should omit dropped path {drop_path}"
         );
     }
@@ -3032,7 +3364,17 @@ mod tests {
             "resized parquet must be reported stale: {bad:?}"
         );
 
-        let ident = &load_index(&idx_root).unwrap().fragments[0].file_idents[0];
+        let meta: IndexFragmentMeta = serde_json::from_reader(
+            File::open(
+                idx_root
+                    .join("fragments")
+                    .join("frag-v")
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ident = &meta.file_idents[0];
         let live = probe_file_ident(ident.path.as_str(), &paths[0]);
         assert!(
             file_ident_mismatch(ident, &live),
@@ -3277,6 +3619,71 @@ mod tests {
         let err = load_index(&idx_root).expect_err("full load exceeds one-bucket cap");
         let msg = format!("{err:#}");
         assert!(msg.contains("working set exceeded bucket cap"), "got {msg}");
+    }
+
+    #[test]
+    fn point_lookup_does_not_decode_whole_file_dict() {
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                test_clear_dict_load_cap();
+            }
+        }
+        let _g = Guard;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("parquet");
+        let idx_root = tmp.path().join("rap-index");
+        let paths = write_sample_dataset(&tiny_opts(&data, WriteMode::Sorted, 1)).unwrap();
+        IndexBuilder::new(&idx_root, 8)
+            .build_fragment(&paths, "frag-dict", None)
+            .unwrap();
+        let frag_dir = idx_root.join("fragments").join("frag-dict");
+        let meta: IndexFragmentMeta =
+            serde_json::from_reader(File::open(frag_dir.join("manifest.json")).unwrap()).unwrap();
+        let n_fake = 20_000u32;
+        let mut files = Vec::with_capacity(n_fake as usize + meta.files.len());
+        for i in 0..n_fake {
+            files.push(format!("pad/fake_{i:05}.parquet"));
+        }
+        files.extend(meta.files.iter().cloned());
+        write_files_bin(&frag_dir, &files, &[]).unwrap();
+        for bi in 0..meta.num_buckets {
+            let mut ents = read_bucket_entries(&frag_dir, bi).unwrap();
+            for e in &mut ents {
+                e.file += n_fake;
+            }
+            write_jsonl(
+                &frag_dir
+                    .join("buckets")
+                    .join(format!("bucket_{bi:03}.jsonl")),
+                &ents,
+            )
+            .unwrap();
+            write_bincode(
+                &frag_dir.join("buckets").join(format!("bucket_{bi:03}.bin")),
+                &ents,
+            )
+            .unwrap();
+        }
+
+        test_set_dict_load_cap(8);
+        let keyed = load_index_for_keys(&idx_root, &[String::from("user_0000")]).unwrap();
+        assert!(
+            !keyed.lookup("user_0000").is_empty(),
+            "lookup must find the key without decoding 20k dict records"
+        );
+        let q = crate::query::RapQuerier::new(keyed);
+        let res = q.query("user_0000").expect("query with on-demand dict");
+        assert!(res.batch.num_rows() >= 1 || !res.rows.is_empty());
+
+        test_set_dict_load_cap(8);
+        let (dict, _, _) = load_index_file_dictionary(&idx_root).unwrap();
+        assert!(dict.len() >= 20_000, "dict has {} entries", dict.len());
+        let err = dict
+            .materialize_all()
+            .expect_err("decoding the whole dict must exceed cap");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("file-dictionary cap"), "got {msg}");
     }
 
     #[test]

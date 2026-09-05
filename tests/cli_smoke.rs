@@ -26,6 +26,16 @@ fn cli_help_lists_commands() {
 }
 
 #[test]
+fn cli_has_no_delete_subcommand() {
+    Command::cargo_bin("needle")
+        .unwrap()
+        .arg("delete")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unrecognized subcommand"));
+}
+
+#[test]
 fn cli_new_subcommand_help() {
     Command::cargo_bin("needle")
         .unwrap()
@@ -114,7 +124,7 @@ fn cli_new_subcommand_help() {
         .stdout(predicate::str::contains("--key"))
         .stdout(predicate::str::contains("--index"))
         .stdout(predicate::str::contains("--check"))
-        .stdout(predicate::str::contains("not a GDPR delete"));
+        .stdout(predicate::str::contains("hide-only"));
 
     Command::cargo_bin("needle")
         .unwrap()

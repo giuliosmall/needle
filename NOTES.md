@@ -126,7 +126,7 @@ prove bytes match local (`prove_http_matches_local`).
 
 ## Remaining non-goals (not a general lake query engine)
 
-- File dictionary still lives in RAM; only hash buckets are mmapped. Multi-TB lakes are not 1.0
+- File dictionary is mmapped `files.bin`; point lookup decodes only named files. Residual RAM is mmap handles + fragment list + that key’s postings, not the whole dict. Multi-TB lakes still need OS page cache and a bounded working set.
 - Glue / Nessie catalogs: `--catalog glue|nessie` is a hard error (no silent Hadoop fallback). REST is supported; Hadoop is fallback
 - Multi-writer: local exclusive `flock`; S3 registry publish is conditional (`If-None-Match` / `If-Match`). Not a distributed lock service
 - Lake-wide SQL (SQL is over rows for one lookup key)

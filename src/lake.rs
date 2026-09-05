@@ -6,7 +6,7 @@
 
 use crate::index::{
     key_bucket, load_index_entries_for_keys, load_index_file_dictionary, load_index_for_keys,
-    write_registry, CoveringValues, IndexFragmentMeta, PageLoc, RapIndexEntry,
+    write_files_bin, write_registry, CoveringValues, IndexFragmentMeta, PageLoc, RapIndexEntry,
 };
 use crate::parquet_lowlevel::{
     pages_for_rows, write_paged_plain_into, write_tiny_plain_into, PageLocInfo, TinyRow,
@@ -443,6 +443,7 @@ pub fn lake_generate(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
     };
     let frag_dir = opts.index_dir.join("fragments").join(&opts.fragment_id);
     serde_json::to_writer_pretty(File::create(frag_dir.join("manifest.json"))?, &meta)?;
+    write_files_bin(&frag_dir, &meta.files, &meta.file_idents)?;
     write_registry(&opts.index_dir, &[opts.fragment_id.clone()])?;
 
     let n = uploaded.load(Ordering::Relaxed);
@@ -831,6 +832,11 @@ pub fn lake_index_from_bucket(
         )?,
         &meta,
     )?;
+    write_files_bin(
+        &index_dir.join("fragments").join(fragment_id),
+        &meta.files,
+        &meta.file_idents,
+    )?;
     write_registry(index_dir, &[fragment_id.to_string()])?;
     println!(
         "lake-index done: {} files in {:?}",
@@ -1138,6 +1144,7 @@ pub fn lake_generate_fat(opts: &LakeGenerateOpts) -> Result<LakeManifest> {
     } else {
         serde_json::to_writer_pretty(mf, &meta)?;
     }
+    write_files_bin(&frag_dir, &meta.files, &meta.file_idents)?;
     write_registry(&opts.index_dir, &[opts.fragment_id.clone()])?;
 
     let mut sizes = file_sizes.into_inner().unwrap();
@@ -1846,8 +1853,7 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
     if warmup_n > 0 {
         eprintln!("  warmup {warmup_n} queries…");
         let warm_keys: Vec<String> = keys[..warmup_n].to_vec();
-        let warm_idx =
-            load_index_entries_for_keys(&root, Arc::clone(&files), &fragments, &warm_keys)?;
+        let warm_idx = load_index_entries_for_keys(&root, files.clone(), &fragments, &warm_keys)?;
         let querier = RapQuerier::new(warm_idx).with_s3(client.clone());
         for k in &warm_keys {
             let _ = querier.query_with(
@@ -1882,7 +1888,7 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
         if wave_keys.is_empty() {
             continue;
         }
-        let idx = load_index_entries_for_keys(&root, Arc::clone(&files), &fragments, &wave_keys)?;
+        let idx = load_index_entries_for_keys(&root, files.clone(), &fragments, &wave_keys)?;
         let querier = RapQuerier::new(idx).with_s3(client.clone());
         // Run with verify based on original positions: pass keys and check inside using enumerate offset.
         // Simpler: run_query_batch with query_offset=0 and verify_every on local i - approximate.
@@ -1954,7 +1960,7 @@ pub fn lake_stress(opts: &LakeStressOpts) -> Result<LakeStressReport> {
         // Preload a working set: first min(4096, n) keys' buckets (few waves).
         let set_n = keys.len().min(4096).max(64);
         let set_keys: Vec<String> = keys[..set_n].to_vec();
-        let idx = load_index_entries_for_keys(&root, Arc::clone(&files), &fragments, &set_keys)?;
+        let idx = load_index_entries_for_keys(&root, files.clone(), &fragments, &set_keys)?;
         let querier = Arc::new(RapQuerier::new(idx).with_s3(client.clone()));
         let ol_acc = StressAcc::new(100_000);
         let stop_at = Instant::now() + Duration::from_secs(opts.duration_secs);

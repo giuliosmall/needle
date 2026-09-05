@@ -309,7 +309,7 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Hide keys from Needle lookups only. Does not rewrite Parquet (not a GDPR delete).
+    /// Hide keys from Needle lookups only. Does not rewrite lake Parquet (hide-only).
     Forget {
         #[arg(long, default_value = "data/rap-index")]
         index: PathBuf,
@@ -849,7 +849,7 @@ fn main() -> Result<()> {
                 }
                 OutputFormat::Table => {
                     println!(
-                        "suppressed {} key(s) from Needle lookups → {} (Parquet unchanged; not a GDPR delete)",
+                        "suppressed {} key(s) from Needle lookups → {} (Parquet unchanged; hide-only)",
                         key.len(),
                         frag.display()
                     );

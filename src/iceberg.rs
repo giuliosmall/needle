@@ -2926,7 +2926,6 @@ mod tests {
         use crate::index::STALE_FILE_IDENTITY;
         use crate::query::QueryOptions;
         use crate::server::{start, DaemonOptions};
-        use std::sync::Arc;
 
         let tmp = tempfile::tempdir().unwrap();
         let table = tmp.path().join("table");
@@ -3010,7 +3009,8 @@ mod tests {
         let parquet_bytes = fs::read(&parquet).unwrap();
         let s3 = start_integrator_s3_mock(parquet_bytes.clone(), "sts-session-token");
         let mut remote = load_index(&index).unwrap();
-        remote.files = Arc::new(vec![PathBuf::from("s3://needle-e2e/rows.parquet")]);
+        remote.files =
+            crate::index::FileDict::from_paths(vec![PathBuf::from("s3://needle-e2e/rows.parquet")]);
         for entries in remote.entries_by_key.values_mut() {
             for e in entries {
                 e.file_etag = Some("e2eetag".into());
@@ -3092,7 +3092,7 @@ mod tests {
 
     fn clone_rap_index(src: &crate::index::RapIndex) -> crate::index::RapIndex {
         crate::index::RapIndex {
-            files: std::sync::Arc::clone(&src.files),
+            files: src.files.clone(),
             entries_by_key: src.entries_by_key.clone(),
             fragments: src.fragments.clone(),
             root: src.root.clone(),

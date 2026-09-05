@@ -40,7 +40,9 @@ Writers take a non-blocking exclusive `flock` on `.needle.lock` for the whole fr
 
 When the index root is `s3://`, `registry.json` is published with a conditional PUT: `If-None-Match: *` on create and `If-Match: <etag>` on update. A lost race is `s3_precondition_failed` (the object is left as valid v1 JSON).
 
-Point lookup mmaps `bucket_{NNN}.bin` (or scans `bucket_{NNN}.jsonl`) for the hashed bucket only. `--full-index` deserializes every bucket into RAM. The file dictionary stays in RAM.
+Point lookup mmaps `bucket_{NNN}.bin` (or scans `bucket_{NNN}.jsonl`) for the hashed bucket only. `--full-index` deserializes every bucket into RAM.
+
+Each fragment may include `files.bin` (additive v1): an mmapable file-id → path table. Point lookup decodes **only** the records named by that key's postings. v1 indexes without `files.bin` still load `manifest.json` `files[]` into RAM (fallback). New writers write both `files.bin` and `files[]` so old v1 readers keep working.
 
 ## Fragment directory
 
@@ -60,6 +62,22 @@ Point lookup mmaps `bucket_{NNN}.bin` (or scans `bucket_{NNN}.jsonl`) for the ha
 | `iceberg_delete_files` | Position/equality delete files applied when this fragment was built |
 
 Buckets are `bucket_{NNN}.jsonl` (inspectable) and `bucket_{NNN}.bin` (bincode; preferred on load).
+
+### `files.bin` (additive v1)
+
+```
+magic      4 bytes  "NDFD"
+version    u32le    1
+count      u32le    N
+offsets    (N+1)×u64le  absolute file offsets of each record; last is end
+records    for i in 0..N:
+             u32le path_len; path utf-8
+             u32le etag_len; etag utf-8 (len 0 = none)
+             u64le size (u64::MAX = none)
+             i64le mtime_ms (i64::MIN = none)
+```
+
+Optional manifest field `file_count` is the same N. Readers that see `files.bin` skip allocating `files[]` / `file_idents[]` from JSON.
 
 ## Compatibility policy (frozen v1)
 

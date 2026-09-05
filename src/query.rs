@@ -1971,7 +1971,7 @@ mod tests {
         let e = &querier.index.lookup(key)[0];
         let stored = stored_ident_for_entry(&querier.index, e);
         let open = querier.index.file_path(e.file).unwrap();
-        let live = probe_file_ident(&open.to_string_lossy(), open);
+        let live = probe_file_ident(&open.to_string_lossy(), &open);
         assert!(
             file_ident_mismatch(&stored, &live),
             "query and verify share file_ident_mismatch; stored={stored:?} live={live:?}"

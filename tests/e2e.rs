@@ -202,7 +202,7 @@ fn e2e_http_range_query() {
         .iter()
         .map(|l| l.offset..l.offset + l.size as u64)
         .collect();
-    let proof = prove_http_matches_local(path, &base, &ranges).unwrap();
+    let proof = prove_http_matches_local(&path, &base, &ranges).unwrap();
     assert!(proof.bytes_compared > 0);
     server.stop();
 }
