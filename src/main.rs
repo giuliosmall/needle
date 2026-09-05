@@ -19,9 +19,10 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate};
 use clap::{Parser, Subcommand, ValueEnum};
-use needle::iceberg::{self, IcebergIndexOpts};
+use needle::iceberg::{self, IcebergCatalog, IcebergIndexOpts};
 use needle::index::{
-    compact_index, forget_keys, load_index, load_index_for_keys, verify_index_files, IndexBuilder,
+    compact_index, forget_keys, load_index, load_index_for_keys, read_registry, verify_index_files,
+    IndexBuilder,
 };
 use needle::lake::{self, LakeGenerateOpts};
 use needle::parquet_lowlevel;
@@ -51,6 +52,25 @@ enum OutputFormat {
     #[default]
     Table,
     Json,
+}
+
+/// Iceberg catalog for `iceberg-index`. REST is production; Hadoop is fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum IcebergCatalogArg {
+    /// Hadoop warehouse / table root (`--table`). Fallback.
+    #[default]
+    Hadoop,
+    /// Iceberg REST catalog (`--rest-uri`, `--namespace`, `--table-name`). Production.
+    Rest,
+}
+
+impl From<IcebergCatalogArg> for IcebergCatalog {
+    fn from(v: IcebergCatalogArg) -> Self {
+        match v {
+            IcebergCatalogArg::Hadoop => IcebergCatalog::Hadoop,
+            IcebergCatalogArg::Rest => IcebergCatalog::Rest,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -100,11 +120,28 @@ enum Cmd {
         value_column: Vec<String>,
     },
     /// Index an Apache Iceberg table into Needle / RAP fragments.
+    ///
+    /// REST is the production catalog path; Hadoop is a warehouse-path fallback.
     #[command(name = "iceberg-index")]
     IcebergIndex {
-        /// Path to the Iceberg table root (or table metadata).
-        #[arg(long)]
-        table: PathBuf,
+        /// Catalog: `rest` (production) or `hadoop` (fallback). REST is the production catalog path; Hadoop is fallback.
+        #[arg(long, value_enum, default_value_t = IcebergCatalogArg::Hadoop)]
+        catalog: IcebergCatalogArg,
+        /// Hadoop table root (directory with `metadata/`, or `s3://…`). Required for `--catalog hadoop`.
+        #[arg(long, required_if_eq("catalog", "hadoop"))]
+        table: Option<PathBuf>,
+        /// Iceberg REST catalog base URI (`http://host/iceberg`). Required for `--catalog rest`.
+        #[arg(long, required_if_eq("catalog", "rest"))]
+        rest_uri: Option<String>,
+        /// Iceberg namespace (`db` or nested `a.b`). Required for `--catalog rest`.
+        #[arg(long, required_if_eq("catalog", "rest"))]
+        namespace: Option<String>,
+        /// Table name in the REST catalog. Required for `--catalog rest`.
+        #[arg(long, required_if_eq("catalog", "rest"))]
+        table_name: Option<String>,
+        /// Bearer token for REST (`Authorization: Bearer`). Env: `NEEDLE_ICEBERG_TOKEN`.
+        #[arg(long, env = "NEEDLE_ICEBERG_TOKEN", hide_env_values = true)]
+        rest_token: Option<String>,
         #[arg(long, default_value = "data/rap-index")]
         index: PathBuf,
         /// Key column to index (repeatable). Default: user_id.
@@ -178,7 +215,7 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Run SQL over the rows for one key (table name `hits`).
+    /// SQL over rows for one lookup key (`hits` / `needle_lookup`). Not lake SQL.
     Sql {
         #[arg(long, default_value = "data/rap-index")]
         index: PathBuf,
@@ -266,7 +303,7 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Append tombstone entries that hide keys from subsequent lookups.
+    /// Hide keys from Needle lookups only. Does not rewrite Parquet (not a GDPR delete).
     Forget {
         #[arg(long, default_value = "data/rap-index")]
         index: PathBuf,
@@ -275,6 +312,9 @@ enum Cmd {
         key: Vec<String>,
         #[arg(long)]
         fragment: Option<String>,
+        /// Warn if the key is still present in indexed Parquet files (Needle hide only).
+        #[arg(long, default_value_t = false)]
+        check: bool,
         /// Output format (`table` or `json`).
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         format: OutputFormat,
@@ -608,7 +648,12 @@ fn main() -> Result<()> {
             );
         }
         Cmd::IcebergIndex {
+            catalog,
             table,
+            rest_uri,
+            namespace,
+            table_name,
+            rest_token,
             index,
             key_column,
             value_column,
@@ -622,13 +667,18 @@ fn main() -> Result<()> {
                 key_column
             };
             let report = iceberg::index_iceberg_table(&IcebergIndexOpts {
-                table,
+                table: table.unwrap_or_default(),
                 index,
                 key_columns,
                 value_columns: value_column,
                 covering,
                 buckets,
                 fragment_prefix,
+                catalog: catalog.into(),
+                rest_uri,
+                namespace,
+                table_name,
+                rest_token,
             })?;
             println!(
                 "snapshot_id={} fragment_id={} files_indexed={} skipped={} table_location={}",
@@ -772,23 +822,38 @@ fn main() -> Result<()> {
             index,
             key,
             fragment,
+            check,
             format,
             json,
         } => {
+            let still_in_files = if check {
+                forget_check_parquet(&index, &key)?
+            } else {
+                Vec::new()
+            };
             let frag = forget_keys(&index, &key, fragment.as_deref())?;
             match resolve_format(format, json) {
                 OutputFormat::Json => {
                     let v = serde_json::json!({
                         "fragment": frag.display().to_string(),
                         "keys": key,
+                        "parquet_unchanged": true,
+                        "still_in_parquet": still_in_files,
                     });
                     println!("{}", serde_json::to_string(&v)?);
                 }
-                OutputFormat::Table => println!(
-                    "suppressed {} key(s) from Needle lookups → {} (Parquet unchanged)",
-                    key.len(),
-                    frag.display()
-                ),
+                OutputFormat::Table => {
+                    println!(
+                        "suppressed {} key(s) from Needle lookups → {} (Parquet unchanged; not a GDPR delete)",
+                        key.len(),
+                        frag.display()
+                    );
+                    for k in &still_in_files {
+                        eprintln!(
+                            "warning: {k} still exists in source Parquet; forget only hides it in Needle"
+                        );
+                    }
+                }
             }
         }
         Cmd::Verify {
@@ -1897,6 +1962,16 @@ fn query_result_json(
     })
 }
 
+/// Keys that still have Needle index locations (and therefore source Parquet rows).
+fn forget_check_parquet(index: &Path, keys: &[String]) -> Result<Vec<String>> {
+    let idx = load_index_for_keys(index, keys)?;
+    Ok(keys
+        .iter()
+        .filter(|k| !idx.lookup(k).is_empty())
+        .cloned()
+        .collect())
+}
+
 fn print_explain(expl: &needle::query::ExplainResult, out: OutputFormat) -> Result<()> {
     match out {
         OutputFormat::Json => {
@@ -1956,8 +2031,7 @@ fn run_stats(index: &Path, out: OutputFormat) -> Result<()> {
             index.display()
         );
     }
-    let registry: Vec<String> = serde_json::from_reader(std::fs::File::open(&registry_path)?)
-        .with_context(|| format!("read {}", registry_path.display()))?;
+    let registry = read_registry(index)?;
 
     let mut fragments = Vec::new();
     for frag_id in &registry {

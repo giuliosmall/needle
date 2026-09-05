@@ -7,8 +7,10 @@
 
 use crate::index::{
     load_index, load_index_entries_for_keys, load_index_file_dictionary, IndexFragmentMeta,
+    STALE_FILE_IDENTITY,
 };
 use crate::query::{ExplainResult, QueryOptions, QueryResult, RapQuerier};
+use crate::s3::S3Client;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
@@ -32,9 +34,13 @@ pub struct DaemonCli {
     /// `--tls-cert`/`--tls-key` (or `--insecure`).
     #[arg(long, default_value = "127.0.0.1:7780", env = "NEEDLE_BIND")]
     pub bind: String,
-    /// Load hash buckets per key instead of the full index at startup.
-    #[arg(long, default_value_t = false)]
+    /// Load hash buckets per key instead of the full index at startup (default).
+    /// Pass `--full-index` for a full RAM load.
+    #[arg(long)]
     pub lazy_buckets: bool,
+    /// Load every index bucket into RAM (opt-in; default is lazy buckets).
+    #[arg(long)]
+    pub full_index: bool,
     /// PEM certificate for TLS (pair with `--tls-key`).
     #[arg(long, value_name = "PATH")]
     pub tls_cert: Option<PathBuf>,
@@ -67,7 +73,7 @@ impl Default for DaemonOptions {
         Self {
             index: PathBuf::from("data/rap-index"),
             bind: "127.0.0.1:7780".into(),
-            lazy_buckets: false,
+            lazy_buckets: true,
             tls_cert: None,
             tls_key: None,
             token: None,
@@ -81,7 +87,8 @@ impl From<DaemonCli> for DaemonOptions {
         Self {
             index: c.index,
             bind: c.bind,
-            lazy_buckets: c.lazy_buckets,
+            // Default is lazy buckets; `--full-index` is the opt-in full RAM load.
+            lazy_buckets: !c.full_index,
             tls_cert: c.tls_cert,
             tls_key: c.tls_key,
             token: c.token.filter(|s| !s.is_empty()),
@@ -582,16 +589,208 @@ fn serve_loop(server: tiny_http::Server, state: Arc<DaemonState>, stop: Arc<Atom
     }
 }
 
+/// Frozen HTTP error codes (`HTTP.md`). Additive codes are allowed; these names stay.
+pub const ERR_UNAUTHENTICATED: &str = "unauthenticated";
+pub const ERR_BAD_REQUEST: &str = "bad_request";
+pub const ERR_NOT_FOUND: &str = "not_found";
+pub const ERR_METHOD_NOT_ALLOWED: &str = "method_not_allowed";
+pub const ERR_STALE_FILE_IDENTITY: &str = STALE_FILE_IDENTITY;
+pub const ERR_ICEBERG_UNSUPPORTED_DELETES: &str = "iceberg_unsupported_deletes";
+pub const ERR_CATALOG_ERROR: &str = "catalog_error";
+pub const ERR_S3_IDENTITY_MISMATCH: &str = "s3_identity_mismatch";
+pub const ERR_S3_CHECKSUM_MISMATCH: &str = "s3_checksum_mismatch";
+pub const ERR_INTERNAL: &str = "internal";
+
+/// Frozen top-level keys on a successful `/v1/query` body. Additive keys allowed.
+pub const QUERY_JSON_KEYS: &[&str] = &[
+    "key",
+    "rows",
+    "covering",
+    "covering_values",
+    "timings",
+    "totals",
+];
+pub const QUERY_TIMINGS_KEYS: &[&str] = &[
+    "index_lookup_ms",
+    "metadata_resolve_ms",
+    "ranged_read_ms",
+    "decode_extract_ms",
+    "total_ms",
+];
+pub const QUERY_TOTALS_KEYS: &[&str] = &[
+    "rows",
+    "value_count",
+    "bytes_ranged",
+    "pages_touched",
+    "files_touched",
+    "skipped_by_predicate",
+    "offset",
+    "limit",
+];
+pub const COVERING_VALUES_KEYS: &[&str] = &[
+    "file",
+    "value_count",
+    "listen_count",
+    "total_duration_ms",
+    "min_ts",
+    "max_ts",
+];
+pub const EXPLAIN_JSON_KEYS: &[&str] = &[
+    "key",
+    "bucket",
+    "num_entries",
+    "num_entries_after_predicates",
+    "files",
+    "covering",
+    "page_descriptions",
+    "estimated_bytes",
+    "estimated_range_gets",
+    "covering_only",
+    "columns",
+    "since_ms",
+    "until_ms",
+    "skipped_by_predicate",
+];
+pub const STATS_JSON_KEYS: &[&str] = &[
+    "index",
+    "lazy_buckets",
+    "num_files",
+    "num_fragments",
+    "fragments",
+];
+
+fn error_body(code: &str, message: impl AsRef<str>) -> Value {
+    json!({"error": code, "message": message.as_ref()})
+}
+
+fn error_body_with(code: &str, message: impl AsRef<str>, extra: &Value) -> Value {
+    let mut body = error_body(code, message);
+    if let (Some(map), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra {
+            if k != "error" && k != "message" {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    body
+}
+
+fn extract_json_object(s: &str) -> Option<Value> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&s[start..=end])
+        .ok()
+        .filter(Value::is_object)
+}
+
+fn looks_like_catalog_error(lower: &str) -> bool {
+    if lower.contains(ERR_CATALOG_ERROR) {
+        return true;
+    }
+    if lower.contains("no current snapshot")
+        || lower.contains("has no metadata/")
+        || lower.contains("no *.metadata.json")
+        || lower.contains("*.metadata.json")
+    {
+        return true;
+    }
+    lower.contains("iceberg")
+        && (lower.contains("metadata")
+            || lower.contains("snapshot")
+            || lower.contains("manifest-list")
+            || lower.contains("manifest list"))
+}
+
+/// Map a query/explain/stats failure to a frozen `{error, message, …}` body.
+pub fn map_anyhow_error(err: &anyhow::Error) -> (u16, Value) {
+    map_error_message(&format!("{err:#}"))
+}
+
+fn map_error_message(msg: &str) -> (u16, Value) {
+    if let Some(obj) = extract_json_object(msg) {
+        if let Some(code) = obj.get("error").and_then(|v| v.as_str()) {
+            let remote = obj
+                .get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(S3Client::is_remote_uri);
+            let mapped = if code == STALE_FILE_IDENTITY && remote {
+                ERR_S3_IDENTITY_MISMATCH
+            } else if code == STALE_FILE_IDENTITY {
+                ERR_STALE_FILE_IDENTITY
+            } else if code == ERR_S3_IDENTITY_MISMATCH {
+                ERR_S3_IDENTITY_MISMATCH
+            } else if code == ERR_S3_CHECKSUM_MISMATCH {
+                ERR_S3_CHECKSUM_MISMATCH
+            } else if code == ERR_ICEBERG_UNSUPPORTED_DELETES {
+                ERR_ICEBERG_UNSUPPORTED_DELETES
+            } else if code == ERR_CATALOG_ERROR {
+                ERR_CATALOG_ERROR
+            } else {
+                ""
+            };
+            if !mapped.is_empty() {
+                let human = obj
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| match mapped {
+                        ERR_S3_IDENTITY_MISMATCH => {
+                            "S3 object identity no longer matches the index".into()
+                        }
+                        ERR_STALE_FILE_IDENTITY => {
+                            "indexed file no longer matches live identity".into()
+                        }
+                        _ => msg.to_string(),
+                    });
+                return (500, error_body_with(mapped, human, &obj));
+            }
+        }
+    }
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("unsupported delete") || lower.contains(ERR_ICEBERG_UNSUPPORTED_DELETES) {
+        return (500, error_body(ERR_ICEBERG_UNSUPPORTED_DELETES, msg));
+    }
+    if lower.contains(ERR_S3_CHECKSUM_MISMATCH) || lower.contains("checksum mismatch") {
+        return (500, error_body(ERR_S3_CHECKSUM_MISMATCH, msg));
+    }
+    if lower.contains(ERR_S3_IDENTITY_MISMATCH) {
+        return (500, error_body(ERR_S3_IDENTITY_MISMATCH, msg));
+    }
+    if lower.contains(STALE_FILE_IDENTITY) {
+        let code = if lower.contains("s3://")
+            || lower.contains("s3a://")
+            || lower.contains("https://")
+            || lower.contains("http://")
+        {
+            ERR_S3_IDENTITY_MISMATCH
+        } else {
+            ERR_STALE_FILE_IDENTITY
+        };
+        return (500, error_body(code, msg));
+    }
+    if looks_like_catalog_error(&lower) {
+        return (500, error_body(ERR_CATALOG_ERROR, msg));
+    }
+    (500, error_body(ERR_INTERNAL, msg))
+}
+
 fn handle_one(request: tiny_http::Request, state: &DaemonState) {
     let _ = refresh_if_changed(state);
     if request.method() != &tiny_http::Method::Get {
-        respond_json(request, 405, json!({"error": "method not allowed"}));
+        respond_json(
+            request,
+            405,
+            error_body(ERR_METHOD_NOT_ALLOWED, "method not allowed"),
+        );
         return;
     }
     let url = request.url().to_string();
     let (path, params) = parse_url(&url);
     if let Some(err) = authorize(&request, &path, state.token.as_deref()) {
-        respond_json(request, 401, json!({"error": err}));
+        respond_json(request, 401, error_body(ERR_UNAUTHENTICATED, err));
         return;
     }
     let outcome = match path.as_str() {
@@ -599,11 +798,14 @@ fn handle_one(request: tiny_http::Request, state: &DaemonState) {
         "/v1/query" => handle_query(&params, state),
         "/v1/explain" => handle_explain(&params, state),
         "/v1/stats" => Ok((200, stats_json(state))),
-        _ => Ok((404, json!({"error": "not found"}))),
+        _ => Ok((404, error_body(ERR_NOT_FOUND, "not found"))),
     };
     match outcome {
         Ok((code, body)) => respond_json(request, code, body),
-        Err(e) => respond_json(request, 500, json!({"error": format!("{e:#}")})),
+        Err(e) => {
+            let (code, body) = map_anyhow_error(&e);
+            respond_json(request, code, body);
+        }
     }
 }
 
@@ -654,11 +856,11 @@ fn token_eq(expected: &str, got: &str) -> bool {
 
 fn handle_query(params: &HashMap<String, String>, state: &DaemonState) -> Result<(u16, Value)> {
     let Some(key) = params.get("key").filter(|s| !s.is_empty()) else {
-        return Ok((400, json!({"error": "missing key"})));
+        return Ok((400, error_body(ERR_BAD_REQUEST, "missing key")));
     };
     let opts = match query_options_from_params(params) {
         Ok(o) => o,
-        Err(msg) => return Ok((400, json!({"error": msg}))),
+        Err(msg) => return Ok((400, error_body(ERR_BAD_REQUEST, msg))),
     };
     let result = with_querier(state, key, |q| q.query_with(key, &opts))?;
     Ok((200, query_result_json(&result)))
@@ -666,11 +868,11 @@ fn handle_query(params: &HashMap<String, String>, state: &DaemonState) -> Result
 
 fn handle_explain(params: &HashMap<String, String>, state: &DaemonState) -> Result<(u16, Value)> {
     let Some(key) = params.get("key").filter(|s| !s.is_empty()) else {
-        return Ok((400, json!({"error": "missing key"})));
+        return Ok((400, error_body(ERR_BAD_REQUEST, "missing key")));
     };
     let opts = match query_options_from_params(params) {
         Ok(o) => o,
-        Err(msg) => return Ok((400, json!({"error": msg}))),
+        Err(msg) => return Ok((400, error_body(ERR_BAD_REQUEST, msg))),
     };
     let result = with_querier(state, key, |q| q.explain(key, &opts))?;
     Ok((200, explain_result_json(&result)))
@@ -907,8 +1109,8 @@ fn json_header(name: &[u8], value: &[u8]) -> tiny_http::Header {
 }
 
 fn respond_json(request: tiny_http::Request, status: u16, body: Value) {
-    let payload =
-        serde_json::to_string(&body).unwrap_or_else(|_| "{\"error\":\"serialize\"}".into());
+    let payload = serde_json::to_string(&body)
+        .unwrap_or_else(|_| "{\"error\":\"internal\",\"message\":\"serialize\"}".into());
     let response = tiny_http::Response::from_string(payload)
         .with_status_code(status)
         .with_header(json_header(b"Content-Type", b"application/json"))
@@ -919,7 +1121,9 @@ fn respond_json(request: tiny_http::Request, status: u16, body: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{forget_keys, IndexBuilder};
+    use crate::index::{
+        forget_keys, load_index, stale_file_identity_error, FileIdent, IndexBuilder,
+    };
     use crate::writer::{write_sample_dataset, WriteMode, WriterOptions};
     use clap::Parser;
     use std::io::{Read, Write};
@@ -1053,7 +1257,12 @@ mod tests {
 
     fn assert_401_no_secrets(body: &str, idx: &Path, token: &str) {
         let v: Value = serde_json::from_str(body).expect("401 json");
-        assert!(v["error"].as_str().is_some(), "401 body={body}");
+        assert_eq!(v["error"], json!(ERR_UNAUTHENTICATED), "401 body={body}");
+        let msg = v["message"].as_str().expect("401 message");
+        assert!(
+            msg == "unauthorized" || msg == "invalid token",
+            "401 message={msg}"
+        );
         if let Some(p) = idx.to_str() {
             assert!(!body.contains(p), "401 must not leak index path: {body}");
         }
@@ -1062,6 +1271,27 @@ mod tests {
             !body.to_ascii_lowercase().contains("fragment"),
             "401 must not leak fragment ids: {body}"
         );
+    }
+
+    fn assert_object_has_keys(v: &Value, keys: &[&str], label: &str) {
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("{label} object: {v}"));
+        for k in keys {
+            assert!(obj.contains_key(*k), "{label} missing frozen key {k}: {v}");
+        }
+    }
+
+    fn assert_query_json_frozen(v: &Value) {
+        assert_object_has_keys(v, QUERY_JSON_KEYS, "query");
+        assert_object_has_keys(&v["timings"], QUERY_TIMINGS_KEYS, "timings");
+        assert_object_has_keys(&v["totals"], QUERY_TOTALS_KEYS, "totals");
+        assert!(v["rows"].is_array(), "rows array: {v}");
+        assert!(v["covering"].is_array(), "covering array: {v}");
+        let covering = v["covering_values"].as_array().expect("covering_values");
+        for item in covering {
+            assert_object_has_keys(item, COVERING_VALUES_KEYS, "covering_values[]");
+        }
     }
 
     #[test]
@@ -1091,15 +1321,33 @@ mod tests {
         assert_eq!(st, 200, "query status, body={body}");
         let q: Value = serde_json::from_str(&body).expect("query json");
         assert_eq!(q["key"], json!("user_0000"));
+        assert_query_json_frozen(&q);
         let rows = q["rows"].as_array().expect("rows array");
         assert!(!rows.is_empty(), "expected rows for user_0000, body={body}");
         for r in rows {
             assert!(r.is_object(), "row must be a JSON object, got {r}");
         }
-        assert!(
-            q["covering_values"].as_array().is_some(),
-            "generic covering payload: {body}"
-        );
+
+        let (st, body) = http_get(&format!("{base}/v1/query")).expect("missing key");
+        assert_eq!(st, 400, "missing key, body={body}");
+        let err: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(err["error"], json!(ERR_BAD_REQUEST));
+        assert_eq!(err["message"], json!("missing key"));
+
+        let (st, body) = http_get(&format!("{base}/no-such-route")).expect("404");
+        assert_eq!(st, 404, "body={body}");
+        let err: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(err["error"], json!(ERR_NOT_FOUND));
+
+        let (st, body) = http_get(&format!("{base}/v1/explain?key=user_0000")).expect("explain");
+        assert_eq!(st, 200, "explain status, body={body}");
+        let expl: Value = serde_json::from_str(&body).unwrap();
+        assert_object_has_keys(&expl, EXPLAIN_JSON_KEYS, "explain");
+
+        let (st, body) = http_get(&format!("{base}/v1/stats")).expect("stats");
+        assert_eq!(st, 200, "stats status, body={body}");
+        let stats: Value = serde_json::from_str(&body).unwrap();
+        assert_object_has_keys(&stats, STATS_JSON_KEYS, "stats");
 
         handle.stop();
     }
@@ -1212,6 +1460,26 @@ mod tests {
         assert!(c.lazy_buckets);
         let opts = DaemonOptions::from(c);
         assert_eq!(opts.token.as_deref(), Some("s3cret"));
+        assert!(opts.lazy_buckets);
+    }
+
+    #[test]
+    fn daemon_cli_defaults_lazy_full_index_opt_in() {
+        let c = DaemonCli::try_parse_from(["needled"]).unwrap();
+        assert!(!c.full_index);
+        let opts = DaemonOptions::from(c);
+        assert!(
+            opts.lazy_buckets,
+            "default must be lazy buckets (full RAM is opt-in)"
+        );
+
+        let c = DaemonCli::try_parse_from(["needled", "--full-index"]).unwrap();
+        assert!(c.full_index);
+        let opts = DaemonOptions::from(c);
+        assert!(
+            !opts.lazy_buckets,
+            "--full-index must load every bucket into RAM"
+        );
     }
 
     #[test]
@@ -1322,5 +1590,75 @@ mod tests {
         assert_eq!(st, 200, "tls health, body={body}");
 
         handle.stop();
+    }
+
+    #[test]
+    fn query_json_golden_frozen_keys() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/v1-query-success.json"))
+                .expect("golden query json");
+        assert_query_json_frozen(&golden);
+        assert_eq!(golden["key"], json!("user_0000"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = tiny_dataset(tmp.path());
+        let q = RapQuerier::new(load_index(&idx).unwrap());
+        let live = query_result_json(&q.query("user_0000").unwrap());
+        assert_query_json_frozen(&live);
+        let expl = explain_result_json(&q.explain("user_0000", &QueryOptions::default()).unwrap());
+        assert_object_has_keys(&expl, EXPLAIN_JSON_KEYS, "explain");
+    }
+
+    #[test]
+    fn frozen_error_codes_from_anyhow() {
+        let stored = FileIdent {
+            path: "/tmp/local.parquet".into(),
+            etag: None,
+            size: Some(10),
+            mtime_ms: Some(1),
+        };
+        let live = FileIdent {
+            path: stored.path.clone(),
+            etag: None,
+            size: Some(11),
+            mtime_ms: Some(1),
+        };
+        let (st, body) = map_anyhow_error(&stale_file_identity_error(&stored, Some(&live)));
+        assert_eq!(st, 500);
+        assert_eq!(body["error"], json!(ERR_STALE_FILE_IDENTITY));
+        assert!(body["message"].as_str().is_some());
+        assert_eq!(body["path"], json!("/tmp/local.parquet"));
+        assert!(body["stored"].is_object());
+        assert!(body["live"].is_object());
+
+        let remote = FileIdent {
+            path: "s3://bucket/key.parquet".into(),
+            etag: Some("abc".into()),
+            size: Some(4),
+            mtime_ms: None,
+        };
+        let (st, body) = map_anyhow_error(&stale_file_identity_error(&remote, None));
+        assert_eq!(st, 500);
+        assert_eq!(body["error"], json!(ERR_S3_IDENTITY_MISMATCH));
+        assert_eq!(body["path"], json!("s3://bucket/key.parquet"));
+
+        let (st, body) = map_error_message(
+            "needle refuses Iceberg tables with unsupported delete files; apply deletes or compact first (file_format=ORC)",
+        );
+        assert_eq!(st, 500);
+        assert_eq!(body["error"], json!(ERR_ICEBERG_UNSUPPORTED_DELETES));
+
+        let (st, body) =
+            map_error_message("no current snapshot in /tmp/table/metadata/v1.metadata.json");
+        assert_eq!(st, 500);
+        assert_eq!(body["error"], json!(ERR_CATALOG_ERROR));
+
+        let (st, body) = map_error_message("s3_checksum_mismatch: Content-MD5");
+        assert_eq!(st, 500);
+        assert_eq!(body["error"], json!(ERR_S3_CHECKSUM_MISMATCH));
+
+        let (st, body) = map_error_message("s3_identity_mismatch: etag abc vs xyz");
+        assert_eq!(st, 500);
+        assert_eq!(body["error"], json!(ERR_S3_IDENTITY_MISMATCH));
     }
 }

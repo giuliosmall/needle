@@ -1,6 +1,6 @@
 [package]
 name = "needle"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Needle - external key→page index for point queries over lake Parquet (Spotify RAP-inspired)"
 license = "Apache-2.0"

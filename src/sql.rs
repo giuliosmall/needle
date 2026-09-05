@@ -1,11 +1,11 @@
-//! DataFusion SQL over RAP point-lookup rows.
+//! DataFusion SQL over rows for one lookup key (not lake-wide SQL).
 //!
-//! After a key lookup, the decoded listens are registered as table `hits`.
+//! After a key lookup, the decoded batch is registered as table `hits`.
 //! `needle_lookup(key)` is a table function that runs another RAP lookup.
 
 use crate::index::load_index_for_keys;
 use crate::query::{ListenRow, QueryOptions, RapQuerier};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
     TimestampMillisecondArray, UInt32Array, UInt64Array,
@@ -83,8 +83,20 @@ pub fn sql_lookup(index: impl AsRef<Path>, key: &str, sql: &str) -> Result<SqlRe
     })
 }
 
+/// SQL is scoped to one lookup key (`hits` / `needle_lookup`). Not lake-wide SQL.
+pub fn sql_is_key_scoped(sql: &str) -> bool {
+    let s = sql.to_ascii_lowercase();
+    s.contains("hits") || s.contains("needle_lookup")
+}
+
 /// Block on a tokio runtime. Fetch key via RapQuerier if key is Some, register `hits`, run SQL.
 pub fn run_sql(opts: &SqlOptions) -> Result<SqlResult> {
+    if !sql_is_key_scoped(&opts.sql) {
+        bail!(
+            "SQL is over rows for one lookup key only (use table hits or needle_lookup); \
+             lake-wide SQL is not supported"
+        );
+    }
     let hits = if let Some(key) = &opts.key {
         lookup_hits(&opts.index, key, &opts.query)?
     } else {
@@ -292,5 +304,24 @@ mod tests {
         assert_eq!(json.len(), res.batch.num_rows());
         assert!(json[0].get("track_uri").is_some());
         assert!(json[0].get("n").is_some());
+    }
+
+    #[test]
+    fn sql_rejects_unscoped_lake_query() {
+        let (_tmp, idx) = setup();
+        let err = match run_sql(&SqlOptions {
+            index: idx,
+            key: Some("user_0000".into()),
+            sql: "SELECT 1".into(),
+            query: QueryOptions::default(),
+        }) {
+            Ok(_) => panic!("unscoped SQL must fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            msg.contains("one lookup key") || msg.contains("not supported"),
+            "got {msg}"
+        );
     }
 }

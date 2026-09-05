@@ -21,6 +21,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// On-disk `registry.json` major version written by this crate.
+/// Format v1 is frozen; see `FORMAT.md`.
 pub const INDEX_FORMAT_VERSION: u32 = 1;
 
 /// Exclusive writer lock (`flock` on `<index>/.needle.lock`).
@@ -333,6 +334,9 @@ impl IndexBuilder {
         note: Option<&str>,
     ) -> Result<PathBuf> {
         let _lock = try_lock_index(&self.root)?;
+        if self.covering && !parquet_files.is_empty() {
+            ensure_listen_covering_schema(&parquet_files[0])?;
+        }
         let frag_dir = self.root.join("fragments").join(fragment_id);
         fs::create_dir_all(frag_dir.join("buckets"))?;
 
@@ -637,6 +641,35 @@ fn capture_page_locs(path: &Path, rows: &[u64], value_columns: &[String]) -> Res
         }
     }
     Ok(locs)
+}
+
+/// Covering aggregates are listen-shaped (`duration_ms` / `timestamp` / nested `listens`).
+/// Refuse `--covering` on generic schemas rather than emitting a fake JSON alias.
+fn ensure_listen_covering_schema(path: &Path) -> Result<()> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let uri = path.to_string_lossy();
+    let schema = if S3Client::is_remote_uri(&uri) {
+        let (bucket, key) = S3Client::parse_uri(&uri)?;
+        let reader = S3ChunkReader::open(S3Client::from_env(), bucket, key)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(reader)?;
+        builder.schema().clone()
+    } else {
+        let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        builder.schema().clone()
+    };
+    let ok = schema.index_of("duration_ms").is_ok()
+        || schema.index_of("timestamp").is_ok()
+        || schema.index_of("timestamp_ms").is_ok()
+        || schema.index_of("listens").is_ok()
+        || schema.index_of("payload").is_ok();
+    if !ok {
+        bail!(
+            "covering is listen-shaped (needs duration_ms, timestamp, or listens); \
+             omit --covering for generic Parquet schemas"
+        );
+    }
+    Ok(())
 }
 
 fn write_jsonl(path: &Path, entries: &[RapIndexEntry]) -> Result<()> {
@@ -2288,6 +2321,7 @@ mod tests {
     use crate::writer::{write_sample_dataset, WriteMode, WriterOptions};
     use std::collections::HashSet;
     use std::io::Write;
+    use std::sync::Arc;
 
     fn tiny_opts(dir: &Path, mode: WriteMode, files: usize) -> WriterOptions {
         WriterOptions {
@@ -2942,6 +2976,37 @@ mod tests {
         );
     }
 
+    fn committed_v1_index_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1-index")
+    }
+
+    #[test]
+    fn load_committed_v1_index_fixture() {
+        let root = committed_v1_index_dir();
+        assert!(
+            root.join("registry.json").is_file(),
+            "committed v1 fixture missing at {}",
+            root.display()
+        );
+        let index = load_index(&root).expect("load committed v1 fixture");
+        let hits = index.lookup("user_0000");
+        assert!(
+            !hits.is_empty(),
+            "fixture lookup user_0000 must be nonempty"
+        );
+        assert_eq!(hits[0].key, "user_0000");
+        assert_eq!(hits[0].file, 0);
+        assert!(!hits[0].row_numbers.is_empty());
+        let q = crate::query::RapQuerier::new(index);
+        let res = q
+            .query("user_0000")
+            .expect("query committed v1 fixture parquet");
+        assert!(
+            res.batch.num_rows() >= 1 || !res.rows.is_empty(),
+            "frozen v1 fixture must be queryable"
+        );
+    }
+
     #[test]
     fn write_registry_is_format_version_1_object() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2969,6 +3034,68 @@ mod tests {
         let err = try_lock_index(&root).expect_err("second lock must fail");
         let msg = format!("{err:#}");
         assert!(msg.contains("index lock"), "got: {msg}");
+    }
+
+    fn write_generic_id_amount(path: &Path) -> Result<()> {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::arrow_writer::ArrowWriter;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "a"])),
+                Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+            ],
+        )?;
+        let file = File::create(path)?;
+        let mut w = ArrowWriter::try_new(file, schema, None)?;
+        w.write(&batch)?;
+        w.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn covering_refused_on_generic_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parquet = tmp.path().join("generic.parquet");
+        write_generic_id_amount(&parquet).unwrap();
+        let idx = tmp.path().join("idx");
+        let err = IndexBuilder::new(&idx, 4)
+            .with_key_columns(vec!["id".into()])
+            .with_covering(true)
+            .build_fragment(&[parquet.clone()], "frag-g", None)
+            .expect_err("covering on generic schema must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("covering is listen-shaped") || msg.contains("omit --covering"),
+            "got {msg}"
+        );
+    }
+
+    #[test]
+    fn generic_id_amount_point_lookup_without_covering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parquet = tmp.path().join("generic.parquet");
+        write_generic_id_amount(&parquet).unwrap();
+        let idx = tmp.path().join("idx");
+        IndexBuilder::new(&idx, 4)
+            .with_key_columns(vec!["id".into()])
+            .build_fragment(&[parquet], "frag-g", None)
+            .unwrap();
+        let index = load_index(&idx).unwrap();
+        assert!(!index.lookup("a").is_empty());
+        assert!(!index.lookup("b").is_empty());
+        let q = crate::query::RapQuerier::new(index);
+        let res = q.query("a").unwrap();
+        assert!(res.batch.num_rows() >= 1);
     }
 
     #[test]

@@ -3,14 +3,21 @@
 //! Raw TCP (+ optional `native_tls`) + AWS SigV4 - same rustc-1.85 constraint as
 //! `HttpRange` (no reqwest). Supports Range GET, full GET, PUT, HEAD, ListObjectsV2.
 //! Anonymous GET works when the bucket allows download (our lake setup).
+//! Credentials: `NEEDLE_S3_*` / `RAP_S3_*`, then `AWS_*`, then `~/.aws/{credentials,config}`.
+//! STS `session_token` is signed as `x-amz-security-token`. HTTP 429/5xx and connect
+//! failures retry with jittered backoff. GET bodies are checked against
+//! `x-amz-checksum-sha256` / `x-amz-checksum-crc32` / `Content-MD5` when present.
 
 use anyhow::{bail, Context, Result};
 use hmac::{Hmac, Mac};
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +71,9 @@ pub struct S3Config {
     pub endpoint: String,
     pub access_key: String,
     pub secret_key: String,
+    /// STS session token (`NEEDLE_S3_SESSION_TOKEN` / `AWS_SESSION_TOKEN` / profile).
+    /// When set, SigV4 includes `x-amz-security-token`.
+    pub session_token: Option<String>,
     pub region: String,
     pub anonymous_read: bool,
     /// HTTPS/TLS. Env `RAP_S3_TLS` / `NEEDLE_S3_TLS` = 1/true; also true when
@@ -74,34 +84,160 @@ pub struct S3Config {
     pub path_style: bool,
 }
 
-fn env_first(names: &[&str]) -> Option<String> {
-    names.iter().find_map(|n| std::env::var(n).ok())
+fn env_first_from(names: &[&str], get: &mut impl FnMut(&str) -> Option<String>) -> Option<String> {
+    names.iter().find_map(|n| {
+        get(n).and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+    })
+}
+
+#[derive(Debug, Default, Clone)]
+struct AwsFileCreds {
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    session_token: Option<String>,
+    region: Option<String>,
+}
+
+fn parse_ini_section(contents: &str, section: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut in_section = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some(name) = rest.strip_suffix(']') {
+                in_section = name.trim().eq_ignore_ascii_case(section);
+            }
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim().trim_matches('"').to_string();
+            if !key.is_empty() && !val.is_empty() {
+                out.insert(key, val);
+            }
+        }
+    }
+    out
+}
+
+fn load_aws_files(home: &Path, profile: &str) -> AwsFileCreds {
+    let mut out = AwsFileCreds::default();
+    let cred_path = home.join(".aws").join("credentials");
+    if let Ok(s) = std::fs::read_to_string(cred_path) {
+        let sec = parse_ini_section(&s, profile);
+        out.access_key = sec.get("aws_access_key_id").cloned();
+        out.secret_key = sec.get("aws_secret_access_key").cloned();
+        out.session_token = sec
+            .get("aws_session_token")
+            .cloned()
+            .or_else(|| sec.get("aws_security_token").cloned());
+        out.region = sec.get("region").cloned();
+    }
+    let cfg_path = home.join(".aws").join("config");
+    if let Ok(s) = std::fs::read_to_string(cfg_path) {
+        let section = if profile.eq_ignore_ascii_case("default") {
+            "default".to_string()
+        } else {
+            format!("profile {profile}")
+        };
+        let sec = parse_ini_section(&s, &section);
+        if out.region.is_none() {
+            out.region = sec.get("region").cloned();
+        }
+    }
+    out
+}
+
+fn s3_config_from_env_and_files(
+    mut get: impl FnMut(&str) -> Option<String>,
+    home: Option<PathBuf>,
+) -> S3Config {
+    let raw_endpoint = env_first_from(&["NEEDLE_S3_ENDPOINT", "RAP_S3_ENDPOINT"], &mut get)
+        .unwrap_or_else(|| "127.0.0.1:9000".into());
+    let scheme_https = raw_endpoint.trim().starts_with("https://");
+    let endpoint = normalize_endpoint(&raw_endpoint);
+    let env_tls = env_first_from(&["NEEDLE_S3_TLS", "RAP_S3_TLS"], &mut get);
+    let profile = env_first_from(&["AWS_PROFILE"], &mut get).unwrap_or_else(|| "default".into());
+    let file = home
+        .as_deref()
+        .map(|h| load_aws_files(h, &profile))
+        .unwrap_or_default();
+    let access_key = env_first_from(
+        &[
+            "NEEDLE_S3_ACCESS_KEY",
+            "RAP_S3_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+        ],
+        &mut get,
+    )
+    .or(file.access_key)
+    .unwrap_or_else(|| "minioadmin".into());
+    let secret_key = env_first_from(
+        &[
+            "NEEDLE_S3_SECRET_KEY",
+            "RAP_S3_SECRET_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+        ],
+        &mut get,
+    )
+    .or(file.secret_key)
+    .unwrap_or_else(|| "minioadmin".into());
+    let session_token = env_first_from(
+        &[
+            "NEEDLE_S3_SESSION_TOKEN",
+            "RAP_S3_SESSION_TOKEN",
+            "AWS_SESSION_TOKEN",
+        ],
+        &mut get,
+    )
+    .or(file.session_token);
+    let region = env_first_from(
+        &[
+            "NEEDLE_S3_REGION",
+            "RAP_S3_REGION",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+        ],
+        &mut get,
+    )
+    .or(file.region)
+    .unwrap_or_else(|| "us-east-1".into());
+    let env_anon = env_first_from(&["NEEDLE_S3_ANON_READ", "RAP_S3_ANON_READ"], &mut get);
+    let env_path = env_first_from(&["NEEDLE_S3_PATH_STYLE", "RAP_S3_PATH_STYLE"], &mut get);
+    S3Config {
+        endpoint: endpoint.clone(),
+        access_key,
+        secret_key,
+        session_token,
+        region,
+        anonymous_read: env_anon
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(!endpoint.contains("amazonaws.com")),
+        use_tls: infer_use_tls(&endpoint, env_tls.as_deref(), scheme_https),
+        path_style: infer_path_style(env_path.as_deref(), &endpoint),
+    }
 }
 
 impl Default for S3Config {
     fn default() -> Self {
-        let raw_endpoint = env_first(&["NEEDLE_S3_ENDPOINT", "RAP_S3_ENDPOINT"])
-            .unwrap_or_else(|| "127.0.0.1:9000".into());
-        let scheme_https = raw_endpoint.trim().starts_with("https://");
-        let endpoint = normalize_endpoint(&raw_endpoint);
-        let env_tls = env_first(&["NEEDLE_S3_TLS", "RAP_S3_TLS"]);
-        Self {
-            endpoint: endpoint.clone(),
-            access_key: env_first(&["NEEDLE_S3_ACCESS_KEY", "RAP_S3_ACCESS_KEY"])
-                .unwrap_or_else(|| "minioadmin".into()),
-            secret_key: env_first(&["NEEDLE_S3_SECRET_KEY", "RAP_S3_SECRET_KEY"])
-                .unwrap_or_else(|| "minioadmin".into()),
-            region: env_first(&["NEEDLE_S3_REGION", "RAP_S3_REGION"])
-                .unwrap_or_else(|| "us-east-1".into()),
-            anonymous_read: env_first(&["NEEDLE_S3_ANON_READ", "RAP_S3_ANON_READ"])
-                .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(!endpoint.contains("amazonaws.com")),
-            use_tls: infer_use_tls(&endpoint, env_tls.as_deref(), scheme_https),
-            path_style: infer_path_style(
-                env_first(&["NEEDLE_S3_PATH_STYLE", "RAP_S3_PATH_STYLE"]).as_deref(),
-                &endpoint,
-            ),
-        }
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())
+            .map(PathBuf::from);
+        s3_config_from_env_and_files(|n| std::env::var(n).ok(), home)
     }
 }
 
@@ -302,7 +438,7 @@ impl S3Client {
         let uri = self.object_path(bucket, key);
         let payload_hash = hex_sha256(b"");
         let sign = !self.cfg.anonymous_read;
-        let (status, _h, body) =
+        let (status, headers, body) =
             self.http("GET", bucket, &uri, "", &[], &payload_hash, None, sign)?;
         if status != 200 {
             bail!(
@@ -310,6 +446,7 @@ impl S3Client {
                 String::from_utf8_lossy(&body)
             );
         }
+        verify_s3_body_checksums(&headers, &body)?;
         self.stats.full_gets.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_read
@@ -323,7 +460,7 @@ impl S3Client {
         let end_incl = range.end.saturating_sub(1);
         let range_hdr = format!("bytes={}-{}", range.start, end_incl);
         let sign = !self.cfg.anonymous_read;
-        let (status, _h, body) = self.http(
+        let (status, headers, body) = self.http(
             "GET",
             bucket,
             &uri,
@@ -339,6 +476,7 @@ impl S3Client {
                 String::from_utf8_lossy(&body)
             );
         }
+        verify_s3_body_checksums(&headers, &body)?;
         self.stats.range_gets.fetch_add(1, Ordering::Relaxed);
         self.stats
             .bytes_read
@@ -425,19 +563,15 @@ impl S3Client {
         range: Option<&str>,
         sign: bool,
     ) -> Result<(u16, String, Vec<u8>)> {
-        match self.http_once(
-            method,
-            bucket,
-            canonical_uri,
-            query,
-            body,
-            payload_hash,
-            range,
-            sign,
-            true,
-        ) {
-            Ok(v) => Ok(v),
-            Err(_) => self.http_once(
+        // Initial attempt + up to 4 retries on connect failure and 429/5xx.
+        const MAX_RETRIES: u32 = 4;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(s3_retry_delay(attempt - 1));
+            }
+            let try_reuse = attempt == 0;
+            match self.http_once(
                 method,
                 bucket,
                 canonical_uri,
@@ -446,9 +580,27 @@ impl S3Client {
                 payload_hash,
                 range,
                 sign,
-                false,
-            ),
+                try_reuse,
+            ) {
+                Ok((status, headers, body_out)) => {
+                    if retryable_http_status(status) && attempt < MAX_RETRIES {
+                        last_err = Some(anyhow::anyhow!(
+                            "S3 {method} {canonical_uri} status {status}"
+                        ));
+                        continue;
+                    }
+                    return Ok((status, headers, body_out));
+                }
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("S3 {method} {canonical_uri} failed")))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -477,6 +629,18 @@ impl S3Client {
             format!("{encoded_uri}?{query}")
         };
 
+        let session_token = self
+            .cfg
+            .session_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        let content_md5 = if matches!(method, "PUT" | "POST") {
+            Some(b64_encode(&md5_digest(body)))
+        } else {
+            None
+        };
+
         let auth_header = if sign {
             let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, self.cfg.region);
             let mut pairs: Vec<(String, String)> = vec![
@@ -486,6 +650,12 @@ impl S3Client {
             ];
             if let Some(r) = range {
                 pairs.push(("range".into(), r.to_string()));
+            }
+            if let Some(tok) = session_token {
+                pairs.push(("x-amz-security-token".into(), tok.to_string()));
+            }
+            if let Some(md5) = content_md5.as_deref() {
+                pairs.push(("content-md5".into(), md5.to_string()));
             }
             pairs.sort_by(|a, b| a.0.cmp(&b.0));
             let canonical_headers: String =
@@ -517,6 +687,14 @@ impl S3Client {
         let mut extra = String::new();
         if let Some(r) = range {
             extra.push_str(&format!("Range: {r}\r\n"));
+        }
+        if sign {
+            if let Some(tok) = session_token {
+                extra.push_str(&format!("x-amz-security-token: {tok}\r\n"));
+            }
+        }
+        if let Some(md5) = content_md5.as_deref() {
+            extra.push_str(&format!("Content-MD5: {md5}\r\n"));
         }
         let content_len = if matches!(method, "PUT" | "POST") {
             format!("Content-Length: {}\r\n", body.len())
@@ -713,6 +891,253 @@ fn hex_sha256(data: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(data);
     hex::encode(h.finalize())
+}
+
+fn sha256_raw(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
+}
+
+fn retryable_http_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Full jitter exponential backoff. `retry` is 0-based (first retry = 0).
+fn s3_retry_delay(retry: u32) -> Duration {
+    let cap_ms = 400u64;
+    let base_ms = (25u64 << retry.min(4)).min(cap_ms);
+    let jitter = rand::thread_rng().gen_range(0..=base_ms);
+    Duration::from_millis(jitter)
+}
+
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    for line in headers.lines() {
+        let Some((n, v)) = line.split_once(':') else {
+            continue;
+        };
+        if n.trim().eq_ignore_ascii_case(name) {
+            return Some(v.trim());
+        }
+    }
+    None
+}
+
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i < data.len() {
+        let remaining = data.len() - i;
+        let b0 = data[i];
+        let b1 = if remaining > 1 { data[i + 1] } else { 0 };
+        let b2 = if remaining > 2 { data[i + 2] } else { 0 };
+        out.push(B64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(B64_ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if remaining == 1 {
+            out.push('=');
+            out.push('=');
+        } else {
+            out.push(B64_ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+            if remaining == 2 {
+                out.push('=');
+            } else {
+                out.push(B64_ALPHABET[(b2 & 0x3f) as usize] as char);
+            }
+        }
+        i += 3;
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let filtered: Vec<u8> = s
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    if filtered.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(filtered.len() * 3 / 4);
+    let mut i = 0;
+    while i < filtered.len() {
+        let v0 = val(filtered[i])?;
+        let v1 = if i + 1 < filtered.len() {
+            val(filtered[i + 1])?
+        } else {
+            return None;
+        };
+        out.push((v0 << 2) | (v1 >> 4));
+        if i + 2 < filtered.len() {
+            let v2 = val(filtered[i + 2])?;
+            out.push((v1 << 4) | (v2 >> 2));
+            if i + 3 < filtered.len() {
+                let v3 = val(filtered[i + 3])?;
+                out.push((v2 << 6) | v3);
+            }
+        }
+        i += 4;
+    }
+    Some(out)
+}
+
+fn checksum_header_bytes(raw: &str, expected_len: usize) -> Option<Vec<u8>> {
+    let s = raw.trim().trim_matches('"');
+    if let Some(v) = b64_decode(s) {
+        if v.len() == expected_len {
+            return Some(v);
+        }
+    }
+    if s.len() == expected_len * 2 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if let Ok(v) = hex::decode(s) {
+            if v.len() == expected_len {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// IEEE CRC-32 (ISO 3309 / ITU-T V.42), as used by `x-amz-checksum-crc32`.
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn md5_digest(data: &[u8]) -> [u8; 16] {
+    fn f(x: u32, y: u32, z: u32) -> u32 {
+        (x & y) | (!x & z)
+    }
+    fn g(x: u32, y: u32, z: u32) -> u32 {
+        (x & z) | (y & !z)
+    }
+    fn h(x: u32, y: u32, z: u32) -> u32 {
+        x ^ y ^ z
+    }
+    fn i_fn(x: u32, y: u32, z: u32) -> u32 {
+        y ^ (x | !z)
+    }
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+    let mut a0 = 0x6745_2301u32;
+    let mut b0 = 0xefcd_ab89u32;
+    let mut c0 = 0x98ba_dcfeu32;
+    let mut d0 = 0x1032_5476u32;
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity(data.len() + 72);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_le_bytes());
+    for chunk in padded.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for (i, slot) in m.iter_mut().enumerate() {
+            let o = i * 4;
+            *slot = u32::from_le_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]]);
+        }
+        let mut a = a0;
+        let mut b = b0;
+        let mut c = c0;
+        let mut d = d0;
+        for i in 0..64 {
+            let (fval, gidx) = if i < 16 {
+                (f(b, c, d), i)
+            } else if i < 32 {
+                (g(b, c, d), (5 * i + 1) % 16)
+            } else if i < 48 {
+                (h(b, c, d), (3 * i + 5) % 16)
+            } else {
+                (i_fn(b, c, d), (7 * i) % 16)
+            };
+            let fval = fval
+                .wrapping_add(a)
+                .wrapping_add(K[i])
+                .wrapping_add(m[gidx]);
+            a = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(fval.rotate_left(S[i]));
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out
+}
+
+fn verify_s3_body_checksums(headers: &str, body: &[u8]) -> Result<()> {
+    if let Some(raw) = header_value(headers, "x-amz-checksum-sha256") {
+        let got = sha256_raw(body);
+        match checksum_header_bytes(raw, 32) {
+            Some(want) if want.as_slice() == got.as_slice() => {}
+            _ => {
+                bail!("s3_checksum_mismatch: x-amz-checksum-sha256 {raw}");
+            }
+        }
+    }
+    if let Some(raw) = header_value(headers, "x-amz-checksum-crc32") {
+        let got = crc32_ieee(body).to_be_bytes();
+        match checksum_header_bytes(raw, 4) {
+            Some(want) if want.as_slice() == got.as_slice() => {}
+            _ => {
+                bail!("s3_checksum_mismatch: x-amz-checksum-crc32 {raw}");
+            }
+        }
+    }
+    if let Some(raw) = header_value(headers, "content-md5") {
+        let got = md5_digest(body);
+        match checksum_header_bytes(raw, 16) {
+            Some(want) if want.as_slice() == got.as_slice() => {}
+            _ => {
+                bail!("s3_checksum_mismatch: Content-MD5 {raw}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
@@ -1081,6 +1506,115 @@ impl parquet::file::reader::ChunkReader for S3ChunkReader {
 mod tests {
     use super::*;
     use rayon::prelude::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicBool;
+
+    struct MockS3 {
+        endpoint: String,
+        hits: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for MockS3 {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(&self.endpoint);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    fn test_client(endpoint: &str, session_token: Option<&str>) -> S3Client {
+        S3Client::new(S3Config {
+            endpoint: endpoint.to_string(),
+            access_key: "AKIA_TEST".into(),
+            secret_key: "testsecret".into(),
+            session_token: session_token.map(|s| s.to_string()),
+            region: "us-east-1".into(),
+            anonymous_read: false,
+            use_tls: false,
+            path_style: true,
+        })
+    }
+
+    fn start_mock(
+        handler: impl Fn(u64, &str) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + Sync + 'static,
+    ) -> MockS3 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock s3");
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let hits = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits_c = hits.clone();
+        let stop_c = stop.clone();
+        let handler = Arc::new(handler);
+        let join = std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                if stop_c.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut stream = match incoming {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                if stop_c.load(Ordering::SeqCst) {
+                    break;
+                }
+                let _ = stream.set_nodelay(true);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break None,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(s) = find_header_end(&buf) {
+                                break Some(s);
+                            }
+                            if buf.len() > 1024 * 1024 {
+                                break None;
+                            }
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                let Some(sep) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buf[..sep]).into_owned();
+                let n = hits_c.fetch_add(1, Ordering::SeqCst) + 1;
+                let (status, extra, body) = handler(n, &headers);
+                let reason = match status {
+                    200 => "OK",
+                    206 => "Partial Content",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    503 => "Service Unavailable",
+                    _ => "Error",
+                };
+                let mut resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    body.len()
+                );
+                for (k, v) in extra {
+                    resp.push_str(&format!("{k}: {v}\r\n"));
+                }
+                resp.push_str("\r\n");
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        MockS3 {
+            endpoint,
+            hits,
+            stop,
+            join: Some(join),
+        }
+    }
 
     #[test]
     fn parse_s3_uri() {
@@ -1157,6 +1691,7 @@ mod tests {
             endpoint: "s3.us-east-1.amazonaws.com".into(),
             access_key: "x".into(),
             secret_key: "y".into(),
+            session_token: None,
             region: "us-east-1".into(),
             anonymous_read: true,
             use_tls: true,
@@ -1183,6 +1718,7 @@ mod tests {
             endpoint: "127.0.0.1:9000".into(),
             access_key: "minioadmin".into(),
             secret_key: "minioadmin".into(),
+            session_token: None,
             region: "us-east-1".into(),
             anonymous_read: true,
             use_tls: false,
@@ -1285,5 +1821,203 @@ mod tests {
             snap2.mc_fallbacks, snap.mc_fallbacks,
             "PUT of date=… path fell back to mc (SigV4 encoding bug)"
         );
+    }
+
+    #[test]
+    fn checksum_primitives_and_verify() {
+        assert_eq!(
+            hex::encode(md5_digest(b"")),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+        assert_eq!(
+            hex::encode(md5_digest(b"hello")),
+            "5d41402abc4b2a76b9719d911017c592"
+        );
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+        assert_eq!(b64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(b64_decode("aGVsbG8=").as_deref(), Some(&b"hello"[..]));
+        assert_eq!(b64_encode(&md5_digest(b"")), "1B2M2Y8AsgTpgAmY7PhCfg==");
+        let body = b"hello";
+        let sha = b64_encode(&sha256_raw(body));
+        verify_s3_body_checksums(
+            &format!("HTTP/1.1 200 OK\r\nx-amz-checksum-sha256: {sha}\r\n"),
+            body,
+        )
+        .unwrap();
+        let crc = b64_encode(&crc32_ieee(body).to_be_bytes());
+        verify_s3_body_checksums(
+            &format!("HTTP/1.1 200 OK\r\nx-amz-checksum-crc32: {crc}\r\n"),
+            body,
+        )
+        .unwrap();
+        let md = b64_encode(&md5_digest(body));
+        verify_s3_body_checksums(&format!("HTTP/1.1 200 OK\r\nContent-MD5: {md}\r\n"), body)
+            .unwrap();
+        let err =
+            verify_s3_body_checksums("HTTP/1.1 200 OK\r\nx-amz-checksum-sha256: AAAA\r\n", body)
+                .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("s3_checksum_mismatch"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn credential_chain_needle_beats_aws_and_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aws = tmp.path().join(".aws");
+        std::fs::create_dir_all(&aws).unwrap();
+        std::fs::write(
+            aws.join("credentials"),
+            "[default]\naws_access_key_id = FILEAK\naws_secret_access_key = FILEsk\naws_session_token = FILEtok\n",
+        )
+        .unwrap();
+        std::fs::write(aws.join("config"), "[default]\nregion = ap-south-1\n").unwrap();
+
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert("NEEDLE_S3_ACCESS_KEY".into(), "nkey".into());
+        env.insert("NEEDLE_S3_SECRET_KEY".into(), "nsecret".into());
+        env.insert("NEEDLE_S3_SESSION_TOKEN".into(), "ntok".into());
+        env.insert("NEEDLE_S3_REGION".into(), "us-west-2".into());
+        env.insert("AWS_ACCESS_KEY_ID".into(), "akey".into());
+        env.insert("AWS_SECRET_ACCESS_KEY".into(), "asecret".into());
+        env.insert("AWS_SESSION_TOKEN".into(), "atok".into());
+        env.insert("AWS_REGION".into(), "eu-west-1".into());
+        let cfg =
+            s3_config_from_env_and_files(|n| env.get(n).cloned(), Some(tmp.path().to_path_buf()));
+        assert_eq!(cfg.access_key, "nkey");
+        assert_eq!(cfg.secret_key, "nsecret");
+        assert_eq!(cfg.session_token.as_deref(), Some("ntok"));
+        assert_eq!(cfg.region, "us-west-2");
+
+        env.clear();
+        env.insert("AWS_ACCESS_KEY_ID".into(), "akey".into());
+        env.insert("AWS_SECRET_ACCESS_KEY".into(), "asecret".into());
+        env.insert("AWS_SESSION_TOKEN".into(), "atok".into());
+        env.insert("AWS_DEFAULT_REGION".into(), "eu-central-1".into());
+        let cfg =
+            s3_config_from_env_and_files(|n| env.get(n).cloned(), Some(tmp.path().to_path_buf()));
+        assert_eq!(cfg.access_key, "akey");
+        assert_eq!(cfg.secret_key, "asecret");
+        assert_eq!(cfg.session_token.as_deref(), Some("atok"));
+        assert_eq!(cfg.region, "eu-central-1");
+
+        env.clear();
+        let cfg =
+            s3_config_from_env_and_files(|n| env.get(n).cloned(), Some(tmp.path().to_path_buf()));
+        assert_eq!(cfg.access_key, "FILEAK");
+        assert_eq!(cfg.secret_key, "FILEsk");
+        assert_eq!(cfg.session_token.as_deref(), Some("FILEtok"));
+        assert_eq!(cfg.region, "ap-south-1");
+    }
+
+    #[test]
+    fn credential_chain_aws_profile_and_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aws = tmp.path().join(".aws");
+        std::fs::create_dir_all(&aws).unwrap();
+        std::fs::write(
+            aws.join("credentials"),
+            "[default]\naws_access_key_id = DEF\naws_secret_access_key = defs\n\n[dev]\naws_access_key_id = DEV\naws_secret_access_key = devs\naws_session_token = devtok\n",
+        )
+        .unwrap();
+        std::fs::write(
+            aws.join("config"),
+            "[default]\nregion = us-east-1\n\n[profile dev]\nregion = eu-west-1\n",
+        )
+        .unwrap();
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert("AWS_PROFILE".into(), "dev".into());
+        let cfg =
+            s3_config_from_env_and_files(|n| env.get(n).cloned(), Some(tmp.path().to_path_buf()));
+        assert_eq!(cfg.access_key, "DEV");
+        assert_eq!(cfg.secret_key, "devs");
+        assert_eq!(cfg.session_token.as_deref(), Some("devtok"));
+        assert_eq!(cfg.region, "eu-west-1");
+    }
+
+    #[test]
+    fn mock_range_get_retries_on_503() {
+        let mock = start_mock(|n, _headers| {
+            if n == 1 {
+                (
+                    503,
+                    vec![("Content-Type".into(), "application/xml".into())],
+                    b"<Error>slow down</Error>".to_vec(),
+                )
+            } else {
+                (
+                    206,
+                    vec![
+                        ("Content-Type".into(), "application/octet-stream".into()),
+                        ("Content-Range".into(), "bytes 0-3/4".into()),
+                    ],
+                    b"abcd".to_vec(),
+                )
+            }
+        });
+        let client = test_client(&mock.endpoint, None);
+        let body = client
+            .get_range("bkt", "obj", &(0..4))
+            .expect("range get after 503 retry");
+        assert_eq!(body, b"abcd");
+        let hits = mock.hits.load(Ordering::SeqCst);
+        assert!(hits >= 2, "expected >= 2 requests, got {hits}");
+    }
+
+    #[test]
+    fn mock_session_token_required() {
+        let mock = start_mock(|_n, headers| {
+            let has_tok = headers.lines().any(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("x-amz-security-token:") && l.contains("sts-session-token")
+            });
+            if has_tok {
+                (200, vec![], b"ok-token".to_vec())
+            } else {
+                (403, vec![], b"missing token".to_vec())
+            }
+        });
+        let denied = test_client(&mock.endpoint, None);
+        let err = denied.get_object("bkt", "obj").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("403"), "{msg}");
+        let hits_after_deny = mock.hits.load(Ordering::SeqCst);
+        assert_eq!(hits_after_deny, 1, "403 must not be retried");
+
+        let allowed = test_client(&mock.endpoint, Some("sts-session-token"));
+        let body = allowed.get_object("bkt", "obj").expect("token accepted");
+        assert_eq!(body, b"ok-token");
+    }
+
+    #[test]
+    fn mock_get_checksum_mismatch() {
+        let mock = start_mock(|_n, _headers| {
+            (
+                200,
+                vec![(
+                    "x-amz-checksum-sha256".into(),
+                    // 32 zero bytes, not the SHA-256 of the body
+                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                )],
+                b"hello".to_vec(),
+            )
+        });
+        let client = test_client(&mock.endpoint, None);
+        let err = client.get_object("bkt", "obj").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("s3_checksum_mismatch"),
+            "expected s3_checksum_mismatch, got {msg}"
+        );
+    }
+
+    #[test]
+    fn mock_does_not_retry_404() {
+        let mock = start_mock(|_n, _headers| (404, vec![], b"nope".to_vec()));
+        let client = test_client(&mock.endpoint, None);
+        let err = client.get_object("bkt", "missing").unwrap_err();
+        assert!(format!("{err:#}").contains("404"));
+        assert_eq!(mock.hits.load(Ordering::SeqCst), 1);
     }
 }

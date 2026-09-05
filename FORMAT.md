@@ -29,7 +29,7 @@ Writers always emit an object:
 
 | Field | Meaning |
 |-------|---------|
-| `format_version` | Major version. Must be `1`. |
+| `format_version` | Major version. **FROZEN** at `1`. |
 | `fragments` | Fragment ids, oldest first (apply order). |
 
 A legacy JSON array of fragment-id strings is still accepted as v1. The next write migrates to the object form.
@@ -57,6 +57,13 @@ Writers take a non-blocking exclusive `flock` on `.needle.lock` for the whole fr
 
 Buckets are `bucket_{NNN}.jsonl` (inspectable) and `bucket_{NNN}.bin` (bincode; preferred on load).
 
-## Compatibility
+## Compatibility policy (frozen v1)
 
-v1 is the current format. Compact rewrites to one fragment, points `registry.json` at that id, and deletes unreferenced directories under `fragments/`. `forgotten.jsonl` is kept.
+`format_version` 1 is **FROZEN**.
+
+- Additive optional fields on manifests and entries with `serde` default are allowed without a major bump.
+- Removing or renaming fields, changing the bucket hash, changing the registry object shape, or changing ordinal meaning requires a major bump (`format_version` 2).
+- Readers reject unknown majors (`unsupported index format_version`).
+- A legacy JSON array of fragment-id strings is still accepted as v1. The next write migrates to the object form.
+
+Compact rewrites to one fragment, points `registry.json` at that id, and deletes unreferenced directories under `fragments/`. `forgotten.jsonl` is kept.

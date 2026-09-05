@@ -34,6 +34,7 @@ fn cli_new_subcommand_help() {
         .success()
         .stdout(predicate::str::contains("bind"))
         .stdout(predicate::str::contains("lazy-buckets"))
+        .stdout(predicate::str::contains("full-index"))
         .stdout(predicate::str::contains("tls-cert"))
         .stdout(predicate::str::contains("token"))
         .stdout(predicate::str::contains("insecure"));
@@ -45,7 +46,9 @@ fn cli_new_subcommand_help() {
         .success()
         .stdout(predicate::str::contains("--sql"))
         .stdout(predicate::str::contains("--index"))
-        .stdout(predicate::str::contains("no-verify"));
+        .stdout(predicate::str::contains("no-verify"))
+        .stdout(predicate::str::contains("one lookup key"))
+        .stdout(predicate::str::contains("Not lake SQL"));
 
     Command::cargo_bin("needle")
         .unwrap()
@@ -53,7 +56,15 @@ fn cli_new_subcommand_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("key-column"))
-        .stdout(predicate::str::contains("--table"));
+        .stdout(predicate::str::contains("--table"))
+        .stdout(predicate::str::contains("--catalog"))
+        .stdout(predicate::str::contains("--rest-uri"))
+        .stdout(predicate::str::contains("--namespace"))
+        .stdout(predicate::str::contains("--table-name"))
+        .stdout(predicate::str::contains("--rest-token"))
+        .stdout(predicate::str::contains("NEEDLE_ICEBERG_TOKEN"))
+        .stdout(predicate::str::contains("production catalog path"))
+        .stdout(predicate::str::contains("fallback"));
 
     Command::cargo_bin("needle")
         .unwrap()
@@ -69,7 +80,9 @@ fn cli_new_subcommand_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--key"))
-        .stdout(predicate::str::contains("--index"));
+        .stdout(predicate::str::contains("--index"))
+        .stdout(predicate::str::contains("--check"))
+        .stdout(predicate::str::contains("not a GDPR delete"));
 
     Command::cargo_bin("needle")
         .unwrap()

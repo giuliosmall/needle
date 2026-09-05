@@ -144,11 +144,11 @@ maintain it without rewriting lake Parquet:
 
 | Command | What it does |
 |---------|----------------|
-| `needle forget --key K` | Hide `K` from lookups. Sticky across later data fragments (`forgotten.jsonl`). Does **not** rewrite Parquet. |
+| `needle forget --key K` | Hide `K` from Needle lookups only (sticky `forgotten.jsonl`). **Not a GDPR delete** — Parquet is unchanged. `--check` warns if the key still has source files. |
 | `needle compact` | Rewrite to one fragment: last `(key, file)` wins, apply forget + Iceberg drops. Unreferenced fragment dirs are deleted. `registry.json` (`format_version` 1) points at the new id (`compact-<unix-ms>` unless `--fragment` is set). |
 | `needle verify` | Compare stored size / ETag / mtime (`file_idents`) to live local files or S3 HEAD. Exits non-zero if any file is `stale`. |
 
-Queries **fail closed** on identity mismatch (`stale_file_identity`) unless you pass `--no-verify` (unsafe). `registry.json` is published with tmp+rename under an exclusive `.needle.lock`. `needled` reloads when that file’s mtime changes, so forget/compact show up without a restart. See [`FORMAT.md`](./FORMAT.md).
+Queries **fail closed** on identity mismatch (`stale_file_identity`) unless you pass `--no-verify` (unsafe). `registry.json` is published with tmp+rename under an exclusive `.needle.lock`. `needled` reloads when that file’s mtime changes, so forget/compact show up without a restart. Default is `--lazy-buckets` (full RAM load is `--full-index`). See [`FORMAT.md`](./FORMAT.md).
 
 ### HTTP daemon
 
@@ -175,11 +175,16 @@ Env: `NEEDLE_INDEX`, `NEEDLE_BIND`, `NEEDLED_TOKEN`.
 
 ### Iceberg
 
-Index an Apache Iceberg table (Hadoop metadata + Avro manifests) into Needle fragments.
-`--table` is a local directory or an `s3://` / `https://` table root.
+Production discovery is an **Iceberg REST catalog**. Hadoop `metadata/*.json` remains a fallback.
 
 ```bash
-needle iceberg-index --table /path/to/iceberg/table --index data/rap-index --key-column user_id --covering
+# REST catalog (production)
+needle iceberg-index --catalog rest --rest-uri http://catalog:8181/iceberg \
+  --namespace db --table-name events --index data/rap-index --key-column user_id
+# Bearer: --rest-token or NEEDLE_ICEBERG_TOKEN
+
+# Hadoop warehouse fallback
+needle iceberg-index --catalog hadoop --table /path/to/iceberg/table --index data/rap-index --key-column user_id
 needle iceberg-index --table s3://bucket/warehouse/db/tbl --index data/rap-index --key-column user_id
 ```
 
@@ -197,7 +202,7 @@ file reindexes it.
 
 ### SQL
 
-Run SQL over the hits for a single key (`hits` is the decoded Arrow batch for that key):
+SQL over **rows for one lookup key** (`hits` / `needle_lookup`). This is not lake-wide SQL:
 
 ```bash
 needle sql --index data/rap-index --key user_0042 --sql "SELECT track_uri, count(*) AS n FROM hits GROUP BY track_uri ORDER BY n DESC"
@@ -206,6 +211,9 @@ needle sql --index data/rap-index --key user_0042 --sql "SELECT track_uri, count
 ### Object store (MinIO and AWS)
 
 Range GET, full GET, PUT, HEAD, ListObjectsV2. SigV4 over raw TCP; TLS via `native-tls`.
+Retries with jitter on 429/5xx; STS session tokens; response checksums verified when S3 sends them.
+
+Credential chain: `NEEDLE_S3_*` / `RAP_S3_*`, then `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION`, then `~/.aws/credentials` + `~/.aws/config` (`AWS_PROFILE`).
 
 | | MinIO (default) | AWS |
 |--|-----------------|-----|
@@ -214,17 +222,13 @@ Range GET, full GET, PUT, HEAD, ListObjectsV2. SigV4 over raw TCP; TLS via `nati
 | TLS | off | on |
 | Anonymous GET | on (if the bucket allows it) | off (signed) |
 
-`NEEDLE_S3_*` wins over the older `RAP_S3_*` names:
-
 ```bash
 export NEEDLE_S3_ENDPOINT=s3.us-east-1.amazonaws.com   # or https://…
 export NEEDLE_S3_REGION=us-east-1
-export NEEDLE_S3_ACCESS_KEY=…
-export NEEDLE_S3_SECRET_KEY=…
-# optional overrides:
-# NEEDLE_S3_TLS=1|0
-# NEEDLE_S3_PATH_STYLE=1|0
-# NEEDLE_S3_ANON_READ=1|0
+export NEEDLE_S3_ACCESS_KEY=…          # or AWS_ACCESS_KEY_ID
+export NEEDLE_S3_SECRET_KEY=…          # or AWS_SECRET_ACCESS_KEY
+export NEEDLE_S3_SESSION_TOKEN=…       # optional STS; or AWS_SESSION_TOKEN
+# NEEDLE_S3_TLS=1|0  NEEDLE_S3_PATH_STYLE=1|0  NEEDLE_S3_ANON_READ=1|0
 ```
 
 Local MinIO stress (no cloud account):
@@ -287,7 +291,8 @@ src/
   secondary.rs         Hash + sorted secondary indexes
   parquet_lowlevel/    Custom page writer (frames, align, interleaved, paged)
 tests/                 Unit-adjacent E2E + MinIO smoke
-FORMAT.md              On-disk index format (`format_version`, lock, compact GC)
+FORMAT.md              On-disk index format (frozen v1, lock, compact GC)
+HTTP.md                needled HTTP JSON (frozen v1)
 NOTES.md               Article mapping & fidelity notes
 ```
 
@@ -295,10 +300,12 @@ NOTES.md               Article mapping & fidelity notes
 
 ## Status / honesty
 
-**0.2 preview / beta — not production.** This is not Spotify’s RAP.
+**0.3 preview — productionizable on Iceberg REST catalog + AWS S3 (STS, retries, checksums) with frozen v1 index/HTTP; not a general lake query engine.** This is not Spotify’s RAP.
 
-- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host, MinIO and AWS), Iceberg incremental index (add/drop live-set, v2 position/equality deletes, fail-closed on unsupported deletes), compact/forget/verify, **strict** file identity on query (`--no-verify` unsafe), `needled` TLS + bearer token, versioned `registry.json` + writer lock + compact GC, CI, MinIO lake harness, broad unit/E2E suite.
-- **Still out of scope:** mmap’d huge indexes, generic covering aggregates, REST/Glue/Nessie catalogs, a full AWS SDK S3 client, `forget` as a lake delete, SQL over the whole lake.
+**Stability policy.** Index `format_version` 1 and needled HTTP JSON v1 are **frozen**: current fields stay, additive optional keys are allowed, breaking changes require a new major (`format_version` 2 or `/v2/`). See [`FORMAT.md`](./FORMAT.md) and [`HTTP.md`](./HTTP.md).
+
+- **Implemented:** external index, page-accurate ranged reads, covering + secondary indexes, HTTP/S3 Range (TLS + virtual-host, MinIO and AWS, STS session tokens, retries, checksums), Iceberg REST catalog + Hadoop fallback, incremental index (add/drop live-set, v2 position/equality deletes, fail-closed on unsupported deletes), compact/forget/verify, **strict** file identity on query (`--no-verify` unsafe), `needled` TLS + bearer token, frozen `registry.json` v1 + writer lock + compact GC, CI, MinIO lake harness, broad unit/E2E suite.
+- **Still out of scope:** mmap / multi-TB lakes, Glue/Nessie catalogs, multi-writer index beyond flock, lake-wide SQL, physical Parquet/Iceberg deletes. `--covering` is listen-shaped only (refused on generic schemas). `forget` only hides keys in Needle.
 - **Custom Parquet prep** (ZSTD multi-frame pages, skippable alignment, interleaving) uses a low-level writer so layouts live **inside** `.parquet` files readable by Arrow.
 
 Apache-2.0.

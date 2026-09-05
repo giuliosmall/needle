@@ -4,6 +4,11 @@
 //! and Avro are fetched via `S3Client::get_object` for `s3://` / `https://`
 //! (data-file URIs stay as `s3://…` in the index).
 //!
+//! Catalogs: Iceberg REST (`GET {rest-uri}/v1/namespaces/{ns}/tables/{table}` →
+//! `metadata-location`) is the production discovery path. Hadoop warehouse /
+//! table-root (`--table`) remains a fallback. REST nested namespaces use the
+//! Iceberg unit separator (`a.b` → `a%1Fb`).
+//!
 //! Avro is a simplified Iceberg subset: we read `manifest_path` from the
 //! manifest-list and `status` + nested `data_file.file_path` (also `file-path`)
 //! from manifest entries. Writers in tests use those underscore names (valid
@@ -18,14 +23,27 @@ use apache_avro::Reader;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const UNSUPPORTED_DELETE_FILES: &str =
     "needle refuses Iceberg tables with unsupported delete files; apply deletes or compact first";
 
+/// Iceberg catalog used to discover the current table metadata location.
+///
+/// REST is the production path; Hadoop warehouse/table-root is a fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IcebergCatalog {
+    #[default]
+    Hadoop,
+    Rest,
+}
+
 #[derive(Debug, Clone)]
 pub struct IcebergIndexOpts {
-    /// Table root (directory that contains `metadata/`).
+    /// Hadoop table root (directory that contains `metadata/`). Unused for REST.
     pub table: PathBuf,
     pub index: PathBuf,
     /// Default `["user_id"]` when empty.
@@ -35,6 +53,16 @@ pub struct IcebergIndexOpts {
     pub buckets: u32,
     /// Default `"iceberg"` when empty.
     pub fragment_prefix: String,
+    /// `Hadoop` (default) uses [`Self::table`]; `Rest` uses REST catalog fields.
+    pub catalog: IcebergCatalog,
+    /// REST catalog base URI, e.g. `http://host/iceberg`.
+    pub rest_uri: Option<String>,
+    /// Iceberg namespace (`db`, or `a.b` for nested).
+    pub namespace: Option<String>,
+    /// Table name in the REST catalog.
+    pub table_name: Option<String>,
+    /// Bearer token (`Authorization: Bearer`). CLI also reads `NEEDLE_ICEBERG_TOKEN`.
+    pub rest_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +83,14 @@ struct TableMetadataJson {
     location: Option<String>,
     #[serde(default)]
     snapshots: Vec<SnapshotJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestLoadTable {
+    #[serde(rename = "metadata-location", alias = "metadata_location", default)]
+    metadata_location: Option<String>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,7 +124,7 @@ pub fn list_current_parquet_files(table: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn index_iceberg_table(opts: &IcebergIndexOpts) -> Result<IcebergIndexReport> {
-    let loaded = load_table(&opts.table)?;
+    let loaded = load_table_for_index(opts)?;
     let snapshot_id = loaded.current_snapshot_id;
     let table_location = loaded.location.clone();
     let prefix = if opts.fragment_prefix.is_empty() {
@@ -299,11 +335,78 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     }
 }
 
+fn load_table_for_index(opts: &IcebergIndexOpts) -> Result<LoadedTable> {
+    match opts.catalog {
+        IcebergCatalog::Hadoop => {
+            if opts.table.as_os_str().is_empty() {
+                return Err(catalog_error(
+                    "Hadoop catalog requires --table (warehouse/table root); REST is the production catalog path",
+                ));
+            }
+            load_table(&opts.table)
+        }
+        IcebergCatalog::Rest => load_table_from_rest(opts),
+    }
+}
+
+fn load_table_from_rest(opts: &IcebergIndexOpts) -> Result<LoadedTable> {
+    let resp = rest_load_table(opts)?;
+    if let Some(loc) = resp
+        .metadata_location
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return load_table(&path_from_iceberg_uri(loc));
+    }
+    let Some(meta_val) = resp.metadata else {
+        return Err(catalog_error(
+            "REST table response missing metadata-location",
+        ));
+    };
+    let parsed: TableMetadataJson = serde_json::from_value(meta_val.clone()).map_err(|e| {
+        catalog_error(format!(
+            "REST table response has invalid inline metadata: {e}"
+        ))
+    })?;
+    let hint = parsed
+        .location
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(path_from_iceberg_uri)
+        .ok_or_else(|| {
+            catalog_error("REST inline metadata missing location and metadata-location")
+        })?;
+    let meta_path = hint.join("metadata").join("rest.metadata.json");
+    let bytes = serde_json::to_vec(&meta_val)
+        .map_err(|e| catalog_error(format!("serialize REST inline metadata: {e}")))?;
+    load_table_from_metadata_bytes(&hint, meta_path, &bytes)
+}
+
 fn load_table(table: &Path) -> Result<LoadedTable> {
     let metadata_path = find_current_metadata(table)?;
     let bytes = read_bytes(&metadata_path)
         .with_context(|| format!("open Iceberg metadata {}", metadata_path.display()))?;
-    let meta: TableMetadataJson = serde_json::from_slice(&bytes)
+    // REST `metadata-location` is often the JSON file; Hadoop `--table` is the root.
+    let root = if is_metadata_json_path(table.to_string_lossy().trim()) {
+        metadata_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(table)
+            .to_path_buf()
+    } else {
+        table.to_path_buf()
+    };
+    load_table_from_metadata_bytes(&root, metadata_path, &bytes)
+}
+
+fn load_table_from_metadata_bytes(
+    table: &Path,
+    metadata_path: PathBuf,
+    bytes: &[u8],
+) -> Result<LoadedTable> {
+    let meta: TableMetadataJson = serde_json::from_slice(bytes)
         .with_context(|| format!("parse Iceberg metadata {}", metadata_path.display()))?;
     let current_snapshot_id = meta
         .current_snapshot_id
@@ -339,6 +442,12 @@ fn load_table(table: &Path) -> Result<LoadedTable> {
 
 fn find_current_metadata(table: &Path) -> Result<PathBuf> {
     let table_uri = table.to_string_lossy();
+    if let Some(local) = strip_file_uri(table_uri.trim()) {
+        return find_current_metadata(Path::new(&local));
+    }
+    if is_metadata_json_path(table_uri.trim()) {
+        return Ok(table.to_path_buf());
+    }
     if S3Client::is_remote_uri(&table_uri) {
         return find_current_metadata_remote(&table_uri);
     }
@@ -527,6 +636,289 @@ fn parse_metadata_version(name: &str) -> Option<i64> {
     num_part.parse().ok()
 }
 
+fn is_metadata_json_path(s: &str) -> bool {
+    s.trim_end_matches('/')
+        .split('?')
+        .next()
+        .unwrap_or(s)
+        .ends_with(".metadata.json")
+}
+
+fn path_from_iceberg_uri(s: &str) -> PathBuf {
+    let s = s.trim();
+    if let Some(local) = strip_file_uri(s) {
+        PathBuf::from(local)
+    } else {
+        PathBuf::from(s)
+    }
+}
+
+fn rest_load_table(opts: &IcebergIndexOpts) -> Result<RestLoadTable> {
+    let uri = opts
+        .rest_uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| catalog_error("REST catalog requires --rest-uri"))?;
+    let ns = opts
+        .namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| catalog_error("REST catalog requires --namespace"))?;
+    let name = opts
+        .table_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| catalog_error("REST catalog requires --table-name"))?;
+    if !(uri.starts_with("http://") || uri.starts_with("https://")) {
+        return Err(catalog_error(format!(
+            "REST URI must be http:// or https://: {uri}"
+        )));
+    }
+    let url = rest_table_url(uri, ns, name);
+    let token = opts
+        .rest_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (status, body) = rest_http_get(&url, token)?;
+    if status == 401 || status == 403 {
+        return Err(catalog_error(format!(
+            "REST catalog GET {url} returned {status} (unauthorized; set --rest-token or NEEDLE_ICEBERG_TOKEN)"
+        )));
+    }
+    if !(200..300).contains(&status) {
+        let preview = String::from_utf8_lossy(&body);
+        let preview: String = preview.chars().take(200).collect();
+        return Err(catalog_error(format!(
+            "REST catalog GET {url} returned {status}: {preview}"
+        )));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|e| catalog_error(format!("REST catalog GET {url} returned invalid JSON: {e}")))
+}
+
+fn rest_table_url(rest_uri: &str, namespace: &str, table: &str) -> String {
+    let base = rest_uri.trim().trim_end_matches('/');
+    format!(
+        "{base}/v1/namespaces/{}/tables/{}",
+        encode_rest_namespace(namespace),
+        encode_path_segment(table.trim())
+    )
+}
+
+/// Iceberg REST: nested namespaces are unit-separator joined, then percent-encoded.
+/// `a.b` → `a%1Fb`.
+fn encode_rest_namespace(ns: &str) -> String {
+    let joined = ns
+        .trim()
+        .split('.')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("\u{1F}");
+    encode_path_segment(&joined)
+}
+
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn rest_http_get(url: &str, bearer: Option<&str>) -> Result<(u16, Vec<u8>)> {
+    let mut last_err = None;
+    for attempt in 0..20 {
+        match rest_http_get_once(url, bearer) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                let transient = msg.contains("connect")
+                    || msg.contains("Connection refused")
+                    || msg.contains("Connection reset");
+                last_err = Some(e);
+                if !transient || attempt == 19 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    Err(catalog_error(format!(
+        "REST GET {url} failed: {:#}",
+        last_err.unwrap_or_else(|| anyhow::anyhow!("unknown error"))
+    )))
+}
+
+struct RestUrl {
+    tls: bool,
+    sni: String,
+    connect_addr: String,
+    host_header: String,
+    path: String,
+}
+
+fn parse_rest_url(url: &str) -> Result<RestUrl> {
+    let url = url.split('#').next().unwrap_or(url).trim();
+    let (tls, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        bail!("REST URL must be http:// or https://");
+    };
+    let rest = rest.split_once('?').map(|(a, _)| a).unwrap_or(rest);
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, "/".to_string()),
+    };
+    if authority.is_empty() {
+        bail!("REST URL missing host");
+    }
+    let (host, port) = split_host_port(authority, if tls { 443 } else { 80 })?;
+    let connect_addr = format!("{host}:{port}");
+    let host_header = if (tls && port == 443) || (!tls && port == 80) {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok(RestUrl {
+        tls,
+        sni: host.to_string(),
+        connect_addr,
+        host_header,
+        path,
+    })
+}
+
+fn split_host_port(authority: &str, default_port: u16) -> Result<(&str, u16)> {
+    if let Some(h) = authority.strip_prefix('[') {
+        let end = h
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("invalid IPv6 host"))?;
+        let host = &h[..end];
+        let rest = &h[end + 1..];
+        if let Some(p) = rest.strip_prefix(':') {
+            let port: u16 = p.parse().context("invalid port")?;
+            return Ok((host, port));
+        }
+        return Ok((host, default_port));
+    }
+    if let Some((host, p)) = authority.rsplit_once(':') {
+        if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+            let port: u16 = p.parse().context("invalid port")?;
+            return Ok((host, port));
+        }
+    }
+    Ok((authority, default_port))
+}
+
+fn rest_http_get_once(url: &str, bearer: Option<&str>) -> Result<(u16, Vec<u8>)> {
+    let parsed = parse_rest_url(url)?;
+    let auth = match bearer {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Accept: application/json\r\n\
+         {auth}\
+         Connection: close\r\n\
+         \r\n",
+        path = parsed.path,
+        host = parsed.host_header,
+    );
+    let tcp = TcpStream::connect(&parsed.connect_addr)
+        .with_context(|| format!("connect {}", parsed.connect_addr))?;
+    tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+    if parsed.tls {
+        let connector = native_tls::TlsConnector::new().context("tls connector")?;
+        let mut stream = connector
+            .connect(&parsed.sni, tcp)
+            .map_err(|e| anyhow::anyhow!("tls handshake {}: {e}", parsed.sni))?;
+        stream.write_all(req.as_bytes())?;
+        stream.flush()?;
+        rest_read_response(&mut stream)
+    } else {
+        let mut stream = tcp;
+        stream.write_all(req.as_bytes())?;
+        stream.flush()?;
+        rest_read_response(&mut stream)
+    }
+}
+
+fn rest_read_response(stream: &mut impl Read) -> Result<(u16, Vec<u8>)> {
+    let mut resp = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 8192];
+    let sep = loop {
+        let n = match stream.read(&mut tmp) {
+            Ok(0) => bail!("eof before HTTP headers"),
+            Ok(n) => n,
+            Err(e) => return Err(e.into()),
+        };
+        resp.extend_from_slice(&tmp[..n]);
+        if let Some(s) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+            break s;
+        }
+        if resp.len() > 1024 * 1024 {
+            bail!("HTTP headers too large");
+        }
+    };
+    let headers = std::str::from_utf8(&resp[..sep]).unwrap_or("");
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let header_end = sep + 4;
+    let mut body = resp[header_end..].to_vec();
+    if let Some(need) = rest_content_length(headers) {
+        while body.len() < need {
+            let n = stream.read(&mut tmp)?;
+            if n == 0 {
+                bail!("eof in HTTP body ({} of {} bytes)", body.len(), need);
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(need);
+    } else {
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => body.extend_from_slice(&tmp[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok((status, body))
+}
+
+fn rest_content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|l| {
+        let l = l.to_ascii_lowercase();
+        l.strip_prefix("content-length:")
+            .and_then(|v| v.trim().parse().ok())
+    })
+}
+
 fn list_live_files(loaded: &LoadedTable) -> Result<Vec<PathBuf>> {
     Ok(list_snapshot_files(loaded)?.data)
 }
@@ -541,6 +933,10 @@ fn table_root(loaded: &LoadedTable) -> &Path {
 
 fn unsupported_deletes(why: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{UNSUPPORTED_DELETE_FILES} ({why})")
+}
+
+fn catalog_error(msg: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("catalog_error: {msg}")
 }
 
 fn list_snapshot_files(loaded: &LoadedTable) -> Result<SnapshotFiles> {
@@ -1381,6 +1777,11 @@ mod tests {
             covering: true,
             buckets: 8,
             fragment_prefix: "iceberg".to_string(),
+            catalog: IcebergCatalog::Hadoop,
+            rest_uri: None,
+            namespace: None,
+            table_name: None,
+            rest_token: None,
         }
     }
 
@@ -1942,5 +2343,706 @@ mod tests {
             ok.batch.num_rows() > 0 || !ok.rows.is_empty(),
             " --no-verify must still decode"
         );
+    }
+
+    struct RestCatalogMock {
+        addr: std::net::SocketAddr,
+        handle: Option<std::thread::JoinHandle<()>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RestCatalogMock {
+        fn start(expected_path: &str, body: String, required_token: Option<String>) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").expect("bind rest mock");
+            let addr = server.server_addr().to_ip().expect("ip addr");
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_c = std::sync::Arc::clone(&stop);
+            let expected_path = expected_path.to_string();
+            let handle = std::thread::spawn(move || {
+                rest_mock_loop(server, expected_path, body, required_token, stop_c);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Self {
+                addr,
+                handle: Some(handle),
+                stop,
+            }
+        }
+
+        fn rest_uri(&self) -> String {
+            format!("http://{}/iceberg", self.addr)
+        }
+    }
+
+    impl Drop for RestCatalogMock {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.addr);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn rest_mock_loop(
+        server: tiny_http::Server,
+        expected_path: String,
+        body: String,
+        required_token: Option<String>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        loop {
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            let request = match server.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
+            if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = request.respond(tiny_http::Response::empty(503));
+                break;
+            }
+            let url = request.url().to_string();
+            let path = url.split('?').next().unwrap_or(&url);
+            let path_ok = path == expected_path || path.ends_with(&expected_path);
+            if request.method() != &tiny_http::Method::Get || !path_ok {
+                let _ = request
+                    .respond(tiny_http::Response::from_string("not found").with_status_code(404));
+                continue;
+            }
+            if let Some(tok) = &required_token {
+                let got = rest_mock_bearer(&request);
+                if got.as_deref() != Some(tok.as_str()) {
+                    let _ = request.respond(
+                        tiny_http::Response::from_string(r#"{"error":"unauthorized"}"#)
+                            .with_status_code(401),
+                    );
+                    continue;
+                }
+            }
+            let resp = tiny_http::Response::from_string(body.clone())
+                .with_status_code(200)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+            let _ = request.respond(resp);
+        }
+    }
+
+    fn rest_mock_bearer(request: &tiny_http::Request) -> Option<String> {
+        for h in request.headers() {
+            if !h.field.equiv("Authorization") {
+                continue;
+            }
+            let v = h.value.as_str().trim();
+            if v.len() >= 7 && v[..7].eq_ignore_ascii_case("Bearer ") {
+                return Some(v[7..].trim().to_string());
+            }
+        }
+        None
+    }
+
+    fn rest_index_opts(rest_uri: &str, index: &Path, token: Option<&str>) -> IcebergIndexOpts {
+        IcebergIndexOpts {
+            table: PathBuf::new(),
+            index: index.to_path_buf(),
+            key_columns: vec!["user_id".to_string()],
+            value_columns: Vec::new(),
+            covering: true,
+            buckets: 8,
+            fragment_prefix: "iceberg".to_string(),
+            catalog: IcebergCatalog::Rest,
+            rest_uri: Some(rest_uri.to_string()),
+            namespace: Some("db".to_string()),
+            table_name: Some("tbl".to_string()),
+            rest_token: token.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn rest_namespace_encodes_unit_separator() {
+        assert_eq!(encode_rest_namespace("db"), "db");
+        assert_eq!(encode_rest_namespace("a.b"), "a%1Fb");
+        assert_eq!(encode_rest_namespace("a.b.c"), "a%1Fb%1Fc");
+        assert_eq!(
+            rest_table_url("http://host/iceberg/", "a.b", "tbl"),
+            "http://host/iceberg/v1/namespaces/a%1Fb/tables/tbl"
+        );
+    }
+
+    #[test]
+    fn index_iceberg_table_via_rest_applies_position_deletes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("table");
+        let data = table.join("data");
+        let index = tmp.path().join("rap-index");
+        let parquet = data.join("rows.parquet");
+        write_flat_rows(&parquet, &["user_0000", "user_0001", "user_0002"]).unwrap();
+        let pos_del = data.join("pos-del.parquet");
+        write_position_delete_parquet(&pos_del, &[(&parquet, 0)]).unwrap();
+        write_iceberg_table_with_deletes(&table, &[parquet], &[pos_del], &[], 1, 1).unwrap();
+
+        let body = serde_json::json!({
+            "metadata-location": file_uri(&table),
+        })
+        .to_string();
+        let mock = RestCatalogMock::start("/iceberg/v1/namespaces/db/tables/tbl", body, None);
+        let opts = rest_index_opts(&mock.rest_uri(), &index, None);
+        let report = index_iceberg_table(&opts).unwrap();
+        assert!(!report.skipped);
+        assert_eq!(report.files_indexed, 1);
+
+        let rap = load_index(&index).unwrap();
+        assert!(
+            rap.lookup("user_0000").is_empty(),
+            "REST-discovered position delete must hide user_0000"
+        );
+        assert!(!rap.lookup("user_0001").is_empty());
+        assert!(!rap.lookup("user_0002").is_empty());
+    }
+
+    #[test]
+    fn rest_catalog_bearer_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("table");
+        let data = table.join("data");
+        let index = tmp.path().join("rap-index");
+        let parquet = data.join("rows.parquet");
+        write_flat_rows(&parquet, &["user_0000", "user_0001"]).unwrap();
+        write_iceberg_table(&table, &[parquet], 1, 1).unwrap();
+
+        let meta_loc = table
+            .join("metadata")
+            .join("v1.metadata.json")
+            .canonicalize()
+            .unwrap();
+        let body = serde_json::json!({
+            "metadata-location": format!("file://{}", meta_loc.display()),
+        })
+        .to_string();
+        let token = "rest-secret";
+        let mock = RestCatalogMock::start(
+            "/iceberg/v1/namespaces/db/tables/tbl",
+            body,
+            Some(token.to_string()),
+        );
+
+        let unauth = rest_index_opts(&mock.rest_uri(), &index, None);
+        let err = index_iceberg_table(&unauth).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("catalog_error"),
+            "401 must be catalog_error, got {msg}"
+        );
+        assert!(
+            msg.contains("401"),
+            "401 status must appear in catalog_error, got {msg}"
+        );
+        assert!(
+            !index.join("registry.json").exists(),
+            "must not publish an index after catalog 401"
+        );
+
+        let auth = rest_index_opts(&mock.rest_uri(), &index, Some(token));
+        let report = index_iceberg_table(&auth).unwrap();
+        assert!(!report.skipped);
+        let rap = load_index(&index).unwrap();
+        assert!(!rap.lookup("user_0000").is_empty());
+        assert!(!rap.lookup("user_0001").is_empty());
+    }
+
+    struct IntegratorS3Mock {
+        endpoint: String,
+        hits: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        replaced: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for IntegratorS3Mock {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = TcpStream::connect(&self.endpoint);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    fn start_integrator_s3_mock(object: Vec<u8>, required_token: &'static str) -> IntegratorS3Mock {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind integrator s3");
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let hits = std::sync::Arc::new(AtomicU64::new(0));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let replaced = std::sync::Arc::new(AtomicBool::new(false));
+        let hits_c = hits.clone();
+        let stop_c = stop.clone();
+        let replaced_c = replaced.clone();
+        let join = std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                if stop_c.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut stream = match incoming {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                if stop_c.load(Ordering::SeqCst) {
+                    break;
+                }
+                let _ = stream.set_nodelay(true);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break None,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break buf.windows(4).position(|w| w == b"\r\n\r\n");
+                            }
+                            if buf.len() > 1024 * 1024 {
+                                break None;
+                            }
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                let Some(sep) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buf[..sep]).into_owned();
+                let n = hits_c.fetch_add(1, Ordering::SeqCst) + 1;
+                let (status, extra, body) = integrator_s3_handle(
+                    n,
+                    &headers,
+                    &object,
+                    required_token,
+                    replaced_c.load(Ordering::SeqCst),
+                );
+                let reason = match status {
+                    200 => "OK",
+                    206 => "Partial Content",
+                    403 => "Forbidden",
+                    503 => "Service Unavailable",
+                    _ => "Error",
+                };
+                let mut resp = format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n");
+                let has_cl = extra
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("Content-Length"));
+                for (k, v) in extra {
+                    resp.push_str(&format!("{k}: {v}\r\n"));
+                }
+                if !has_cl {
+                    resp.push_str(&format!("Content-Length: {}\r\n", body.len()));
+                }
+                resp.push_str("\r\n");
+                let _ = stream.write_all(resp.as_bytes());
+                if !headers.starts_with("HEAD ") {
+                    let _ = stream.write_all(&body);
+                }
+                let _ = stream.flush();
+            }
+        });
+        IntegratorS3Mock {
+            endpoint,
+            hits,
+            stop,
+            replaced,
+            join: Some(join),
+        }
+    }
+
+    fn integrator_s3_handle(
+        n: u64,
+        headers: &str,
+        object: &[u8],
+        required_token: &str,
+        replaced: bool,
+    ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        if n == 1 {
+            return (
+                503,
+                vec![("Content-Type".into(), "application/xml".into())],
+                b"<Error>slow down</Error>".to_vec(),
+            );
+        }
+        let has_tok = headers.lines().any(|l| {
+            let l = l.to_ascii_lowercase();
+            l.starts_with("x-amz-security-token:")
+                && l.contains(&required_token.to_ascii_lowercase())
+        });
+        if !has_tok {
+            return (403, vec![], b"missing token".to_vec());
+        }
+        let method = headers
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or("GET");
+        let len = object.len() as u64;
+        let (etag, size) = if replaced {
+            ("etag-replaced", len + 1)
+        } else {
+            ("e2eetag", len)
+        };
+        if method.eq_ignore_ascii_case("HEAD") {
+            return (
+                200,
+                vec![
+                    ("Content-Length".into(), size.to_string()),
+                    ("ETag".into(), format!("\"{etag}\"")),
+                ],
+                Vec::new(),
+            );
+        }
+        if replaced {
+            // Identity already fails on HEAD; keep GET from succeeding if a client skipped verify.
+            return (
+                200,
+                vec![
+                    ("Content-Length".into(), size.to_string()),
+                    ("ETag".into(), format!("\"{etag}\"")),
+                ],
+                vec![0u8; size as usize],
+            );
+        }
+        if let Some(range) = integrator_parse_range(headers, object.len()) {
+            let (start, end_incl) = range;
+            let slice = &object[start..=end_incl];
+            return (
+                206,
+                vec![
+                    (
+                        "Content-Range".into(),
+                        format!("bytes {start}-{end_incl}/{}", object.len()),
+                    ),
+                    ("Content-Length".into(), slice.len().to_string()),
+                    ("ETag".into(), format!("\"{etag}\"")),
+                ],
+                slice.to_vec(),
+            );
+        }
+        (
+            200,
+            vec![
+                ("Content-Length".into(), object.len().to_string()),
+                ("ETag".into(), format!("\"{etag}\"")),
+            ],
+            object.to_vec(),
+        )
+    }
+
+    fn integrator_parse_range(headers: &str, len: usize) -> Option<(usize, usize)> {
+        for line in headers.lines() {
+            let Some(rest) = line.split_once(':') else {
+                continue;
+            };
+            if !rest.0.trim().eq_ignore_ascii_case("range") {
+                continue;
+            }
+            let v = rest.1.trim();
+            let v = v.strip_prefix("bytes=")?;
+            let (a, b) = v.split_once('-')?;
+            let start: usize = a.parse().ok()?;
+            let end_incl: usize = if b.is_empty() {
+                len.saturating_sub(1)
+            } else {
+                b.parse().ok()?
+            };
+            if start < len && end_incl < len && start <= end_incl {
+                return Some((start, end_incl));
+            }
+        }
+        None
+    }
+
+    fn integrator_s3_client(endpoint: &str, session_token: Option<&str>) -> crate::s3::S3Client {
+        crate::s3::S3Client::new(crate::s3::S3Config {
+            endpoint: endpoint.to_string(),
+            access_key: "AKIA_TEST".into(),
+            secret_key: "testsecret".into(),
+            session_token: session_token.map(|s| s.to_string()),
+            region: "us-east-1".into(),
+            anonymous_read: false,
+            use_tls: false,
+            path_style: true,
+        })
+    }
+
+    fn integrator_http_get(url: &str, bearer: Option<&str>) -> (u16, String) {
+        let (tls, bare) = if let Some(b) = url.strip_prefix("https://") {
+            (true, b)
+        } else if let Some(b) = url.strip_prefix("http://") {
+            (false, b)
+        } else {
+            panic!("url must be http(s): {url}");
+        };
+        let (hostport, path) = match bare.split_once('/') {
+            Some((h, p)) => (h, format!("/{p}")),
+            None => (bare, "/".to_string()),
+        };
+        let auth = bearer
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: {hostport}\r\n{auth}Connection: close\r\n\r\n");
+        let mut last = None;
+        for _ in 0..25 {
+            match integrator_http_once(hostport, &req, tls) {
+                Ok(v) => return v,
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        panic!("http get {url} failed: {last:?}");
+    }
+
+    fn integrator_http_once(hostport: &str, req: &str, tls: bool) -> Result<(u16, String)> {
+        let tcp = TcpStream::connect(hostport)?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
+        if tls {
+            let connector = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
+                .build()
+                .context("tls connector")?;
+            let stream = connector
+                .connect("localhost", tcp)
+                .map_err(|e| anyhow::anyhow!("tls handshake: {e}"))?;
+            integrator_read_http(stream, req)
+        } else {
+            integrator_read_http(tcp, req)
+        }
+    }
+
+    fn integrator_read_http(mut stream: impl Read + Write, req: &str) -> Result<(u16, String)> {
+        stream.write_all(req.as_bytes())?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf);
+        let status = text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        Ok((status, body))
+    }
+
+    fn openssl_ok() -> bool {
+        std::process::Command::new("openssl")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn gen_self_signed(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        let st = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .args(["-days", "1", "-subj", "/CN=localhost"])
+            .status()
+            .context("openssl req")?;
+        if !st.success() {
+            bail!("openssl req failed");
+        }
+        Ok((cert, key))
+    }
+
+    /// Integrator A: REST catalog + S3 STS mock + TLS needled + position delete + replaced object.
+    #[test]
+    fn integrator_a_rest_s3_sts_tls_position_delete_and_stale() {
+        use crate::index::STALE_FILE_IDENTITY;
+        use crate::query::QueryOptions;
+        use crate::server::{start, DaemonOptions};
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let table = tmp.path().join("table");
+        let data = table.join("data");
+        let index = tmp.path().join("rap-index");
+        let parquet = data.join("rows.parquet");
+        write_flat_rows(&parquet, &["user_0000", "user_0001", "user_0002"]).unwrap();
+        let pos_del = data.join("pos-del.parquet");
+        write_position_delete_parquet(&pos_del, &[(&parquet, 0)]).unwrap();
+        write_iceberg_table_with_deletes(&table, &[parquet.clone()], &[pos_del], &[], 1, 1)
+            .unwrap();
+
+        let body = serde_json::json!({
+            "metadata-location": file_uri(&table),
+        })
+        .to_string();
+        let rest = RestCatalogMock::start("/iceberg/v1/namespaces/db/tables/tbl", body, None);
+        let report = index_iceberg_table(&rest_index_opts(&rest.rest_uri(), &index, None)).unwrap();
+        assert!(!report.skipped);
+        assert_eq!(report.files_indexed, 1);
+
+        let rap = load_index(&index).unwrap();
+        assert!(
+            rap.lookup("user_0000").is_empty(),
+            "position delete must hide user_0000"
+        );
+        assert!(!rap.lookup("user_0001").is_empty());
+
+        let token = "integrator-a-token";
+        let tls_pair = if openssl_ok() {
+            gen_self_signed(tmp.path()).ok()
+        } else {
+            None
+        };
+        let (tls_cert, tls_key) = match &tls_pair {
+            Some((c, k)) => (Some(c.clone()), Some(k.clone())),
+            None => (None, None),
+        };
+        let handle = start(DaemonOptions {
+            index: index.clone(),
+            bind: "127.0.0.1:0".into(),
+            token: Some(token.into()),
+            tls_cert,
+            tls_key,
+            ..Default::default()
+        })
+        .expect("start needled");
+        let base = handle.base_url();
+        if tls_pair.is_some() {
+            assert!(
+                base.starts_with("https://127.0.0.1:"),
+                "expected TLS needled, got {base}"
+            );
+        }
+
+        let (st, body) = integrator_http_get(&format!("{base}/v1/query?key=user_0001"), None);
+        assert_eq!(st, 401, "unauth must 401, body={body}");
+        let err: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(err["error"], "unauthenticated");
+        assert!(!body.contains(index.to_string_lossy().as_ref()));
+
+        let (st, body) =
+            integrator_http_get(&format!("{base}/v1/query?key=user_0001"), Some(token));
+        assert_eq!(st, 200, "auth live key, body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(!v["rows"].as_array().unwrap().is_empty());
+
+        let (st, body) =
+            integrator_http_get(&format!("{base}/v1/query?key=user_0000"), Some(token));
+        assert_eq!(st, 200, "deleted key is empty rows not 401, body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["rows"].as_array().unwrap().is_empty(),
+            "position-deleted key must not return rows: {body}"
+        );
+
+        let (st, body) = integrator_http_get(&format!("{base}/no-such"), Some(token));
+        assert_eq!(st, 404, "unknown path, body={body}");
+        handle.stop();
+
+        let parquet_bytes = fs::read(&parquet).unwrap();
+        let s3 = start_integrator_s3_mock(parquet_bytes.clone(), "sts-session-token");
+        let mut remote = load_index(&index).unwrap();
+        remote.files = Arc::new(vec![PathBuf::from("s3://needle-e2e/rows.parquet")]);
+        for entries in remote.entries_by_key.values_mut() {
+            for e in entries {
+                e.file_etag = Some("e2eetag".into());
+                e.file_size = Some(parquet_bytes.len() as u64);
+                e.file_mtime_ms = None;
+            }
+        }
+
+        let denied = RapQuerier::new(clone_rap_index(&remote))
+            .with_s3(integrator_s3_client(&s3.endpoint, None));
+        let err = denied
+            .query("user_0001")
+            .expect_err("S3 without STS token must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STALE_FILE_IDENTITY)
+                || msg.contains("s3_identity_mismatch")
+                || msg.contains("403"),
+            "expected identity/auth fail closed, got {msg}"
+        );
+
+        let allowed = RapQuerier::new(clone_rap_index(&remote)).with_s3(integrator_s3_client(
+            &s3.endpoint,
+            Some("sts-session-token"),
+        ));
+        let ok = allowed
+            .query("user_0001")
+            .expect("STS + 503 retry must succeed");
+        assert!(
+            ok.batch.num_rows() > 0 || !ok.rows.is_empty(),
+            "live key via S3 STS must decode"
+        );
+        assert!(
+            s3.hits.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "503 must be retried"
+        );
+
+        s3.replaced.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stale = RapQuerier::new(clone_rap_index(&remote)).with_s3(integrator_s3_client(
+            &s3.endpoint,
+            Some("sts-session-token"),
+        ));
+        let err = stale
+            .query("user_0001")
+            .expect_err("replaced S3 object must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STALE_FILE_IDENTITY) || msg.contains("s3_identity_mismatch"),
+            "expected stale/s3 identity mismatch, got {msg}"
+        );
+
+        let st = std::process::Command::new("touch")
+            .args(["-d", "1970-01-02 00:00:00 UTC", parquet.to_str().unwrap()])
+            .status()
+            .expect("touch");
+        assert!(st.success(), "touch mtime");
+        let err = RapQuerier::new(load_index(&index).unwrap())
+            .query("user_0001")
+            .expect_err("local mtime change must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(STALE_FILE_IDENTITY),
+            "expected stale_file_identity, got {msg}"
+        );
+        let ok = RapQuerier::new(load_index(&index).unwrap())
+            .query_with(
+                "user_0001",
+                &QueryOptions {
+                    verify: false,
+                    ..QueryOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            ok.batch.num_rows() > 0 || !ok.rows.is_empty(),
+            "--no-verify must still decode"
+        );
+    }
+
+    fn clone_rap_index(src: &crate::index::RapIndex) -> crate::index::RapIndex {
+        crate::index::RapIndex {
+            files: std::sync::Arc::clone(&src.files),
+            entries_by_key: src.entries_by_key.clone(),
+            fragments: src.fragments.clone(),
+            root: src.root.clone(),
+        }
     }
 }

@@ -69,7 +69,7 @@ We write both **JSONL** (inspectable) and **bincode** (compact) per bucket.
 | Covering index | Zero storage reads for hoisted fields | **Implemented** (`--covering`; cogrouped hoists nested list aggregates) |
 | Secondary indexes | Multi-dimension access paths | **Implemented** (`needle index --secondary track_uri`; hash + sorted) |
 | HTTP Range | Object-store ranged reads | **Implemented** (`LocalFile` + `HttpRange`, `needle serve`, prove path) |
-| MinIO / S3 Range | Path-style GetObject Range | **Implemented** (`s3.rs` SigV4 + anon GET, `lake.rs`, `needle lake-*`) |
+| MinIO / S3 Range | Path-style GetObject Range | **Implemented** (`s3.rs` SigV4 + STS + retries + checksums; MinIO path-style and AWS virtual-host TLS) |
 | Fat multi-page lake | Range-GET pages ≪ fat object | **Implemented** (`paged.rs`, `lake-generate-fat`, `S3ChunkReader`) |
 | Pagination | value_count + offset/limit | **Implemented** (`needle query --offset --limit`) |
 
@@ -124,18 +124,19 @@ fragments/<id>/secondary/<dim>/
 `needle query … --http http://127.0.0.1:PORT` issues ranged reads over HTTP and can
 prove bytes match local (`prove_http_matches_local`).
 
-## Gaps vs production RAP (still out of scope for 0.2 beta)
+## Remaining non-goals (not a general lake query engine)
 
-- Index loaded fully into memory (production would memory-map / cache hot buckets)
+- mmap / multi-TB lakes: file dictionary + working set stay in RAM; lazy buckets are the default (`--full-index` is opt-in)
+- Glue / Nessie catalogs (Iceberg REST is the production path; Hadoop `metadata/*.json` is fallback)
+- Multi-writer index beyond exclusive `flock`
+- Lake-wide SQL (SQL is over rows for one lookup key)
+- Physical Parquet / Iceberg deletes (`forget` only hides keys in Needle)
+- Covering aggregates remain listen-shaped; `--covering` is refused on generic schemas
 - Interleaving stays spec-valid by duplicating sibling columns in official
   chunks; RAP's one-read span is the skippable-bridged bundle in the host page
 - No Bloom / partition pruning layer (out of scope - RAP replaces within-file scan)
 - Cogrouped nested decode expands lists; page-range demo focuses on flat / blob / prepared
-- Covering aggregates are still listen-shaped (`listen_count` / `total_duration_ms`), not generic
-- Iceberg Hadoop metadata only (no REST / Glue / Nessie catalog)
-- S3 client is hand-rolled SigV4 (no STS session tokens, limited retries)
-- `forget` hides keys in Needle only; it does not delete lake Parquet
-- SQL is over one key's `hits` batch, not the whole lake
+- S3 is SigV4 over raw TCP (STS session tokens, retries, checksums, default cred chain) rather than aws-sdk-s3
 
 ## Demo expectations
 

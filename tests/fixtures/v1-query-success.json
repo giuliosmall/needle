@@ -1,0 +1,38 @@
+{
+  "key": "user_0000",
+  "rows": [
+    {
+      "user_id": "user_0000"
+    }
+  ],
+  "covering": [
+    "file=data.parquet listen_count=1"
+  ],
+  "covering_values": [
+    {
+      "file": "data.parquet",
+      "value_count": 1,
+      "listen_count": 1,
+      "total_duration_ms": 0,
+      "min_ts": null,
+      "max_ts": null
+    }
+  ],
+  "timings": {
+    "index_lookup_ms": 0,
+    "metadata_resolve_ms": 0,
+    "ranged_read_ms": 0,
+    "decode_extract_ms": 0,
+    "total_ms": 0
+  },
+  "totals": {
+    "rows": 1,
+    "value_count": 1,
+    "bytes_ranged": 0,
+    "pages_touched": 0,
+    "files_touched": 1,
+    "skipped_by_predicate": 0,
+    "offset": 0,
+    "limit": null
+  }
+}
