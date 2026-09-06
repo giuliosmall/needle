@@ -1,7 +1,7 @@
 # Needle
 
 <p align="center">
-  <img src="docs/logo.jpg" alt="Needle" width="280">
+  <img src="docs/logo.png" alt="Needle" width="280">
 </p>
 
 **Point queries on your data lake - without copying it into a KV store.**
@@ -275,7 +275,7 @@ tests/                 Unit-adjacent E2E + MinIO smoke
 FORMAT.md              On-disk index format (frozen v1, lock, compact GC)
 HTTP.md                needled HTTP JSON (frozen v1)
 NOTES.md               Article mapping & fidelity notes
-docs/logo.jpg          Project mark (needle + thread)
+docs/logo.png          Project mark (needle + thread, transparent)
 ```
 
 ---
