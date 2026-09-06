@@ -275,6 +275,7 @@ tests/                 Unit-adjacent E2E + MinIO smoke
 FORMAT.md              On-disk index format (frozen v1, lock, compact GC)
 HTTP.md                needled HTTP JSON (frozen v1)
 NOTES.md               Article mapping & fidelity notes
+ROADMAP.md             Product roadmap (1.1 ops → 1.2 lake clock → 1.3 pipeline prep)
 docs/logo.png          Project mark (needle + thread, transparent)
 ```
 
@@ -290,6 +291,18 @@ docs/logo.png          Project mark (needle + thread, transparent)
 - **Still out of scope:** Glue/Nessie (explicit unsupported), multi-writer beyond flock + S3 If-Match, lake-wide SQL, catalog-committed Iceberg position files from Needle. `--covering` is listen-shaped only (refused on generic schemas). `forget` only hides keys in Needle. There is no `needle delete`.
 - **Residual RAM on point lookup:** registry fragment-id list, fragment manifests (without `files[]` when `files.bin` exists), mmap handles for `files.bin` + one bucket, decoded dict records for files that key names, forgotten-key set, that key’s postings. Not the whole file dictionary.
 - **Custom Parquet prep** (ZSTD multi-frame pages, skippable alignment, interleaving) uses a low-level writer so layouts live **inside** `.parquet` files readable by Arrow.
+
+## Roadmap
+
+Needle stays a **point-lookup** product. Next is operations, not new query languages. Full sequence: [`ROADMAP.md`](./ROADMAP.md).
+
+| | Aim | Not |
+|--|-----|-----|
+| **1.1** | Crate `1.0.0`, `needled` metrics, `s3://` index fragments, idempotent `iceberg-index` job | Glue, Variant, covering rewrite |
+| **1.2** | Snapshot id as the clock; generic covering **or** keep refuse; Iceberg delete **commit** **or** hide-only forever | A flag named `delete` without a real catalog commit |
+| **1.3** | Prep in a real writer pipeline (`needle generate` is a demo) | Claiming Spotify RAP |
+
+**Never:** lake-wide SQL, a UI, a second copy of the lake, silent Parquet rewrite.
 
 Apache-2.0.
 
