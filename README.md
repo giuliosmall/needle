@@ -25,24 +25,16 @@ install -m 0755 target/release/needle target/release/needled ~/.local/bin/
 
 Online services and agents need **per-key** reads (one user, one entity) at interactive latency. Lakes are cheap and huge; distributed SQL is built for scans. The expensive part is rarely the disk - it’s the **dependent discovery chain** inside each Parquet file:
 
-```mermaid
-flowchart LR
-  Q["Point query"] --> L["List / prune files"]
-  L --> F["Fetch footer"]
-  F --> RG["Parse row groups"]
-  RG --> K["Scan key column"]
-  K --> P["Page index"]
-  P --> V["Fetch value pages"]
+```
+Point query → List / prune files → Fetch footer → Parse row groups
+           → Scan key column → Page index → Fetch value pages
 ```
 
 Each arrow is another round-trip. Needle collapses that to: **index lookup → ranged reads**.
 
-```mermaid
-flowchart LR
-  Q["Point query"] --> I["Needle index O(1)"]
-  I --> M["Cached page locations"]
-  M --> R["Parallel Range GETs"]
-  R --> D["Decode matching rows"]
+```
+Point query → Needle index O(1) → Cached page locations
+           → Parallel Range GETs → Decode matching rows
 ```
 
 ---
@@ -62,21 +54,15 @@ A multimap (hash-bucketed, append-only fragments):
 | `page_locs` / `frame_locs` | Optional - byte ranges stored in the index |
 | `covering` | Optional hoisted aggregates (counts, sums) |
 
-```mermaid
-flowchart TB
-  subgraph Lake["Object store / MinIO"]
-    P1["Parquet part-000.parquet"]
-    P2["Parquet part-001.parquet"]
-    Pn["more parts"]
-  end
-  subgraph NeedleIdx["Needle index"]
-    B0["bucket_000"]
-    B1["bucket_001"]
-    Bn["more buckets"]
-  end
-  user_42["key = user_42"] --> B1
-  B1 -->|"file=7 rows page_locs"| P2
-  P2 -->|"Range GET about 2 KiB"| Out["Rows for user_42"]
+```
+key = user_42
+        │
+        ▼
+   bucket_001  ──file=7, rows, page_locs──►  part-001.parquet
+                                                    │
+                                                    │  Range GET ~2 KiB
+                                                    ▼
+                                           rows for user_42
 ```
 
 ### Reader path
@@ -251,22 +237,13 @@ We routinely stress **hundreds of thousands** of multi-page objects on one box; 
 
 ## Architecture sketch
 
-```mermaid
-sequenceDiagram
-  participant Client
-  participant Needle
-  participant Index as Index buckets
-  participant Store as Object store
-  Client->>Needle: query user_42
-  Needle->>Index: lookup index bucket
-  Index-->>Needle: file rows page_locs
-  par column pages
-    Needle->>Store: Range GET page A
-    Needle->>Store: Range GET page B
-    Needle->>Store: Range GET page C
-  end
-  Store-->>Needle: small page payloads
-  Needle-->>Client: rows and covering aggregates
+```
+Client  → Needle:  query user_42
+Needle  → Index:   lookup index bucket
+Index   → Needle:  file, rows, page_locs
+Needle  → Store:   Range GET page A, B, C  (parallel)
+Store   → Needle:  small page payloads
+Needle  → Client:  rows and covering aggregates
 ```
 
 **Two stress axes this repo exercises:**
