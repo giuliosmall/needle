@@ -1,5 +1,9 @@
 # Needle
 
+<p align="center">
+  <img src="docs/logo.jpg" alt="Needle" width="280">
+</p>
+
 **Point queries on your data lake - without copying it into a KV store.**
 
 Why *Needle*? A data lake is a haystack, one key is a needle, and the usual plan is to hire a combine harvester. Scan engines find the needle by eating the haystack (then billing you for the straw). We keep a map to the needle so you can just pick it up.
@@ -294,6 +298,7 @@ tests/                 Unit-adjacent E2E + MinIO smoke
 FORMAT.md              On-disk index format (frozen v1, lock, compact GC)
 HTTP.md                needled HTTP JSON (frozen v1)
 NOTES.md               Article mapping & fidelity notes
+docs/logo.jpg          Project mark (needle + thread)
 ```
 
 ---
